@@ -1,0 +1,11 @@
+.jj/
+.git/
+node_modules/
+dist/
+coverage/
+artifacts/
+work/
+ci/
+test-results/
+playwright-report/
+blob-report/

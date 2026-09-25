@@ -1,13 +1,14 @@
 import { css } from '@emotion/css';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { type GrafanaTheme2, type TimeRange } from '@grafana/data';
 import { TemporaryAlert } from '@grafana/o11y-ds-frontend';
 import { reportInteraction } from '@grafana/runtime';
-import { CodeEditor, type Monaco, type monacoTypes, useTheme2 } from '@grafana/ui';
+import { Button, CodeEditor, type Monaco, type monacoTypes, useTheme2 } from '@grafana/ui';
 
 import { DEFAULT_TIME_RANGE_FOR_TAGS } from '../configuration/TagsTimeRangeSettings';
 import { type TempoDatasource } from '../datasource';
+import { assertProtectedQueryModelSafe, openProtectedQueryModel, prepareProtectedQueryModel } from '../protectedAttributes/model';
 import { type TempoQuery } from '../types';
 
 import { CompletionProvider, type CompletionItemType } from './autocomplete';
@@ -19,6 +20,7 @@ interface Props {
   query: TempoQuery;
   onChange: (val: TempoQuery) => void;
   onRunQuery: () => void;
+  onPendingChange?: (pending: boolean) => void;
   datasource: TempoDatasource;
   readOnly?: boolean;
   range?: TimeRange;
@@ -26,6 +28,10 @@ interface Props {
 
 export function TraceQLEditor(props: Props) {
   const [alertText, setAlertText] = useState<string>();
+  const [draft, setDraft] = useState(() => props.datasource.instanceSettings?.jsonData?.protectedKeyId ? '' : props.query.query || '');
+  const [locked, setLocked] = useState(() => Boolean(props.datasource.instanceSettings?.jsonData?.protectedKeyId));
+  const [draftPending, setDraftPending] = useState(false);
+  const [dirty, setDirty] = useState(false);
 
   const { query, onChange, onRunQuery, placeholder } = props;
   const setupAutocompleteFn = useAutocomplete(
@@ -43,26 +49,148 @@ export function TraceQLEditor(props: Props) {
   // So we need useRef to get the latest version of query in the onEditorChange callback.
   const queryRef = useRef(query);
   queryRef.current = query;
-  const onEditorChange = (value: string) => {
-    onChange({ ...queryRef.current, query: value });
+  const generation = useRef(0);
+  const savedEnvelope = useRef<string | undefined>(undefined);
+  const [legacy, setLegacy] = useState(false);
+  const committed = useRef(true);
+  const configuredKid = props.datasource.instanceSettings?.jsonData?.protectedKeyId;
+  const key = props.datasource.protectedKey;
+
+  useEffect(() => {
+    // A host acknowledgement of our own seal must not replace a newer Monaco draft.
+    if (savedEnvelope.current !== undefined && savedEnvelope.current === query.query) {
+      return;
+    }
+    const current = ++generation.current;
+    if (!configuredKid) {
+      setDraft(query.query || '');
+      setLocked(false);
+      setLegacy(false);
+      return;
+    }
+    try {
+      assertProtectedQueryModelSafe(query, configuredKid);
+    } catch {
+      // Existing legacy plaintext remains in the host model. Only a key holder
+      // may explicitly edit and migrate it; never forward it again unchanged.
+      setDraft(key && !query.query?.startsWith('qenc:') ? query.query || '' : '');
+      setLegacy(Boolean(key && !query.query?.startsWith('qenc:')));
+      setLocked(true);
+      return;
+    }
+    setLegacy(false);
+    if (!query.query?.startsWith('qenc:')) {
+      setDraft(query.query || '');
+      setLocked(false);
+      committed.current = true;
+      return;
+    }
+    setDraft('');
+    setLocked(true);
+    if (key?.kid !== configuredKid) {
+      return;
+    }
+    void openProtectedQueryModel(query, key, props.datasource.uid).then(
+      (opened) => {
+        if (generation.current === current) {
+          setDraft(opened.query || '');
+          setLocked(false);
+          committed.current = true;
+        }
+      },
+      () => {
+        if (generation.current === current) {
+          setAlertText('Unable to open protected query');
+        }
+      }
+    );
+    // A new model increments generation at the beginning of this effect;
+    // an acknowledgement of our own seal must not invalidate a newer edit.
+  }, [query.query, configuredKid, key, props.datasource.uid]);
+
+  useEffect(() => () => { generation.current++; }, []);
+  useEffect(() => {
+    props.onPendingChange?.(locked || dirty);
+  }, [locked, dirty, props.onPendingChange]);
+  useEffect(() => () => props.onPendingChange?.(false), [props.onPendingChange]);
+
+  const editorChangeRef = useRef<(value: string) => void>(() => {});
+  editorChangeRef.current = (value: string) => {
+    if (locked || props.readOnly) {
+      return;
+    }
+    setDraft(value);
+    setDirty(true);
+    props.onPendingChange?.(true);
+    committed.current = false;
+    const current = ++generation.current;
+    setDraftPending(false);
+    const candidate = { ...queryRef.current, query: value };
+    if (!configuredKid) {
+      onChange(candidate);
+      committed.current = true;
+      setDirty(false);
+      props.onPendingChange?.(false);
+      return;
+    }
+    try {
+      if (!key) {
+        assertProtectedQueryModelSafe(candidate, configuredKid);
+        onChange(candidate);
+        committed.current = true;
+        setDirty(false);
+        props.onPendingChange?.(false);
+        return;
+      }
+      setDraftPending(true);
+      void prepareProtectedQueryModel(candidate, key, props.datasource.uid, queryRef.current).then(
+        (sealed) => {
+          if (generation.current !== current || props.datasource.protectedKey !== key) {
+            return;
+          }
+          savedEnvelope.current = sealed.query;
+          onChange(sealed);
+          committed.current = true;
+          setDraftPending(false);
+          setDirty(false);
+          props.onPendingChange?.(false);
+          setAlertText(undefined);
+        },
+        () => {
+          if (generation.current === current) {
+            setDraftPending(false);
+            setAlertText('Complete or correct the protected query before saving');
+          }
+        }
+      );
+    } catch {
+      setAlertText('Complete or correct the protected query before saving');
+    }
   };
+  const onEditorChange = useCallback((value: string) => editorChangeRef.current(value), []);
 
   // work around the problem that `onEditorDidMount` is called once
   // and wouldn't get new version of onRunQuery
   const onRunQueryRef = useRef(onRunQuery);
-  onRunQueryRef.current = onRunQuery;
+  onRunQueryRef.current = () => {
+    if (committed.current && !draftPending && !locked) {
+      onRunQuery();
+    } else {
+      setAlertText('Complete or unlock the query before running it');
+    }
+  };
 
   const errorTimeoutId = useRef<number | undefined>(undefined);
 
   return (
     <>
       <CodeEditor
-        value={query.query || ''}
+        value={locked ? '' : draft}
         language={langId}
         onBlur={onEditorChange}
         onChange={onEditorChange}
         containerStyles={styles.queryField}
-        readOnly={props.readOnly}
+        readOnly={props.readOnly || locked}
         monacoOptions={{
           folding: false,
           fontSize: 14,
@@ -136,6 +264,25 @@ export function TraceQLEditor(props: Props) {
           });
         }}
       />
+      {locked && <TemporaryAlert severity="info" text="Import the matching key to unlock this query" />}
+      {legacy && key?.kid === configuredKid && (
+        <Button variant="secondary" onClick={() => {
+          const current = ++generation.current;
+          void prepareProtectedQueryModel(queryRef.current, key, props.datasource.uid, queryRef.current).then(
+            (sealed) => {
+              if (generation.current === current && props.datasource.protectedKey === key) {
+                savedEnvelope.current = sealed.query;
+                onChange(sealed);
+                setLegacy(false);
+                setLocked(false);
+                setDirty(false);
+                props.onPendingChange?.(false);
+              }
+            },
+            () => setAlertText('Correct the legacy query before migrating it')
+          );
+        }}>Seal legacy query</Button>
+      )}
       {alertText && <TemporaryAlert severity="error" text={alertText} />}
     </>
   );

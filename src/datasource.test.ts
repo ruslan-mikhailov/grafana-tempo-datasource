@@ -1,4 +1,6 @@
-import { lastValueFrom, type Observable, of } from 'rxjs';
+import { webcrypto } from 'node:crypto';
+
+import { lastValueFrom, type Observable, of, throwError } from 'rxjs';
 
 import {
   type DataFrame,
@@ -20,19 +22,23 @@ import {
 } from '@grafana/data';
 import {
   type BackendDataSourceResponse,
+  type BackendSrv,
   config,
   type FetchResponse,
+  getGrafanaLiveSrv,
+  reportInteraction,
   setBackendSrv,
   setDataSourceSrv,
   type TemplateSrv,
   type DataSourceSrv,
-  type BackendSrv,
 } from '@grafana/runtime';
 import { BarGaugeDisplayMode, type DataQuery, TableCellDisplayMode } from '@grafana/schema';
 
 import { TempoVariableQueryType } from './VariableQueryEditor';
 import { createFetchResponse } from './_importedDependencies/test/helpers/createFetchResponse';
 import { TraceqlSearchScope } from './dataquery';
+import { importKey } from './protectedAttributes/crypto';
+import { prepareProtectedQueryModel } from './protectedAttributes/model';
 import {
   TempoDatasource,
   buildExpr,
@@ -52,6 +58,12 @@ import mockServiceGraph from './test/mockServiceGraph.json';
 import { createTempoDatasource } from './test/mocks';
 import { initTemplateSrv } from './test/test_utils';
 import { type TempoJsonData, type TempoQuery } from './types';
+
+jest.mock('@grafana/runtime', () => ({
+  ...jest.requireActual('@grafana/runtime'),
+  reportInteraction: jest.fn(),
+  getGrafanaLiveSrv: jest.fn(() => ({ getStream: () => jest.requireActual('rxjs').of({}) })),
+}));
 
 describe('Tempo data source', () => {
   // Mock the console error so that running the test suite doesnt throw the error
@@ -1583,3 +1595,624 @@ describe('parseTimeRangeForTags', () => {
 interface PromQuery extends DataQuery {
   expr: string;
 }
+
+describe('protected datasource transport boundary', () => {
+  const master = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
+  const kid = '630dcd2966c4336691125448bbb25b4f';
+  const attributeEnvelope = `enc:v1:${kid}:7aUwjY5fPtHvu_dUnzcxBJc6XQ`;
+  const settings: DataSourceInstanceSettings<TempoJsonData> = {
+    ...defaultSettings,
+    jsonData: { ...defaultSettings.jsonData, protectedKeyId: kid, streamingEnabled: { search: false } },
+  };
+  const range = getDefaultTimeRange();
+  const fetchMock = jest.fn((_request: unknown) =>
+    of(createFetchResponse({ results: { A: { frames: [] }, B: { frames: [] }, C: { frames: [] } } }))
+  );
+  let previousCrypto: PropertyDescriptor | undefined;
+  let previousLiveEnabled: boolean;
+
+  beforeAll(() => {
+    previousCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+    Object.defineProperty(globalThis, 'crypto', { value: webcrypto, configurable: true });
+  });
+  afterAll(() => {
+    if (previousCrypto) {
+      Object.defineProperty(globalThis, 'crypto', previousCrypto);
+    }
+  });
+  beforeEach(() => {
+    previousLiveEnabled = config.liveEnabled;
+    config.liveEnabled = false;
+    fetchMock.mockClear();
+    jest.mocked(reportInteraction).mockClear();
+    setBackendSrv({ fetch: fetchMock } as unknown as BackendSrv);
+  });
+  afterEach(() => {
+    config.liveEnabled = previousLiveEnabled;
+  });
+
+  it('imports by configured ID, keeps the old key on mismatch, and broadcasts only committed changes', async () => {
+    const ds = new TempoDatasource(settings);
+    const epochs: number[] = [];
+    const unsubscribe = ds.subscribeProtectedKey((epoch) => epochs.push(epoch));
+    expect(await ds.importProtectedKey(master)).toBe(kid);
+    const previous = ds.protectedKey;
+    await expect(ds.importProtectedKey(Buffer.alloc(32, 7).toString('base64'))).rejects.toThrow('ID mismatch');
+    expect(ds.protectedKey).toBe(previous);
+    expect(epochs).toEqual([1]);
+    ds.clearProtectedKey();
+    expect(ds.protectedKey).toBeUndefined();
+    expect(epochs).toEqual([1, 2]);
+    unsubscribe();
+    const pending = ds.importProtectedKey(master);
+    ds.clearProtectedKey();
+    await expect(pending).rejects.toThrow('superseded');
+    expect(ds.protectedKey).toBeUndefined();
+    await ds.importProtectedKey(master);
+    expect(epochs).toEqual([1, 2]);
+  });
+
+  it('sends only compiled raw and builder targets in the entire HTTP payload and omits query telemetry', async () => {
+    const ds = new TempoDatasource(settings);
+    await ds.importProtectedKey(master);
+    const raw = await prepareProtectedQueryModel(
+      { refId: 'A', queryType: 'traceql', query: '{span.enc.password="abc"}', filters: [] },
+      ds.protectedKey!,
+      ds.uid
+    );
+    const builder = await prepareProtectedQueryModel(
+      {
+        refId: 'B',
+        queryType: 'traceqlSearch',
+        filters: [{ id: 'secret-filter', scope: TraceqlSearchScope.Span, tag: 'enc.password', operator: '=', value: 'abc', valueType: 'string' }],
+      },
+      ds.protectedKey!,
+      ds.uid
+    );
+    expect(raw.query).toMatch(/^qenc:v1:/);
+    expect(builder.filters[0].value).toMatch(/^qenc:v1:/);
+    await lastValueFrom(
+      ds.query({
+        targets: [{ ...raw, editorDraft: 'never-send-editor-data' }, builder],
+        filters: [{ key: 'span.http.route', operator: '=', value: '/health' }],
+        scopedVars: { hidden: { text: 'never-send-scoped-vars', value: 'never-send-scoped-vars' } },
+        range,
+        app: CoreApp.Explore,
+        requestId: 'protected-http',
+      } as DataQueryRequest<TempoQuery>)
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const outbound = fetchMock.mock.calls[0][0] as { data: { queries: TempoQuery[] } };
+    const body = JSON.stringify(outbound);
+    expect(body).toContain(attributeEnvelope);
+    expect(outbound.data.queries).toHaveLength(2);
+    expect(outbound.data.queries[0].query).toBe(`{span.enc.password="${attributeEnvelope}"} | select(span.enc.password)`);
+    expect(outbound.data.queries[1].query).toContain(`span.enc.password="${attributeEnvelope}"`);
+    for (const target of outbound.data.queries) {
+      expect(target).not.toHaveProperty('filters');
+      expect(target).not.toHaveProperty('editorDraft');
+      expect(target).not.toHaveProperty('scopedVars');
+    }
+    expect(body).not.toContain('qenc:v1:');
+    expect(body).not.toContain('never-send');
+    expect(body).not.toContain('"abc"');
+    for (const [, payload] of jest.mocked(reportInteraction).mock.calls) {
+      expect(payload).not.toHaveProperty('query');
+      expect(payload).not.toHaveProperty('error');
+      expect(payload).not.toHaveProperty('statusText');
+      expect(JSON.stringify(payload)).not.toContain('abc');
+    }
+  });
+
+  it('keeps HTTP host frames encrypted while publishing per-refId browser-only pane entries', async () => {
+    const frames = ['A', 'B'].map((refId) =>
+      createDataFrame({
+        refId,
+        name: 'Spans',
+        fields: [
+          { name: 'traceIdHidden', values: [`trace-${refId}`] },
+          { name: 'spanID', values: [`span-${refId}`] },
+          { name: 'enc.password', values: [attributeEnvelope] },
+        ],
+      })
+    );
+    const backend = jest.fn(() =>
+      of(createFetchResponse({
+        results: {
+          A: { frames: [dataFrameToJSON(frames[0])] },
+          B: { frames: [dataFrameToJSON(frames[1])] },
+        },
+      }))
+    );
+    setBackendSrv({ fetch: backend } as unknown as BackendSrv);
+    const ds = new TempoDatasource(settings);
+    await ds.importProtectedKey(master);
+    const targets = ['A', 'B'].map((refId) => ({
+      refId,
+      queryType: 'traceql' as const,
+      query: '{span.http.route="/ready"}',
+      filters: [],
+    }));
+    const response = await lastValueFrom(ds.query({ targets, range } as DataQueryRequest<TempoQuery>));
+    expect(backend).toHaveBeenCalledTimes(1);
+    expect(response.data.map((frame) => frame.fields.find((field) => field.name === 'enc.password')?.values[0])).toEqual([
+      attributeEnvelope,
+      attributeEnvelope,
+    ]);
+    expect(ds.protectedValues.snapshot()).toEqual([
+      { traceID: 'trace-A', spanID: 'span-A', storedField: 'enc.password', value: 'abc', status: 'decrypted' },
+      { traceID: 'trace-B', spanID: 'span-B', storedField: 'enc.password', value: 'abc', status: 'decrypted' },
+    ]);
+    ds.clearProtectedKey();
+    expect(ds.protectedValues.snapshot()).toEqual([]);
+    await lastValueFrom(ds.query({ targets: [targets[0]], range } as DataQueryRequest<TempoQuery>));
+    expect(ds.protectedValues.snapshot()).toEqual([
+      {
+        traceID: 'trace-A',
+        spanID: 'span-A',
+        storedField: 'enc.password',
+        value: '[encrypted: key unavailable]',
+        status: 'key-unavailable',
+      },
+    ]);
+    expect(frames[0].fields[2].values[0]).toBe(attributeEnvelope);
+  });
+
+  it('prepares every visible target before dispatch and keeps ordinary queries usable without an imported key', async () => {
+    const ds = new TempoDatasource(settings);
+    const ordinary = { refId: 'A', queryType: 'traceql', query: '{span.http.route="/ready"}', filters: [] } as TempoQuery;
+    await lastValueFrom(ds.query({ targets: [ordinary], range } as DataQueryRequest<TempoQuery>));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(fetchMock.mock.calls[0][0])).toContain('{span.http.route=\\"/ready\\"}');
+    fetchMock.mockClear();
+    jest.mocked(reportInteraction).mockClear();
+
+    const key = await importKey(master);
+    const sealed = await prepareProtectedQueryModel(
+      { refId: 'B', queryType: 'traceql', query: '{span.enc.password="abc"}', filters: [] },
+      key,
+      ds.uid
+    );
+    const locked = await lastValueFrom(ds.query({ targets: [ordinary, sealed], range } as DataQueryRequest<TempoQuery>));
+    expect(locked.error?.message).toBeDefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(reportInteraction).not.toHaveBeenCalledWith('grafana_traces_traceql_queried', expect.anything());
+
+    const legacy = await lastValueFrom(
+      ds.query({ targets: [ordinary, { refId: 'B', queryType: 'traceql', query: '{span.enc.password="abc"}', filters: [] }], range } as DataQueryRequest<TempoQuery>)
+    );
+    expect(legacy.error?.message).toBeDefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const other = await importKey(Buffer.alloc(32, 7).toString('base64'));
+    const wrongKeyModel: TempoQuery = {
+      refId: 'B',
+      queryType: 'traceql',
+      filters: [],
+      query: await other.sealQueryModel('{span.enc.password="abc"}', JSON.stringify([ds.uid, 'query'])),
+    };
+    const wrongKey = await lastValueFrom(
+      ds.query({ targets: [ordinary, wrongKeyModel], range } as DataQueryRequest<TempoQuery>)
+    );
+    expect(wrongKey.error?.message).toBeDefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects protected host-owned ad-hoc and template RHS before HTTP or telemetry', async () => {
+    const templateSrv: TemplateSrv = {
+      replace: (value: string) => value.replace('$password', 'abc'),
+    } as unknown as TemplateSrv;
+    const ds = new TempoDatasource(settings, templateSrv);
+    await ds.importProtectedKey(master);
+    const variableQuery = await prepareProtectedQueryModel(
+      { refId: 'A', queryType: 'traceql', query: '{span.enc.password="$password"}', filters: [] },
+      ds.protectedKey!,
+      ds.uid
+    );
+    const hostRhs = await lastValueFrom(ds.query({ targets: [variableQuery], range } as DataQueryRequest<TempoQuery>));
+    expect(hostRhs.error?.message).not.toContain('abc');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(reportInteraction).not.toHaveBeenCalled();
+
+    const inject = new TempoDatasource(settings, {
+      replace: (value: string) =>
+        value.replace('$value', '"x" || span.enc.password="host-secret"'),
+    } as unknown as TemplateSrv);
+    await inject.importProtectedKey(master);
+    const hostFragment: TempoQuery = {
+      refId: 'A',
+      queryType: 'traceql',
+      filters: [],
+      query: await inject.protectedKey!.sealQueryModel(
+        '{span.http.route=$value}',
+        JSON.stringify([inject.uid, 'query'])
+      ),
+    };
+    const injected = await lastValueFrom(
+      inject.query({ targets: [hostFragment], range } as DataQueryRequest<TempoQuery>)
+    );
+    expect(injected.error?.message).not.toContain('host-secret');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(reportInteraction).not.toHaveBeenCalled();
+
+    const adHoc = await lastValueFrom(
+      ds.query({
+        targets: [{ refId: 'A', queryType: 'traceqlSearch', filters: [] }],
+        filters: [{ key: 'span.enc.password', operator: '=', value: 'abc' }],
+        range,
+      } as DataQueryRequest<TempoQuery>)
+    );
+    expect(adHoc.error?.message).not.toContain('abc');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('never reports backend-echoed query or error text for protected failures', async () => {
+    setBackendSrv({
+      fetch: () =>
+        throwError(() => ({
+          message: 'backend echoed abc',
+          data: { message: 'backend echoed abc' },
+          status: 500,
+          statusText: 'backend echoed abc',
+        })),
+    } as unknown as BackendSrv);
+    const ds = new TempoDatasource(settings);
+    await ds.importProtectedKey(master);
+    const sealed = await prepareProtectedQueryModel(
+      { refId: 'A', queryType: 'traceql', query: '{span.enc.password="abc"}', filters: [] },
+      ds.protectedKey!,
+      ds.uid
+    );
+    const response = await lastValueFrom(ds.query({ targets: [sealed], range } as DataQueryRequest<TempoQuery>));
+    expect(JSON.stringify(response)).not.toContain('backend echoed abc');
+    expect(JSON.stringify(jest.mocked(reportInteraction).mock.calls)).not.toContain('abc');
+    for (const [, payload] of jest.mocked(reportInteraction).mock.calls) {
+      expect(payload).not.toHaveProperty('query');
+      expect(payload).not.toHaveProperty('error');
+      expect(payload).not.toHaveProperty('statusText');
+    }
+  });
+
+  it('passes compiled per-target search and metrics only to Live data', async () => {
+    const stream = jest.fn((_request: unknown) => of({}));
+    jest.mocked(getGrafanaLiveSrv).mockReturnValue({ getStream: stream } as never);
+    config.liveEnabled = true;
+    const ds = new TempoDatasource(settings);
+    ds.streamingEnabled = { search: true, metrics: true };
+    await ds.importProtectedKey(master);
+    const search = await prepareProtectedQueryModel(
+      { refId: 'A', queryType: 'traceql', query: '{span.enc.password="abc"}', filters: [] },
+      ds.protectedKey!,
+      ds.uid
+    );
+    const metrics = await prepareProtectedQueryModel(
+      { refId: 'B', queryType: 'traceql', query: '{span.enc.password="abc"} | rate()', filters: [] },
+      ds.protectedKey!,
+      ds.uid
+    );
+    await lastValueFrom(
+      ds.query({
+        targets: [search, metrics],
+        scopedVars: { secret: { text: 'never-send-live', value: 'never-send-live' } },
+        range,
+        app: CoreApp.Explore,
+      } as DataQueryRequest<TempoQuery>)
+    );
+    expect(stream).toHaveBeenCalledTimes(2);
+    const [searchCall, metricsCall] = stream.mock.calls.map(
+      ([request]) => request as { path: string; data: TempoQuery }
+    );
+    expect(searchCall.path).toMatch(/^search\//);
+    expect(metricsCall.path).toMatch(/^metrics\//);
+    expect(searchCall.data.query).toContain(`"${attributeEnvelope}"`);
+    expect(searchCall.data.query).toContain('| select(span.enc.password)');
+    expect(metricsCall.data.query).toContain(`"${attributeEnvelope}"`);
+    expect(metricsCall.data.query).not.toContain('| select(');
+    for (const call of [searchCall, metricsCall]) {
+      expect(call.data).not.toHaveProperty('filters');
+      expect(call.data).not.toHaveProperty('scopedVars');
+      expect(JSON.stringify(call.data)).not.toContain('never-send-live');
+      expect(JSON.stringify(call.data)).not.toContain('qenc:v1:');
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('compiles contextual metadata once and rejects protected host-variable RHS and protected tag-value requests', async () => {
+    const templateSrv: TemplateSrv = {
+      replace: (value: string) =>
+        value.replace('$password', 'abc').replace('$value', '"x" || span.enc.password="host-secret"'),
+    } as unknown as TemplateSrv;
+    const ds = new TempoDatasource(settings, templateSrv);
+    await ds.importProtectedKey(master);
+    const resource = jest.spyOn(ds, 'getResource').mockResolvedValue({ data: { tagValues: [] } });
+    ds.languageProvider.tagsV2 = [
+      { name: 'span', tags: ['enc.password', 'http.route'] },
+      { name: 'resource', tags: ['enc.password'] },
+    ];
+    jest.spyOn(ds.languageProvider, 'fetchTags').mockResolvedValue();
+    expect(await ds.getTagKeys({ filters: [], timeRange: range })).toEqual([
+      { text: 'span.http.route' },
+      { text: 'resource.enc.password' },
+    ]);
+    expect(await ds.getTagValues({ key: 'span."enc"."password"', filters: [], timeRange: range })).toEqual([]);
+    expect(resource).not.toHaveBeenCalled();
+    await ds.metadataRequest('tag-values', { q: '{span.enc.password="abc"}', tag: 'span.http.route', limit: 20 });
+    expect(resource).toHaveBeenCalledWith(
+      'tag-values',
+      expect.objectContaining({ q: `{span.enc.password="${attributeEnvelope}"}`, tag: 'span.http.route' }),
+      expect.anything()
+    );
+    resource.mockClear();
+    expect(await ds.getTagValues({
+      key: 'span:name',
+      filters: [{ key: 'span.http.route', operator: '=', value: 'ready' }],
+      timeRange: range,
+    })).toEqual([]);
+    expect(resource).toHaveBeenCalledWith(
+      'tag-values',
+      expect.objectContaining({ tag: 'span%3Aname', q: '{span.http.route="ready"}' }),
+      expect.anything()
+    );
+    resource.mockClear();
+    expect(await ds.getTagValues({
+      key: 'span:name',
+      filters: [
+        { key: 'span.http.route', operator: '=', value: 'say "hello"' },
+        { key: 'span.http.path', operator: '=', value: 'C:\\tmp' },
+      ],
+      timeRange: range,
+    })).toEqual([]);
+    expect(resource).toHaveBeenCalledWith(
+      'tag-values',
+      expect.objectContaining({
+        q: '{span.http.route="say \\"hello\\"" && span.http.path="C:\\\\tmp"}',
+        tag: 'span%3Aname',
+      }),
+      expect.anything()
+    );
+    resource.mockClear();
+    await expect(ds.metadataRequest('tag-values', { q: '{span.enc.password="$password"}' })).rejects.toThrow(
+      'Protected metadata request failed.'
+    );
+    await expect(ds.metadataRequest('tag-values', { q: '{span.http.route=$value}' })).rejects.toThrow(
+      'Protected metadata request failed.'
+    );
+    await expect(ds.metadataRequest('tag-values', { tag: 'span.enc.password' })).rejects.toThrow();
+    await expect(ds.metadataRequest('tag-values', { tag: encodeURIComponent('span."enc"."password"') })).rejects.toThrow();
+    expect(await ds.getTagValues({
+      key: 'span.http.route',
+      filters: [
+        { key: 'span.http.route', operator: '=', value: 'x"} //' },
+        { key: 'span."enc"."password"', operator: '=', value: 'host-secret' },
+      ],
+      timeRange: range,
+    })).toEqual([]);
+    expect(resource).not.toHaveBeenCalled();
+    await ds.metadataRequest('tag-values', { tag: 'span.http.enc.password' });
+    expect(resource).toHaveBeenCalledWith(
+      'tag-values',
+      expect.objectContaining({ tag: 'span.http.enc.password' }),
+      expect.anything()
+    );
+  });
+  it('rejects host-variable predicate erasure but confines ordinary builder values to one literal', async () => {
+    const templateSrv = {
+      replace: (value: string) =>
+        value.replace('$value', 'x" || span.enc.password="host-secret"} // '),
+    } as unknown as TemplateSrv;
+    const ds = new TempoDatasource(settings, templateSrv);
+    await ds.importProtectedKey(master);
+    const sealed = await prepareProtectedQueryModel(
+      { refId: 'A', queryType: 'traceql', query: '{span.http.route="$value" && span.enc.password="abc"}', filters: [] },
+      ds.protectedKey!,
+      ds.uid
+    );
+    const rawResponse = await lastValueFrom(ds.query({ targets: [sealed], range } as DataQueryRequest<TempoQuery>));
+    expect(rawResponse.error?.message).not.toContain('host-secret');
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const builderResponse = await lastValueFrom(ds.query({
+      targets: [{
+        refId: 'B',
+        queryType: 'traceqlSearch',
+        filters: [{ id: 'route', scope: TraceqlSearchScope.Span, tag: 'http.route', operator: '=', value: '$value', valueType: 'string' }],
+      }],
+      range,
+    } as DataQueryRequest<TempoQuery>));
+    expect(builderResponse.error).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const builderSent = fetchMock.mock.calls[0][0] as { data: { queries: TempoQuery[] } };
+    expect(builderSent.data.queries[0].query).toBe(
+      String.raw`{span.http.route="x\" || span.enc.password=\"host-secret\"} // "}`
+    );
+    fetchMock.mockClear();
+    const adHocResponse = await lastValueFrom(ds.query({
+      targets: [{ refId: 'C', queryType: 'traceqlSearch', filters: [] }],
+      filters: [
+        { key: 'span.http.route', operator: '=', value: 'x" || span.enc.password="host-secret"} // ' },
+        { key: 'span."enc"."password"', operator: '=', value: 'host-secret' },
+      ],
+      range,
+    } as DataQueryRequest<TempoQuery>));
+    expect(adHocResponse.error?.message).not.toContain('host-secret');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(JSON.stringify(jest.mocked(reportInteraction).mock.calls)).not.toContain('host-secret');
+  });
+
+  it('escapes ordinary quoted and backslash ad-hoc values for HTTP without introducing predicates', async () => {
+    const ds = new TempoDatasource(settings);
+    await lastValueFrom(ds.query({
+      targets: [{ refId: 'A', queryType: 'traceqlSearch', filters: [] }],
+      filters: [
+        { key: 'span.http.route', operator: '=', value: 'say "hello"' },
+        { key: 'span.http.path', operator: '=', value: 'C:\\tmp' },
+      ],
+      range,
+    } as DataQueryRequest<TempoQuery>));
+    const sent = fetchMock.mock.calls[0][0] as { data: { queries: TempoQuery[] } };
+    expect(sent.data.queries[0].query).toBe(
+      '{span.http.route="say \\"hello\\"" && span.http.path="C:\\\\tmp"}'
+    );
+  });
+
+  it('keeps pinned enum host variables ordinary without accepting a TraceQL expression', async () => {
+    const ds = new TempoDatasource(settings, {
+      replace: (value: string) => value.replace('$status', 'error').replace('$kind', 'server'),
+    } as unknown as TemplateSrv);
+    await lastValueFrom(ds.query({
+      targets: [
+        { refId: 'A', queryType: 'traceql', query: '{status=$status}' },
+        { refId: 'B', queryType: 'traceql', query: '{kind=$kind}' },
+      ],
+      range,
+    } as DataQueryRequest<TempoQuery>));
+    const sent = fetchMock.mock.calls[0][0] as { data: { queries: TempoQuery[] } };
+    expect(sent.data.queries.map(({ query }) => query)).toEqual(['{status=error}', '{kind=server}']);
+    fetchMock.mockClear();
+
+    const injected = new TempoDatasource(settings, {
+      replace: (value: string) => value.replace('$status', 'error || span.enc.password="host-secret"'),
+    } as unknown as TemplateSrv);
+    const rejected = await lastValueFrom(injected.query({
+      targets: [{ refId: 'A', queryType: 'traceql', query: '{status=$status}' }],
+      range,
+    } as DataQueryRequest<TempoQuery>));
+    expect(rejected.error?.message).not.toContain('host-secret');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps host interpolation callbacks from returning protected plaintext or nested template expansion', async () => {
+    const inject = new TempoDatasource(settings, {
+      replace: (value: string) => value.replace('$value', '"x" || span.enc.password="host-secret"'),
+    } as unknown as TemplateSrv);
+    const source = { refId: 'A', queryType: 'traceql', query: '{span.http.route=$value}', filters: [] } as TempoQuery;
+    expect(() => inject.applyVariables(source, {})).toThrow();
+    expect(() => inject.applyTemplateVariables(source, {})).toThrow();
+    expect(() => inject.interpolateVariablesInQueries([source], {})).toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const once = new TempoDatasource(settings, {
+      replace: (value: string) => value.includes('$value')
+        ? value.replace('$value', '"safe"')
+        : value.replace('"safe"', '"host-secret"'),
+    } as unknown as TemplateSrv);
+    await lastValueFrom(once.query({ targets: [source], range } as DataQueryRequest<TempoQuery>));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const sent = fetchMock.mock.calls[0][0] as { data: { queries: TempoQuery[] } };
+    expect(sent.data.queries[0].query).toBe('{span.http.route="safe"}');
+    expect(JSON.stringify(sent)).not.toContain('host-secret');
+  });
+
+  it('interpolates a trace ID before validating and preserves it through backend interpolation', async () => {
+    const traceId = '0123456789abcdef0123456789abcdef';
+    const ds = new TempoDatasource(settings, {
+      replace: (value: string) => value.replace('$traceId', traceId),
+    } as unknown as TemplateSrv);
+    await lastValueFrom(ds.query({
+      targets: [{ refId: 'A', queryType: 'traceId', query: '$traceId' }],
+      range,
+    } as DataQueryRequest<TempoQuery>));
+    const sent = fetchMock.mock.calls[0][0] as { data: { queries: TempoQuery[] } };
+    expect(sent.data.queries[0].query).toBe(traceId);
+    expect(sent.data.queries[0]).not.toHaveProperty('scopedVars');
+  });
+
+  it('routes metrics operators by parsed syntax, not a protected literal containing a metrics function', async () => {
+    const ds = new TempoDatasource(settings);
+    await ds.importProtectedKey(master);
+    const sealed = await prepareProtectedQueryModel(
+      { refId: 'A', queryType: 'traceql', query: '{span.enc.password="abc | rate("}', filters: [] },
+      ds.protectedKey!,
+      ds.uid
+    );
+    await lastValueFrom(ds.query({ targets: [sealed], range } as DataQueryRequest<TempoQuery>));
+    const sent = fetchMock.mock.calls[0][0] as { data: { queries: TempoQuery[] } };
+    expect(sent.data.queries[0].query).toContain('| select(span.enc.password)');
+    expect(JSON.stringify(sent)).not.toContain('abc | rate(');
+  });
+  it('allows a sealed dynamic name and harmless ordinary variable but never a host-owned protected RHS', async () => {
+    const ds = new TempoDatasource(settings, {
+      replace: (value: string) => value.replace('${attribute}', 'enc.password').replace('$service', 'checkout').replace('$value', 'host-secret'),
+    } as unknown as TemplateSrv);
+    await ds.importProtectedKey(master);
+    const dynamic = await prepareProtectedQueryModel(
+      { refId: 'A', queryType: 'traceql', query: '{span.${attribute}="abc"}', filters: [] },
+      ds.protectedKey!,
+      ds.uid
+    );
+    const mixed = await prepareProtectedQueryModel(
+      { refId: 'B', queryType: 'traceql', query: '{span.enc.password="abc" && resource.service.name="$service"}', filters: [] },
+      ds.protectedKey!,
+      ds.uid
+    );
+    await lastValueFrom(ds.query({ targets: [dynamic, mixed], range } as DataQueryRequest<TempoQuery>));
+    const sent = fetchMock.mock.calls[0][0] as { data: { queries: TempoQuery[] } };
+    expect(sent.data.queries[0].query).toContain(`span.enc.password="${attributeEnvelope}"`);
+    expect(sent.data.queries[1].query).toContain('resource.service.name="checkout"');
+    expect(JSON.stringify(sent)).not.toContain('"abc"');
+    fetchMock.mockClear();
+
+    const hostRhs = await prepareProtectedQueryModel(
+      { refId: 'A', queryType: 'traceql', query: '{span.${attribute}="$value"}', filters: [] },
+      ds.protectedKey!,
+      ds.uid
+    );
+    const rejected = await lastValueFrom(ds.query({ targets: [hostRhs], range } as DataQueryRequest<TempoQuery>));
+    expect(rejected.error?.message).not.toContain('host-secret');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('retains ordinary escaped array filters and static native-search migration under protection', async () => {
+    const ds = new TempoDatasource(settings);
+    await lastValueFrom(ds.query({ targets: [{
+      refId: 'A', queryType: 'traceqlSearch',
+      filters: [{ id: 'route', scope: TraceqlSearchScope.Span, tag: 'http.route', operator: '=', value: ['C:\\tmp'], valueType: 'string' }],
+    }], range } as DataQueryRequest<TempoQuery>));
+    const arraySent = fetchMock.mock.calls[0][0] as { data: { queries: TempoQuery[] } };
+    expect(arraySent.data.queries[0].query).toContain('http.route="C:\\\\tmp"');
+    fetchMock.mockClear();
+    await lastValueFrom(ds.query({
+      targets: [{ refId: 'A', queryType: 'traceqlSearch', filters: [] }],
+      filters: [{ key: 'span:name', operator: '=', value: 'GET' }],
+      range,
+    } as DataQueryRequest<TempoQuery>));
+    const intrinsic = fetchMock.mock.calls[0][0] as { data: { queries: TempoQuery[] } };
+    expect(intrinsic.data.queries[0].query).toContain('span:name="GET"');
+    fetchMock.mockClear();
+    await ds.importProtectedKey(master);
+    const sealed = await prepareProtectedQueryModel({
+      refId: 'A', queryType: 'traceqlSearch',
+      filters: [{ id: 'protected', scope: TraceqlSearchScope.Span, tag: 'enc.password', operator: '=', value: 'abc', valueType: 'string' }],
+    }, ds.protectedKey!, ds.uid);
+    await lastValueFrom(ds.query({ targets: [{
+      ...sealed,
+      filters: [
+        { id: 'route', scope: TraceqlSearchScope.Span, tag: 'http.route', operator: '=', value: ['x\\', '|| span.enc.password=', ')} //'], valueType: 'string' },
+        ...sealed.filters,
+      ],
+    }], range } as DataQueryRequest<TempoQuery>));
+    const multi = fetchMock.mock.calls[0][0] as { data: { queries: TempoQuery[] } };
+    expect(multi.data.queries[0].query).toContain(attributeEnvelope);
+    expect(multi.data.queries[0].query).not.toContain('span.enc.password="abc"');
+    fetchMock.mockClear();
+    await lastValueFrom(ds.query({ targets: [{
+      refId: 'A', queryType: 'nativeSearch', search: 'http.route="ready"',
+    }], range } as DataQueryRequest<TempoQuery>));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(fetchMock.mock.calls[0][0])).toContain('ready');
+    fetchMock.mockClear();
+    const rejected = await lastValueFrom(ds.query({ targets: [{
+      refId: 'A', queryType: 'nativeSearch', search: 'enc.password="abc"',
+    }], range } as DataQueryRequest<TempoQuery>));
+    expect(rejected.error?.message).toBeDefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('leaves unconfigured server-valid escapes outside the protected frontend parser', async () => {
+    const ds = new TempoDatasource(defaultSettings);
+    const serverQuery = '{span.message="line\\nbreak"}';
+    await lastValueFrom(ds.query({ targets: [{ refId: 'A', queryType: 'traceql', query: serverQuery }], range } as DataQueryRequest<TempoQuery>));
+    const sent = fetchMock.mock.calls[0][0] as { data: { queries: TempoQuery[] } };
+    expect(sent.data.queries[0].query).toBe(serverQuery);
+  });
+});

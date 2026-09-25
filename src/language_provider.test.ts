@@ -4,6 +4,7 @@ import { v2Tags } from './SearchTraceQLEditor/mocks';
 import { TraceqlSearchScope } from './dataquery';
 import { type TempoDatasource } from './datasource';
 import TempoLanguageProvider from './language_provider';
+import { classifyProtectedTraceQL } from './protectedAttributes/traceql';
 import { intrinsics } from './traceql/traceql';
 import { type Scope } from './types';
 
@@ -294,6 +295,38 @@ describe('Language_provider', () => {
           lp.generateQueryFromFilters({ adhocFilters: [{ key: 'name', operator: '=', value: 'my-server' }] })
         ).toBe('{name="my-server"}');
       });
+      it('keeps host ad-hoc string punctuation in a quoted literal and rejects quoted protected keys', async () => {
+        const metadataRequest = jest.fn().mockResolvedValue({ tagValues: [] });
+        const datasource = {
+          search: { filters: [] },
+          metadataRequest,
+          instanceSettings: { jsonData: { protectedKeyId: '630dcd2966c4336691125448bbb25b4f' } },
+        } as unknown as TempoDatasource;
+        const provider = new TempoLanguageProvider(datasource);
+        const punctuation = 'x"} // span.enc.password="secret';
+        const q = provider.generateQueryFromFilters({
+          adhocFilters: [{ key: 'span.http.route', operator: '=', value: punctuation }],
+        });
+        expect(q).toBe(`{span.http.route=${JSON.stringify(punctuation)}}`);
+        expect(classifyProtectedTraceQL(q).protectedRhsRanges).toHaveLength(0);
+        await provider.getOptionsV2({ tag: 'span.http.route', query: q });
+        expect(metadataRequest).toHaveBeenCalledWith('tag-values', expect.objectContaining({ q }));
+        expect(() => provider.generateQueryFromFilters({
+          adhocFilters: [{ key: 'span."enc"."password"', operator: '=', value: 'secret' }],
+        })).toThrow();
+        expect(() => provider.generateQueryFromFilters({
+          adhocFilters: [{ key: 'span.http.enc.password', operator: '=', value: 'ordinary' }],
+        })).not.toThrow();
+        expect(provider.generateQueryFromFilters({
+          adhocFilters: [
+            { key: 'span:kind', operator: '=', value: 'server' },
+            { key: 'span:status', operator: '=', value: 'error' },
+          ],
+        })).toBe('{span:kind=server && span:status=error}');
+        expect(() => provider.generateQueryFromFilters({
+          adhocFilters: [{ key: 'span:enc.password', operator: '=', value: 'secret' }],
+        })).toThrow();
+      });
     });
   });
 
@@ -338,6 +371,26 @@ describe('Language_provider', () => {
       const options = await lp.getOptionsV2({ tag: 'resource.service.name' });
 
       expect(options.map((option) => option.value)).toEqual(['api', 'beta', 'Hosted Grafana - Prod']);
+    });
+    it('does not request protected span value dictionaries or interpolate contextual query before metadata boundary', async () => {
+      const metadataRequest = jest.fn().mockResolvedValue({ tagValues: [{ type: 'string', value: 'visible' }] });
+      const datasource = {
+        metadataRequest,
+        instanceSettings: { jsonData: { protectedKeyId: '630dcd2966c4336691125448bbb25b4f' } },
+      } as unknown as TempoDatasource;
+      const lp = new TempoLanguageProvider(datasource);
+      expect(await lp.getOptionsV2({ tag: 'span.enc.password', query: '{span.enc.password=\"secret\"}' })).toEqual([]);
+      expect(await lp.getOptionsV2({ tag: 'span.\"enc\".\"password\"' })).toEqual([]);
+      expect(await lp.getOptionsV2({ tag: 'span.\"enc.password\"' })).toEqual([]);
+      expect(metadataRequest).not.toHaveBeenCalled();
+      await lp.getOptionsV2({ tag: 'resource.service.name', query: '{span.${attribute}=\"ordinary\"}' });
+      expect(metadataRequest).toHaveBeenCalledWith('tag-values', expect.objectContaining({
+        q: '{span.${attribute}=\"ordinary\"}',
+      }));
+      await lp.getOptionsV2({ tag: 'span.http.enc.password' });
+      expect(metadataRequest).toHaveBeenCalledWith('tag-values', expect.objectContaining({
+        tag: encodeURIComponent('span.http.enc.password'),
+      }));
     });
   });
 

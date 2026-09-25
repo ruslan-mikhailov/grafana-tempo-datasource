@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import useAsync from 'react-use/lib/useAsync';
 
 import { type DataSourcePluginOptionsEditorProps, updateDatasourcePluginJsonDataOption } from '@grafana/data';
@@ -8,6 +8,7 @@ import TagsInput from '../SearchTraceQLEditor/TagsInput';
 import { replaceAt } from '../SearchTraceQLEditor/utils';
 import { type TraceqlFilter, TraceqlSearchScope } from '../dataquery';
 import { type TempoDatasource } from '../datasource';
+import { assertStaticProtectedFilterDefaultsSafe } from '../protectedAttributes/model';
 import { type TempoJsonData } from '../types';
 import { getErrorMessage } from '../utils';
 
@@ -15,7 +16,43 @@ interface Props extends DataSourcePluginOptionsEditorProps<TempoJsonData> {
   datasource?: TempoDatasource;
 }
 
+/** Keep the rejected value (including text embedded in a malformed tag) out of errors. */
+export function protectedStaticFilterError(filters: TraceqlFilter[] | undefined): string | undefined {
+  try {
+    assertStaticProtectedFilterDefaultsSafe(filters);
+    return undefined;
+  } catch {
+    const index = filters?.findIndex((filter) => {
+      try {
+        assertStaticProtectedFilterDefaultsSafe([filter]);
+        return false;
+      } catch {
+        return true;
+      }
+    }) ?? -1;
+    const filter = index >= 0 ? filters?.[index] : undefined;
+    const scope = String(filter?.scope ?? 'unscoped');
+    const field = filter?.tag && /^[a-zA-Z0-9_.-]+$/.test(filter.tag) && /^[a-zA-Z0-9_-]+$/.test(scope)
+      ? `${scope}.${filter.tag}`
+      : `filter ${index + 1} (dynamic or invalid field)`;
+    return `Cannot save static search filter ${field}: its value could target a protected attribute. Remove its value or filter.`;
+  }
+}
+
 export function TraceQLSearchTags({ options, onOptionsChange, datasource }: Props) {
+  const [protectionError, setProtectionError] = useState<string>();
+  const saveFilters = useCallback((filters: TraceqlFilter[]) => {
+    const message = options.jsonData.protectedKeyId ? protectedStaticFilterError(filters) : undefined;
+    setProtectionError(message);
+    if (message) {
+      return;
+    }
+    updateDatasourcePluginJsonDataOption({ onOptionsChange, options }, 'search', {
+      ...options.jsonData.search,
+      filters,
+    });
+  }, [onOptionsChange, options]);
+
   const fetchTags = async () => {
     if (!datasource) {
       throw new Error('Unable to retrieve datasource');
@@ -32,47 +69,26 @@ export function TraceQLSearchTags({ options, onOptionsChange, datasource }: Prop
   const { error, loading } = useAsync(fetchTags, [datasource, options]);
 
   const updateFilter = useCallback(
-    (s: TraceqlFilter) => {
-      let copy = options.jsonData.search?.filters;
-      copy ||= [];
-      const indexOfFilter = copy.findIndex((f) => f.id === s.id);
-      if (indexOfFilter >= 0) {
-        // update in place if the filter already exists, for consistency and to avoid UI bugs
-        copy = replaceAt(copy, indexOfFilter, s);
-      } else {
-        copy.push(s);
-      }
-      updateDatasourcePluginJsonDataOption({ onOptionsChange, options }, 'search', {
-        ...options.jsonData.search,
-        filters: copy,
-      });
+    (filter: TraceqlFilter) => {
+      const filters = options.jsonData.search?.filters ?? [];
+      const index = filters.findIndex((existing) => existing.id === filter.id);
+      saveFilters(index < 0 ? [...filters, filter] : replaceAt(filters, index, filter));
     },
-    [onOptionsChange, options]
+    [options.jsonData.search?.filters, saveFilters]
   );
 
-  const deleteFilter = (s: TraceqlFilter) => {
-    updateDatasourcePluginJsonDataOption({ onOptionsChange, options }, 'search', {
-      ...options.jsonData.search,
-      filters: options.jsonData.search?.filters?.filter((f) => f.id !== s.id),
-    });
+  const deleteFilter = (filter: TraceqlFilter) => {
+    saveFilters((options.jsonData.search?.filters ?? []).filter((existing) => existing.id !== filter.id));
   };
 
   useEffect(() => {
     if (!options.jsonData.search?.filters) {
-      updateDatasourcePluginJsonDataOption({ onOptionsChange, options }, 'search', {
-        ...options.jsonData.search,
-        filters: [
-          {
-            id: 'service-name',
-            tag: 'service.name',
-            operator: '=',
-            scope: TraceqlSearchScope.Resource,
-          },
-          { id: 'span-name', tag: 'name', operator: '=', scope: TraceqlSearchScope.Span },
-        ],
-      });
+      saveFilters([
+        { id: 'service-name', tag: 'service.name', operator: '=', scope: TraceqlSearchScope.Resource },
+        { id: 'span-name', tag: 'name', operator: '=', scope: TraceqlSearchScope.Span },
+      ]);
     }
-  }, [onOptionsChange, options]);
+  }, [options.jsonData.search?.filters, saveFilters]);
 
   // filter out tags that already exist in TraceQLSearch editor
   const staticTags = ['duration'];
@@ -97,6 +113,7 @@ export function TraceQLSearchTags({ options, onOptionsChange, datasource }: Prop
       ) : (
         <div>Invalid data source, please create a valid data source and try again</div>
       )}
+      {protectionError && <Alert title="Unsafe static search filter" severity="error">{protectionError}</Alert>}
       {error && (
         <Alert title={'Unable to fetch TraceQL tags'} severity={'error'} topSpacing={1}>
           {error.message}

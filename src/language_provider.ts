@@ -1,6 +1,4 @@
 import { type AdHocVariableFilter, LanguageProvider, type SelectableValue, type TimeRange } from '@grafana/data';
-import { getTemplateSrv } from '@grafana/runtime';
-import { VariableFormatID } from '@grafana/schema';
 
 import {
   filterToQuerySection,
@@ -8,11 +6,13 @@ import {
   getIntrinsicTags,
   getTagsByScope,
   getUnscopedTags,
+  quoteTraceQLStringValue,
 } from './SearchTraceQLEditor/utils';
 import { DEFAULT_TIME_RANGE_FOR_TAGS } from './configuration/TagsTimeRangeSettings';
 import { type TraceqlFilter, TraceqlSearchScope } from './dataquery';
 import { type TempoDatasource } from './datasource';
-import { enumIntrinsics, intrinsicsV1 } from './traceql/traceql';
+import { assertStaticProtectedFilterDefaultsSafe, classifyProtectedFilter, isProtectedTagValueRequest, isVariableBearing } from './protectedAttributes/model';
+import { enumIntrinsics, intrinsics, intrinsicsV1 } from './traceql/traceql';
 import { type Scope } from './types';
 
 // Limit maximum tags retrieved from the backend
@@ -20,6 +20,9 @@ const TAGS_LIMIT = 5000;
 
 // Limit maximum options in select dropdowns
 export const OPTIONS_LIMIT = 1000;
+const adHocQuotedName = /"(?:\\["\\]|[^"\\\u0000-\u001f])*"/g;
+const adHocStaticName = /^[\p{L}\p{N}_.-]+$/u;
+const adHocOperators = ['=', '!=', '>', '<', '>=', '<=', '=~', '!~'];
 
 interface GetOptionsV2 {
   tag: string;
@@ -140,13 +143,17 @@ export default class TempoLanguageProvider extends LanguageProvider {
   };
 
   async getOptionsV2({ tag, query, timeRangeForTags, range }: GetOptionsV2): Promise<Array<SelectableValue<string>>> {
+    if (this.datasource.instanceSettings.jsonData.protectedKeyId && isProtectedTagValueRequest(tag)) {
+      // Do not request or cache frequency dictionaries containing ciphertext.
+      return [];
+    }
     const encodedTag = this.encodeTag(tag);
     const params: { q?: string; limit: number; start?: number; end?: number; tag?: string } = {
       limit: this.getTagsLimit(),
     };
 
     if (query) {
-      params.q = getTemplateSrv().replace(query, {}, VariableFormatID.Pipe);
+      params.q = query;
     }
 
     if (timeRangeForTags && range && timeRangeForTags !== DEFAULT_TIME_RANGE_FOR_TAGS) {
@@ -200,6 +207,9 @@ export default class TempoLanguageProvider extends LanguageProvider {
     traceqlFilters?: TraceqlFilter[];
     adhocFilters?: AdHocVariableFilter[];
   }) {
+    if (this.datasource.instanceSettings?.jsonData?.protectedKeyId) {
+      assertStaticProtectedFilterDefaultsSafe(this.datasource.search?.filters);
+    }
     if (!traceqlFilters && !adhocFilters) {
       return '';
     }
@@ -218,23 +228,39 @@ export default class TempoLanguageProvider extends LanguageProvider {
     }
 
     return filters
-      .filter((f) => f.tag && f.operator && f.value?.length)
+      .filter((f) => f.tag && f.operator && (f.value?.length || (f.value === '' &&
+        this.datasource.instanceSettings?.jsonData?.protectedKeyId && classifyProtectedFilter(f).requiresSealing)))
       .map((f) => filterToQuerySection(f, filters, this));
   }
 
   private generateQueryFromAdHocFilters = (filters: AdHocVariableFilter[]) => {
+    if (this.datasource.instanceSettings?.jsonData?.protectedKeyId) {
+      for (const filter of filters) {
+        const key = filter.key;
+        if (isVariableBearing(key) ||
+          (!intrinsics.includes(key) && !adHocStaticName.test(key.replace(adHocQuotedName, 'x'))) ||
+          !adHocOperators.includes(filter.operator) ||
+          isProtectedTagValueRequest(key) ||
+          isProtectedTagValueRequest(key.replace(/^(?:resource|event|link|instrumentation)\./, 'span.'))) {
+          throw new Error('Protected or malformed host ad-hoc filters are not supported');
+        }
+      }
+    }
     return filters
       .filter((f) => f.key && f.operator && f.value)
       .map((f) => `${f.key}${f.operator}${this.adHocValueHelper(f)}`);
   };
 
   adHocValueHelper = (f: AdHocVariableFilter) => {
-    if (this.getIntrinsics().find((t) => t === f.key) && enumIntrinsics.includes(f.key)) {
+    if (enumIntrinsics.includes(f.key)) {
+      if (this.datasource.instanceSettings?.jsonData?.protectedKeyId && !/^[\p{L}\p{N}_-]+$/u.test(f.value)) {
+        throw new Error('Malformed host ad-hoc filter value');
+      }
       return f.value;
     }
     if (parseInt(f.value, 10).toString() === f.value) {
       return f.value;
     }
-    return `"${f.value}"`;
+    return quoteTraceQLStringValue(f.value);
   };
 }

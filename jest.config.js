@@ -10,6 +10,7 @@ module.exports = {
     require('./.config/jest/utils').nodeModulesToTransform([
       ...require('./.config/jest/utils').grafanaESModules,
       '@grafana/plugin-ui',
+      '@noble/ciphers',
       '@marcbachmann/cel-js',
       'monaco-editor',
       '@openfeature/ofrep-web-provider',

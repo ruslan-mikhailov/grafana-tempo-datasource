@@ -1,19 +1,21 @@
 import { css } from '@emotion/css';
 import { defaults } from 'lodash';
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { CoreApp, type GrafanaTheme2, type QueryEditorProps } from '@grafana/data';
 import { config, reportInteraction } from '@grafana/runtime';
 import { Alert, Button, InlineLabel, TextLink, useStyles2 } from '@grafana/ui';
 
 import { type TempoDatasource } from '../datasource';
+import { assertProtectedQueryModelSafe, openProtectedQueryModel, prepareProtectedQueryModel } from '../protectedAttributes/model';
 import { defaultQuery, type MyDataSourceOptions, type TempoQuery } from '../types';
 
 import { TempoQueryBuilderOptions } from './TempoQueryBuilderOptions';
 import { TraceQLEditor } from './TraceQLEditor';
 
 type EditorProps = {
-  onClearResults: () => void;
+  onClearResults: () => boolean | void;
+  onPendingChange?: (pending: boolean) => void;
 };
 
 type Props = EditorProps & QueryEditorProps<TempoDatasource, TempoQuery, MyDataSourceOptions>;
@@ -22,11 +24,72 @@ export function QueryEditor(props: Props) {
   const styles = useStyles2(getStyles);
   const query = defaults(props.query, defaultQuery);
   const [showCopyFromSearchButton, setShowCopyFromSearchButton] = useState(() => {
+    if (props.datasource.instanceSettings?.jsonData?.protectedKeyId) {
+      return false;
+    }
     const genQuery = props.datasource.languageProvider.generateQueryFromFilters({
       traceqlFilters: query.filters || [],
     });
     return genQuery === query.query || genQuery === '{}';
   });
+  const [copyError, setCopyError] = useState<string>();
+  const generation = useRef(0);
+  const latestQuery = useRef(query);
+  latestQuery.current = query;
+  const rawPending = useRef(false);
+  const copyPending = useRef(false);
+  const onRawPendingChange = useCallback((pending: boolean) => {
+    rawPending.current = pending;
+    if (pending) {
+      generation.current++;
+      copyPending.current = false;
+    }
+    props.onPendingChange?.(pending || copyPending.current);
+  }, [props.onPendingChange]);
+  useEffect(() => () => { generation.current++; }, []);
+  const copyFromSearch = async () => {
+    const current = ++generation.current;
+    const original = query;
+    copyPending.current = true;
+    props.onPendingChange?.(true);
+    try {
+      const kid = props.datasource.instanceSettings?.jsonData?.protectedKeyId;
+      const key = props.datasource.protectedKey;
+      if (kid) {
+        assertProtectedQueryModelSafe(query, kid);
+      }
+      const opened = kid && key?.kid === kid
+        ? await openProtectedQueryModel(query, key, props.datasource.uid)
+        : query;
+      const raw = props.datasource.languageProvider.generateQueryFromFilters({
+        traceqlFilters: opened.filters || [],
+      });
+      const candidate: TempoQuery = { ...query, query: raw, queryType: 'traceql' };
+      const sealed = kid && key?.kid === kid
+        ? await prepareProtectedQueryModel(candidate, key, props.datasource.uid, query)
+        : candidate;
+      if (kid) {
+        assertProtectedQueryModelSafe(sealed, kid);
+      }
+      if (generation.current === current && latestQuery.current === original &&
+        !rawPending.current && (!kid || props.datasource.protectedKey === key)) {
+        copyPending.current = false;
+        props.onPendingChange?.(false);
+        if (props.onClearResults() === false) {
+          throw new Error('Cannot clear while the previous query is pending');
+        }
+        props.onChange(sealed);
+        setShowCopyFromSearchButton(true);
+      }
+    } catch {
+      setCopyError('Unlock or correct protected search filters before copying');
+    } finally {
+      if (generation.current === current) {
+        copyPending.current = false;
+        props.onPendingChange?.(rawPending.current);
+      }
+    }
+  };
 
   const alertingWarning = (
     <Alert title="Tempo metrics is an experimental feature" severity="warning">
@@ -62,14 +125,7 @@ export function QueryEditor(props: Props) {
                 location: 'traceql_tab',
               });
 
-              props.onClearResults();
-              props.onChange({
-                ...query,
-                query: props.datasource.languageProvider.generateQueryFromFilters({
-                  traceqlFilters: query.filters || [],
-                }),
-              });
-              setShowCopyFromSearchButton(true);
+              void copyFromSearch();
             }}
             style={{ marginLeft: '10px' }}
           >
@@ -77,10 +133,12 @@ export function QueryEditor(props: Props) {
           </Button>
         </div>
       )}
+      {copyError && <Alert severity="error" title={copyError} />}
       <TraceQLEditor
         placeholder="Enter a TraceQL query or trace ID (run with Shift+Enter)"
         query={query}
         onChange={props.onChange}
+        onPendingChange={onRawPendingChange}
         datasource={props.datasource}
         onRunQuery={props.onRunQuery}
         range={props.range}
@@ -88,7 +146,13 @@ export function QueryEditor(props: Props) {
       <div className={styles.optionsContainer}>
         <TempoQueryBuilderOptions
           query={query}
-          onChange={props.onChange}
+          onChange={(next) => {
+            if (rawPending.current || copyPending.current) {
+              setCopyError('Complete or unlock the query before changing options');
+              return;
+            }
+            props.onChange(next);
+          }}
           searchStreaming={props.datasource.isStreamingSearchEnabled() ?? false}
           metricsStreaming={props.datasource.isStreamingMetricsEnabled() ?? false}
           app={props.app}

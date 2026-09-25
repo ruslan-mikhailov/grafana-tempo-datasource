@@ -1,4 +1,5 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { webcrypto } from 'node:crypto';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import React from 'react';
 
@@ -8,6 +9,7 @@ import { type Themeable } from '@grafana/ui';
 
 import QueryField from './QueryField';
 import { createTempoDatasource } from './test/mocks';
+import { importKey } from './protectedAttributes/crypto';
 import { type TempoQuery } from './types';
 
 jest.mock('@grafana/assistant', () => ({
@@ -23,8 +25,30 @@ jest.mock('./ServiceGraphSection', () => ({
   ServiceGraphSection: () => <div data-testid="service-graph-section" />,
 }));
 
+const mockEditorPendingCallbacks: Array<(pending: boolean) => void> = [];
+const mockEditorCommitCallbacks: Array<(query: TempoQuery) => void> = [];
+
 jest.mock('./traceql/QueryEditor', () => ({
-  QueryEditor: () => <div data-testid="traceql-editor" />,
+  QueryEditor: ({ onChange, onRunQuery, onPendingChange }: {
+    onChange: (query: TempoQuery) => void;
+    onRunQuery: () => void;
+    onPendingChange: (pending: boolean) => void;
+  }) => {
+    mockEditorPendingCallbacks.push(onPendingChange);
+    mockEditorCommitCallbacks.push(onChange);
+    return (
+      <div data-testid="traceql-editor">
+        <button type="button" onClick={() => onChange({
+          refId: 'A', queryType: 'traceql', query: '{span.enc.password="secret"}',
+        } as TempoQuery)}>Unsafe host change</button>
+        <button type="button" onClick={() => onChange({
+          refId: 'A', queryType: 'traceql', query: '{span.http.route="public"}',
+        } as TempoQuery)}>Ordinary host change</button>
+        <button type="button" onClick={() => onPendingChange(true)}>Start protected seal</button>
+        <button type="button" onClick={onRunQuery}>Run from editor</button>
+      </div>
+    );
+  },
 }));
 
 jest.mock('@grafana/runtime', () => ({
@@ -82,6 +106,22 @@ jest.mock('@grafana/ui', () => {
 
 const mockedReportInteraction = jest.mocked(reportInteraction);
 
+const master = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
+const kid = '630dcd2966c4336691125448bbb25b4f';
+const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+
+beforeAll(() => {
+  Object.defineProperty(globalThis, 'crypto', { configurable: true, value: webcrypto });
+});
+
+afterAll(() => {
+  if (originalCrypto) {
+    Object.defineProperty(globalThis, 'crypto', originalCrypto);
+  } else {
+    Reflect.deleteProperty(globalThis, 'crypto');
+  }
+});
+
 describe('QueryField', () => {
   const range = {
     from: toUtc('2024-01-01T00:00:00Z'),
@@ -94,6 +134,8 @@ describe('QueryField', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockEditorPendingCallbacks.length = 0;
+    mockEditorCommitCallbacks.length = 0;
     config.featureToggles.queryWithAssistant = true;
     config.buildInfo.version = '11.0.0';
   });
@@ -229,5 +271,153 @@ describe('QueryField', () => {
     expect(datasource.uploadedJson).toBe('{"trace":"uploaded"}');
     expect(onChange).toHaveBeenLastCalledWith({ refId: 'A', queryType: 'upload' });
     expect(onRunQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects protected plaintext at every parent host callback and blocks a pending run', async () => {
+    const user = userEvent.setup();
+    const onChange = jest.fn();
+    const onRunQuery = jest.fn();
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
+    renderQueryField({ datasource, onChange, onRunQuery });
+    await waitFor(() => expect(datasource.getNativeHistograms).toHaveBeenCalled());
+    onChange.mockClear();
+
+    await user.click(screen.getByRole('button', { name: 'Unsafe host change' }));
+    expect(onChange).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Ordinary host change' }));
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ query: '{span.http.route="public"}' }));
+    await user.click(screen.getByRole('button', { name: 'Start protected seal' }));
+    onChange.mockClear();
+    await user.click(screen.getByRole('button', { name: 'Service Graph' }));
+    expect(onChange).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Run from editor' }));
+    expect(onRunQuery).not.toHaveBeenCalled();
+    expect(JSON.stringify(onChange.mock.calls)).not.toContain('secret');
+    expect(screen.queryByTestId('query-with-assistant-button')).not.toBeInTheDocument();
+  });
+
+  it('imports text and local file bytes without writing keys into host models; mismatch retains prior key', async () => {
+    const user = userEvent.setup();
+    const onChange = jest.fn();
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
+    renderQueryField({ datasource, onChange });
+
+    await user.type(screen.getByLabelText('Protected key base64'), master);
+    await user.click(screen.getByRole('button', { name: 'Import key text' }));
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(`Protected key loaded (${kid})`));
+    expect(screen.getByLabelText('Protected key base64')).toHaveValue('');
+    const previousKey = datasource.protectedKey;
+    await user.type(screen.getByLabelText('Protected key base64'), Buffer.alloc(32, 7).toString('base64'));
+    await user.click(screen.getByRole('button', { name: 'Import key text' }));
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Unable to import key'));
+    expect(datasource.protectedKey).toBe(previousKey);
+    expect(screen.getByLabelText('Protected key base64')).toHaveValue('');
+
+    const file = new File([master], 'key.txt', { type: 'text/plain' });
+    Object.defineProperty(file, 'text', { value: async () => master });
+    await user.upload(screen.getByLabelText('Import protected key file'), file);
+    await waitFor(() => expect(datasource.protectedKey).not.toBe(previousKey));
+    expect(screen.getByLabelText('Import protected key file')).toHaveValue('');
+    expect(JSON.stringify(onChange.mock.calls)).not.toContain(master);
+    expect(JSON.stringify(onChange.mock.calls)).not.toContain('secret');
+  });
+
+  it('notifies all mounted editors and clears only the shared datasource pane on key clear', async () => {
+    const user = userEvent.setup();
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
+    await datasource.importProtectedKey(master);
+    const sealed = await (await importKey(master)).sealQueryModel(
+      '{span.enc.password="secret"}', JSON.stringify(['tempo-uid', 'query'])
+    );
+    const query = { refId: 'A', queryType: 'traceql', query: sealed } as TempoQuery;
+    const first = renderQueryField({ datasource, query });
+    const second = renderQueryField({ datasource, query });
+    const originalEditors = screen.getAllByTestId('traceql-editor');
+    const token = datasource.protectedValues.beginRequest();
+    datasource.protectedValues.replace('A', [{
+      traceID: 'trace1', spanID: 'span1', storedField: 'enc.password', status: 'decrypted', value: '<secret>',
+    }], datasource.protectedKeyEpoch, token);
+    await waitFor(() => expect(screen.getAllByText('<secret>')).toHaveLength(2));
+    expect(first.container.innerHTML).toContain('&lt;secret&gt;');
+
+    await user.click(screen.getAllByRole('button', { name: 'Clear key' })[0]);
+    await waitFor(() => expect(screen.getAllByText('No protected span values in current results.')).toHaveLength(2));
+    const nextEditors = screen.getAllByTestId('traceql-editor');
+    expect(nextEditors[0]).not.toBe(originalEditors[0]);
+    expect(nextEditors[1]).not.toBe(originalEditors[1]);
+    expect(second.container).toHaveTextContent(`Protected attributes locked (${kid})`);
+    await user.click(screen.getAllByRole('button', { name: 'Run from editor' })[1]);
+    expect(second.props.onRunQuery).not.toHaveBeenCalled();
+  });
+
+  it('does not let a late native histogram callback overwrite a sealed editor commit before host acknowledgement', async () => {
+    let completeNative!: (enabled: boolean) => void;
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    jest.spyOn(datasource, 'getNativeHistograms').mockImplementation(() =>
+      new Promise<boolean>((resolve) => { completeNative = resolve; }));
+    const onChange = jest.fn();
+    const query = { refId: 'A', queryType: 'traceql' } as TempoQuery;
+    renderQueryField({ datasource, query, onChange });
+    const sealed = await (await importKey(master)).sealQueryModel(
+      '{span.enc.password="secret"}', JSON.stringify(['tempo-uid', 'query'])
+    );
+    const pending = mockEditorPendingCallbacks[mockEditorPendingCallbacks.length - 1];
+    const commit = mockEditorCommitCallbacks[mockEditorCommitCallbacks.length - 1];
+    act(() => {
+      pending(true);
+      commit({ ...query, query: sealed });
+      pending(false);
+    });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    await act(async () => { completeNative(false); });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ query: sealed }));
+  });
+
+  it('ignores stale pending completion after a key epoch remount', async () => {
+    const user = userEvent.setup();
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
+    await datasource.importProtectedKey(master);
+    const onChange = jest.fn();
+    const mounted = renderQueryField({ datasource, onChange });
+    await waitFor(() => expect(onChange).toHaveBeenCalled());
+    const accepted = onChange.mock.lastCall![0] as TempoQuery;
+    mounted.rerender(<QueryField {...mounted.props} query={accepted} />);
+    onChange.mockClear();
+    const stalePending = mockEditorPendingCallbacks[0];
+    await user.click(screen.getByRole('button', { name: 'Clear key' }));
+    const currentPending = mockEditorPendingCallbacks[mockEditorPendingCallbacks.length - 1];
+    expect(currentPending).not.toBe(stalePending);
+    act(() => {
+      currentPending(true);
+      stalePending(false);
+    });
+    await user.click(screen.getByRole('button', { name: 'Service Graph' }));
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('discards a deferred file read when another editor clears the shared key', async () => {
+    const user = userEvent.setup();
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
+    await datasource.importProtectedKey(master);
+    const importSpy = jest.spyOn(datasource, 'importProtectedKey');
+    renderQueryField({ datasource });
+    renderQueryField({ datasource });
+    let completeRead!: (value: string) => void;
+    const file = new File([master], 'key.txt', { type: 'text/plain' });
+    Object.defineProperty(file, 'text', { value: () => new Promise<string>((resolve) => { completeRead = resolve; }) });
+    await user.upload(screen.getAllByLabelText('Import protected key file')[0], file);
+    await user.type(screen.getAllByLabelText('Protected key base64')[1], master);
+    await user.click(screen.getAllByRole('button', { name: 'Clear key' })[1]);
+    expect(screen.getAllByLabelText('Protected key base64')[1]).toHaveValue('');
+    await act(async () => { completeRead(master); });
+    expect(importSpy).not.toHaveBeenCalled();
+    expect(datasource.protectedKey).toBeUndefined();
+    expect(screen.getAllByLabelText('Import protected key file')[0]).toHaveValue('');
   });
 });

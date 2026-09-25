@@ -260,4 +260,37 @@ describe('TraceQLSearch', () => {
       expect(button).toBeInTheDocument();
     });
   });
+  it('keeps sealed filters locked without a key and reopens only into the local editor with a matching key', async () => {
+    const kid = '630dcd2966c4336691125448bbb25b4f';
+    const envelope = `qenc:v1:${kid}:${'A'.repeat(40)}`;
+    const protectedDatasource = {
+      ...datasource,
+      uid: 'tempo-uid',
+      instanceSettings: { jsonData: { protectedKeyId: kid } },
+      search: { filters: [{ id: 'password', tag: 'enc.password', scope: TraceqlSearchScope.Span, operator: '=' }] },
+    } as unknown as TempoDatasource;
+    const saved = {
+      refId: 'A', queryType: 'traceqlSearch', filters: [{
+        id: 'password', tag: 'enc.password', scope: TraceqlSearchScope.Span, operator: '=', value: envelope,
+      }],
+    } as TempoQuery;
+    const hostChange = jest.fn();
+    const view = render(
+      <TraceQLSearch datasource={protectedDatasource} query={saved} onChange={hostChange} onClearResults={onClearResults} />
+    );
+    expect(screen.getByText(/Import the matching key/)).toBeInTheDocument();
+    expect(screen.queryByLabelText('select password value')).not.toBeInTheDocument();
+    const loadedKey = { kid, openQueryModel: jest.fn().mockResolvedValue('abc') };
+    Object.defineProperty(protectedDatasource, 'protectedKey', { value: loadedKey, configurable: true });
+    view.rerender(
+      <TraceQLSearch datasource={protectedDatasource} query={saved} onChange={hostChange} onClearResults={onClearResults} />
+    );
+    await waitFor(() => expect(screen.getByLabelText('select password value')).toBeInTheDocument());
+    expect(loadedKey.openQueryModel).toHaveBeenCalledWith(
+      envelope,
+      JSON.stringify(['tempo-uid', 'filters', 'password', 'value'])
+    );
+    expect(hostChange).not.toHaveBeenCalled();
+    expect(saved.filters[0].value).toBe(envelope);
+  });
 });

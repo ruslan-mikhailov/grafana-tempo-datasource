@@ -1,5 +1,5 @@
 import { capitalize } from 'lodash';
-import { map, type Observable, scan, takeWhile } from 'rxjs';
+import { concatMap, type Observable, map, scan, takeWhile } from 'rxjs';
 import { v4 as uuidv4 } from 'uuid';
 import {
   type DataFrame,
@@ -22,11 +22,10 @@ import { getGrafanaLiveSrv } from '@grafana/runtime';
 
 import { MetricsQueryType, SearchStreamingState } from './dataquery';
 import { DEFAULT_SPSS, type TempoDatasource } from './datasource';
+import { extractProtectedSearchEntries } from './protectedAttributes/decrypt';
 import { formatTraceQLResponse } from './resultTransformer';
-import { type SearchMetrics, type TempoJsonData, type TempoQuery } from './types';
+import { type SearchMetrics, type TempoJsonData, type TempoQuery, type TraceSearchMetadata } from './types';
 import { stepToNanos } from './utils';
-
-const TEMPO_STREAMING_PROGRESS_REF_ID = 'streaming-progress';
 
 function getLiveStreamKey(): string {
   return uuidv4();
@@ -36,13 +35,16 @@ export function doTempoSearchStreaming(
   query: TempoQuery,
   ds: TempoDatasource,
   options: DataQueryRequest<TempoQuery>,
-  instanceSettings: DataSourceInstanceSettings<TempoJsonData>
+  instanceSettings: DataSourceInstanceSettings<TempoJsonData>,
+  displayRequestToken?: number
 ): Observable<DataQueryResponse> {
   const range = options.range;
 
   let frames: DataFrame[] | undefined = undefined;
   let state: LoadingState = LoadingState.NotStarted;
   const requestTime = performance.now();
+  const protectedKey = ds.protectedKey;
+  const protectedKeyEpoch = ds.protectedKeyEpoch;
 
   return getGrafanaLiveSrv()
     .getStream<MutableDataFrame>({
@@ -70,7 +72,7 @@ export function doTempoSearchStreaming(
       }, true)
     )
     .pipe(
-      map((evt) => {
+      concatMap(async (evt) => {
         if ('message' in evt && evt?.message) {
           const currentTime = performance.now();
           const elapsedTime = currentTime - requestTime;
@@ -78,7 +80,7 @@ export function doTempoSearchStreaming(
           const messageFrame = dataFrameFromJSON(evt.message);
           const fieldCache = new FieldCache(messageFrame);
 
-          const traces = fieldCache.getFieldByName('result')?.values[0];
+          const traces = (fieldCache.getFieldByName('result')?.values[0] ?? []) as TraceSearchMetadata[];
           const metrics = fieldCache.getFieldByName('metrics')?.values[0];
           const frameState = fieldCache.getFieldByName('state')?.values[0];
           const error = fieldCache.getFieldByName('error')?.values[0];
@@ -94,15 +96,24 @@ export function doTempoSearchStreaming(
               throw new Error(error);
           }
 
+          if (displayRequestToken !== undefined) {
+            const entries = await extractProtectedSearchEntries(traces, protectedKey);
+            ds.protectedValues.replace(query.refId, entries, protectedKeyEpoch, displayRequestToken);
+          }
+
           // The order of the frames is important. The metrics frame should always be the last frame.
           // This is because the metrics frame is used to display the progress of the streaming query
           // and we would like to display the results first.
           frames = [
-            ...formatTraceQLResponse(traces, instanceSettings, query.tableType),
-            metricsDataFrame(metrics, frameState, elapsedTime),
+            ...formatTraceQLResponse([...traces], instanceSettings, query.tableType).map((frame) => ({
+              ...frame,
+              refId: query.refId,
+            })),
+            metricsDataFrame(metrics, frameState, elapsedTime, query.refId),
           ];
         }
         return {
+          key: query.refId,
           data: frames || [],
           state,
         };
@@ -192,7 +203,9 @@ export function doTempoMetricsStreaming(
           return cloneQueryResponse(curr);
         }
         return mergeFrames(acc, curr);
-      })
+      }),
+      // A status-only packet has no frame refId; Grafana routes it by the outer key.
+      map((response) => ({ ...response, key: query.refId }))
     );
 }
 
@@ -248,7 +261,7 @@ function removeDuplicateTimeFieldValues(accFrame: DataFrame, timeFieldIndex: num
   }
 }
 
-function metricsDataFrame(metrics: SearchMetrics, state: SearchStreamingState, elapsedTime: number) {
+function metricsDataFrame(metrics: SearchMetrics, state: SearchStreamingState, elapsedTime: number, refId: string) {
   const progressThresholds: ThresholdsConfig = {
     steps: [
       {
@@ -264,7 +277,7 @@ function metricsDataFrame(metrics: SearchMetrics, state: SearchStreamingState, e
   };
 
   const frame: DataFrame = {
-    refId: TEMPO_STREAMING_PROGRESS_REF_ID,
+    refId,
     name: 'Streaming Progress',
     length: 1,
     fields: [

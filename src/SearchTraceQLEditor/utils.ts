@@ -7,6 +7,7 @@ import { VariableFormatID } from '@grafana/schema';
 import { type TraceqlFilter, TraceqlSearchScope } from '../dataquery';
 import { getEscapedRegexValues, getEscapedValues } from '../datasource';
 import type TempoLanguageProvider from '../language_provider';
+import { classifyProtectedFilter, isVariableBearing } from '../protectedAttributes/model';
 import { intrinsics } from '../traceql/traceql';
 import { type Scope } from '../types';
 
@@ -30,30 +31,56 @@ export const interpolateFilters = (filters: TraceqlFilter[], scopedVars?: Scoped
   return interpolatedFilters;
 };
 
+export const isProtectedBuilderValue = (filter: TraceqlFilter, lp: TempoLanguageProvider): boolean =>
+  Boolean(lp.datasource.instanceSettings?.jsonData?.protectedKeyId && classifyProtectedFilter(filter).requiresSealing);
+
+export function quoteTraceQLStringValue(value: string): string {
+  if (/[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error('Protected string contains a character unsupported by TraceQL');
+  }
+  return `\"${value.replace(/\\/g, '\\\\').replace(/\"/g, '\\\"')}\"`;
+}
 const isRegExpOperator = (operator: string) => operator === '=~' || operator === '!~';
 
-const valueHelper = (f: TraceqlFilter) => {
+const valueHelper = (f: TraceqlFilter, lp: TempoLanguageProvider) => {
   let value = f.value;
-
-  if (Array.isArray(value) && !f.isCustomValue) {
+  if (isProtectedBuilderValue(f, lp)) {
+    if (Array.isArray(value) && value.length === 1) {
+      value = value[0];
+    }
+    if (typeof value !== 'string') {
+      throw new Error('Protected filter requires a single string value');
+    }
+    if (classifyProtectedFilter(f).protectedReference && isVariableBearing(value)) {
+      throw new Error('Host variable values cannot be used for protected attributes');
+    }
+    return quoteTraceQLStringValue(value);
+  }
+  if (Array.isArray(value)) {
+    // Escaping belongs to each scalar, including custom values and the
+    // multi-value branch below, before the surrounding TraceQL quotes exist.
     value = getEscapedValues(value);
-
-    if (isRegExpOperator(f.operator!) && value.length > 1) {
+    if (isRegExpOperator(f.operator!) && value.length > 1 && !f.isCustomValue) {
       value = getEscapedRegexValues(value);
     }
-  }
-
-  if (Array.isArray(value) && value.length > 1) {
-    return `"${value.join('|')}"`;
+    if (value.length > 1) {
+      return `\"${value.join('|')}\"`;
+    }
+    value = value[0];
+  } else if (typeof value === 'string') {
+    value = getEscapedValues([value])[0];
   }
   if (f.valueType === 'string') {
-    return `"${value}"`;
+    return `\"${value}\"`;
   }
   return value;
 };
 
 const scopeHelper = (f: TraceqlFilter, lp: TempoLanguageProvider) => {
   // Intrinsic fields don't have a scope
+  if (isProtectedBuilderValue(f, lp) && f.scope && isVariableBearing(String(f.scope))) {
+    return `${f.scope}.`;
+  }
   if (lp.getIntrinsics().find((t) => t === f.tag)) {
     return '';
   }
@@ -80,13 +107,16 @@ const tagHelper = (f: TraceqlFilter, filters: TraceqlFilter[]) => {
 };
 
 export const filterToQuerySection = (f: TraceqlFilter, filters: TraceqlFilter[], lp: TempoLanguageProvider) => {
+  if (isProtectedBuilderValue(f, lp) && !['=', '!='].includes(f.operator ?? '')) {
+    throw new Error('Protected filters support equality and inequality only');
+  }
   if (Array.isArray(f.value) && f.value.length > 1 && !isRegExpOperator(f.operator!)) {
     // For negative operators (!=), use && instead of ||
     const joinOperator = f.operator === '!=' ? ' && ' : ' || ';
-    return `(${f.value.map((v) => `${scopeHelper(f, lp)}${tagHelper(f, filters)}${f.operator}${valueHelper({ ...f, value: v })}`).join(joinOperator)})`;
+    return `(${f.value.map((v) => `${scopeHelper(f, lp)}${tagHelper(f, filters)}${f.operator}${valueHelper({ ...f, value: v }, lp)}`).join(joinOperator)})`;
   }
 
-  return `${scopeHelper(f, lp)}${tagHelper(f, filters)}${f.operator}${valueHelper(f)}`;
+  return `${scopeHelper(f, lp)}${tagHelper(f, filters)}${f.operator}${valueHelper(f, lp)}`;
 };
 
 export const getTagWithoutScope = (tag: string) => {

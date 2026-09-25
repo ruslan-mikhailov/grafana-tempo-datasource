@@ -1,0 +1,20 @@
+FROM node:24-bookworm AS frontend
+WORKDIR /app
+RUN npm install --global npm@11.12.1
+COPY package.json package-lock.json .npmrc ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM golang:1.26.7-bookworm AS backend
+WORKDIR /app
+ARG TARGETARCH
+COPY go.mod go.sum ./
+RUN go mod download
+COPY pkg ./pkg
+RUN mkdir -p /out && arch=${TARGETARCH:-$(go env GOARCH)} && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "/out/gpx_grafana-tempo-datasource_linux_${arch}" ./pkg
+
+FROM grafana/grafana:13.1.3
+COPY --from=frontend --chown=472:0 /app/dist/ /var/lib/grafana/plugins/grafana-tempo-datasource/
+COPY --from=backend --chown=472:0 /out/ /var/lib/grafana/plugins/grafana-tempo-datasource/
+COPY --chown=472:0 custom.ini /etc/grafana/grafana.ini

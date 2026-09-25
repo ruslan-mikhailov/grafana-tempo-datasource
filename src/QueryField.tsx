@@ -1,5 +1,5 @@
 import { css } from '@emotion/css';
-import { PureComponent } from 'react';
+import { createRef, PureComponent } from 'react';
 
 import { QueryWithAssistantButton } from '@grafana/assistant';
 import { CoreApp, type QueryEditorProps, type SelectableValue } from '@grafana/data';
@@ -20,6 +20,8 @@ import TraceQLSearch from './SearchTraceQLEditor/TraceQLSearch';
 import { ServiceGraphSection } from './ServiceGraphSection';
 import { type TempoQueryType } from './dataquery';
 import { type TempoDatasource } from './datasource';
+import { type ProtectedDisplayEntry } from './protectedAttributes/decrypt';
+import { assertProtectedQueryModelSafe } from './protectedAttributes/model';
 import { QueryEditor } from './traceql/QueryEditor';
 import { type TempoQuery } from './types';
 import { migrateFromSearchToTraceQLSearch } from './utils';
@@ -30,6 +32,11 @@ interface Props extends QueryEditorProps<TempoDatasource, TempoQuery>, Themeable
 }
 interface State {
   uploadModalOpen: boolean;
+  keyBusy: boolean;
+  keyError?: string;
+  queryError?: string;
+  keyEpoch: number;
+  protectedEntries: readonly ProtectedDisplayEntry[];
 }
 
 // This needs to default to traceql for data sources like Splunk, where clicking on a
@@ -38,13 +45,162 @@ const DEFAULT_QUERY_TYPE: TempoQueryType = 'traceql';
 
 class TempoQueryFieldComponent extends PureComponent<Props, State> {
   private _isMounted = false;
+  private unsubscribeKey?: () => void;
+  private unsubscribeValues?: () => void;
+  private sealPending = false;
+  private awaitingHostCommit?: TempoQuery;
+  private editorCommitSource?: TempoDatasource;
+  private editorCommitEpoch?: number;
+  private editorCommitType?: TempoQueryType;
+  private editorCommit?: (next: TempoQuery) => void;
+  private editorPending?: (pending: boolean) => void;
+  private readonly keyTextInput = createRef<HTMLInputElement>();
+  private readonly keyFileInput = createRef<HTMLInputElement>();
 
   constructor(props: Props) {
     super(props);
     this.state = {
       uploadModalOpen: false,
+      keyBusy: false,
+      keyEpoch: props.datasource.protectedKeyEpoch,
+      protectedEntries: props.datasource.protectedValues.snapshot(),
     };
   }
+
+  private subscribeDatasource = (datasource: TempoDatasource) => {
+    this.unsubscribeKey?.();
+    this.unsubscribeValues?.();
+    this.unsubscribeKey = datasource.subscribeProtectedKey((keyEpoch) => {
+      if (this.props.datasource === datasource) {
+        this.sealPending = false;
+        this.awaitingHostCommit = undefined;
+        if (this.keyTextInput.current) {
+          this.keyTextInput.current.value = '';
+        }
+        if (this.keyFileInput.current) {
+          this.keyFileInput.current.value = '';
+        }
+        this.setState({ keyEpoch, keyError: undefined, protectedEntries: datasource.protectedValues.snapshot() });
+      }
+    });
+    this.unsubscribeValues = datasource.protectedValues.subscribe((protectedEntries) => {
+      if (this.props.datasource === datasource) {
+        this.setState({ protectedEntries });
+      }
+    });
+    this.setState({
+      keyEpoch: datasource.protectedKeyEpoch,
+      protectedEntries: datasource.protectedValues.snapshot(),
+      keyError: undefined,
+      queryError: undefined,
+    });
+  };
+
+  componentDidUpdate(previous: Props) {
+    if (previous.datasource !== this.props.datasource) {
+      this.sealPending = false;
+      this.awaitingHostCommit = undefined;
+      this.subscribeDatasource(this.props.datasource);
+      if (this.keyTextInput.current) {
+        this.keyTextInput.current.value = '';
+      }
+      if (this.keyFileInput.current) {
+        this.keyFileInput.current.value = '';
+      }
+    }
+    if (this.awaitingHostCommit &&
+      this.props.query.query === this.awaitingHostCommit.query &&
+      JSON.stringify(this.props.query.filters) === JSON.stringify(this.awaitingHostCommit.filters)) {
+      this.awaitingHostCommit = undefined;
+    }
+    if (previous.query !== this.props.query) {
+      this.migrateLegacySearch(this.props.query);
+    }
+  }
+
+  private migrateLegacySearch = (query: TempoQuery) => {
+    if (query.spanName || query.serviceName || query.search || query.maxDuration ||
+      query.minDuration || query.queryType === 'nativeSearch') {
+      this.onSafeChange(migrateFromSearchToTraceQLSearch(query));
+    }
+  };
+
+  private onSafeChange = (next: TempoQuery, fromEditor = false): boolean => {
+    if ((this.sealPending || this.awaitingHostCommit) && !fromEditor) {
+      this.setState({ queryError: 'Complete or unlock the protected query before changing it.' });
+      return false;
+    }
+    const kid = this.props.datasource.instanceSettings.jsonData.protectedKeyId;
+    try {
+      if (kid) {
+        assertProtectedQueryModelSafe(next, kid);
+      }
+    } catch {
+      this.setState({ queryError: 'Protected query cannot be saved until it is sealed or corrected.' });
+      return false;
+    }
+    this.setState({ queryError: undefined });
+    if (kid && next !== this.props.query) {
+      this.awaitingHostCommit = next;
+    }
+    this.props.onChange(next);
+    return true;
+  };
+
+  private onSafeRunQuery = (target: TempoQuery = this.props.query) => {
+    if (this.sealPending || (this.awaitingHostCommit &&
+      (target.queryType === 'traceql' || target.queryType === 'traceqlSearch'))) {
+      this.setState({ queryError: 'Complete or unlock the protected query before running it.' });
+      return;
+    }
+    const datasource = this.props.datasource;
+    const kid = datasource.instanceSettings.jsonData.protectedKeyId;
+    try {
+      if (kid) {
+        assertProtectedQueryModelSafe(target, kid);
+        const sealed = target.query?.startsWith('qenc:') ||
+          target.filters?.some((filter) => (Array.isArray(filter.value) ? filter.value : [filter.value])
+            .some((value) => value?.startsWith('qenc:')));
+        if (sealed && (target.queryType === 'traceql' || target.queryType === 'traceqlSearch') &&
+          datasource.protectedKey?.kid !== kid) {
+          throw new Error('Key unavailable');
+        }
+      }
+    } catch {
+      this.setState({ queryError: 'Complete or unlock the protected query before running it.' });
+      return;
+    }
+    this.props.onRunQuery();
+  };
+
+  private importKey = async (readKey: () => Promise<string>) => {
+    if (this.state.keyBusy) {
+      return;
+    }
+    const datasource = this.props.datasource;
+    const epoch = datasource.protectedKeyEpoch;
+    this.setState({ keyBusy: true, keyError: undefined });
+    try {
+      const base64 = await readKey();
+      if (this._isMounted && this.props.datasource === datasource && datasource.protectedKeyEpoch === epoch) {
+        await datasource.importProtectedKey(base64);
+      }
+    } catch {
+      if (this._isMounted && this.props.datasource === datasource) {
+        this.setState({ keyError: 'Unable to import key. Check its base64 bytes and configured key ID.' });
+      }
+    } finally {
+      if (this.keyTextInput.current) {
+        this.keyTextInput.current.value = '';
+      }
+      if (this.keyFileInput.current) {
+        this.keyFileInput.current.value = '';
+      }
+      if (this._isMounted) {
+        this.setState({ keyBusy: false });
+      }
+    }
+  };
 
   // Set the default query type when the component mounts.
   // Also do this if queryType is 'clear' (which is the case when the user changes the query type)
@@ -52,9 +208,11 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
   // which is inconsistent with how the UI was originally when they selected the Tempo data source.
   async componentDidMount() {
     this._isMounted = true;
+    this.subscribeDatasource(this.props.datasource);
+    this.migrateLegacySearch(this.props.query);
 
     if (!this.props.query.queryType || this.props.query.queryType === 'clear') {
-      this.props.onChange({
+      this.onSafeChange({
         ...this.props.query,
         queryType: DEFAULT_QUERY_TYPE,
       });
@@ -62,14 +220,15 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
     // TODO: Remove this automatic check for native histograms once Tempo only supports native histograms https://github.com/grafana/grafana/issues/109708
     // indentify the service map can use native histograms
     const timeRange = this.props.range;
-    const nativeHistograms = await this.props.datasource.getNativeHistograms(timeRange);
+    const datasource = this.props.datasource;
+    const nativeHistograms = await datasource.getNativeHistograms(timeRange);
 
-    // Only update if component is still mounted
-    if (!this._isMounted) {
+    // Ignore a response belonging to an editor whose datasource was replaced.
+    if (!this._isMounted || this.props.datasource !== datasource) {
       return;
     }
 
-    this.props.onChange({
+    const saved = this.onSafeChange({
       ...this.props.query,
       serviceMapUseNativeHistograms: nativeHistograms,
     });
@@ -84,55 +243,74 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
       this.props.query.serviceMapUseNativeHistograms === undefined &&
       // switch from tempo with native histograms to tempo without native histograms
       this.props.query.serviceMapUseNativeHistograms !== nativeHistograms &&
-      nativeHistograms
+      nativeHistograms &&
+      saved
     ) {
-      this.props.onRunQuery();
+      this.onSafeRunQuery();
     }
   }
 
   componentWillUnmount() {
     this._isMounted = false;
+    this.unsubscribeKey?.();
+    this.unsubscribeValues?.();
   }
 
-  onClearResults = () => {
-    // Run clear query to clear results
-    const { onChange, query, onRunQuery } = this.props;
-    onChange({
-      ...query,
-      queryType: 'clear',
-    });
-    onRunQuery();
+  onClearResults = (): boolean => {
+    // Do not discard a draft whose seal has not finished.
+    if (this.sealPending || this.awaitingHostCommit) {
+      this.setState({ queryError: 'Complete or unlock the protected query before changing it.' });
+      return false;
+    }
+    const clear = { ...this.props.query, queryType: 'clear' as const };
+    if (!this.onSafeChange(clear)) {
+      return false;
+    }
+    this.sealPending = false;
+    this.awaitingHostCommit = undefined;
+    this.onSafeRunQuery(clear);
+    return true;
   };
 
   render() {
-    const { query, onChange, datasource, app } = this.props;
+    const { query, datasource, app } = this.props;
     const isAlerting = app === CoreApp.UnifiedAlerting;
-
+    const kid = datasource.instanceSettings.jsonData.protectedKeyId;
+    const keyLoaded = Boolean(kid && datasource.protectedKey?.kid === kid);
+    const editorKey = `${datasource.uid}:${this.state.keyEpoch}`;
+    if (this.editorCommitSource !== datasource || this.editorCommitEpoch !== datasource.protectedKeyEpoch ||
+      this.editorCommitType !== query.queryType) {
+      const epoch = datasource.protectedKeyEpoch;
+      const queryType = query.queryType;
+      const isCurrentEditor = () => this._isMounted && this.props.datasource === datasource &&
+        datasource.protectedKeyEpoch === epoch && this.props.query.queryType === queryType;
+      this.editorCommitSource = datasource;
+      this.editorCommitEpoch = epoch;
+      this.editorCommitType = queryType;
+      this.editorCommit = (next) => {
+        // A seal finished by an editor unmounted on a key or query-type change must not reach Grafana.
+        if (isCurrentEditor()) {
+          this.onSafeChange(next, true);
+        }
+      };
+      this.editorPending = (pending) => {
+        if (isCurrentEditor()) {
+          this.sealPending = pending;
+        }
+      };
+    }
+    const editorCommit = this.editorCommit!;
+    const editorPending = this.editorPending!;
     const graphDatasourceUid = datasource.serviceMap?.datasourceUid;
 
-    let queryTypeOptions: Array<SelectableValue<TempoQueryType>> = [
+    const queryTypeOptions: Array<SelectableValue<TempoQueryType>> = [
       { value: 'traceqlSearch', label: 'Search' },
       { value: 'traceql', label: 'TraceQL' },
       { value: 'serviceMap', label: 'Service Graph' },
     ];
 
-    // Migrate user to new query type if they are using the old search query type
-    if (
-      query.spanName ||
-      query.serviceName ||
-      query.search ||
-      query.maxDuration ||
-      query.minDuration ||
-      query.queryType === 'nativeSearch'
-    ) {
-      onChange(migrateFromSearchToTraceQLSearch(query));
-    }
-
-    // only show query with assistant button if:
-    // feature toggle is enabled
-    // app is Explore, Dashboard, or PanelEditor
-    const showAssistant =
-      config.featureToggles.queryWithAssistant &&
+    // Assistant receives host query objects, not browser-only drafts.
+    const showAssistant = !kid && config.featureToggles.queryWithAssistant &&
       (app === CoreApp.Explore || app === CoreApp.Dashboard || app === CoreApp.PanelEditor);
     return (
       <>
@@ -148,13 +326,12 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
                 if (typeof result !== 'string' && result !== null) {
                   throw Error(`Unexpected result type: ${typeof result}`);
                 }
-                this.props.datasource.uploadedJson = result;
-                onChange({
-                  ...query,
-                  queryType: 'upload',
-                });
-                this.setState({ uploadModalOpen: false });
-                this.props.onRunQuery();
+                const upload = { ...query, queryType: 'upload' as const };
+                if (this.onSafeChange(upload)) {
+                  this.props.datasource.uploadedJson = result;
+                  this.setState({ uploadModalOpen: false });
+                  this.onSafeRunQuery(upload);
+                }
               }}
             />
           </div>
@@ -178,6 +355,9 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
                   options={queryTypeOptions}
                   value={query.queryType}
                   onChange={(v) => {
+                    if (!this.onClearResults()) {
+                      return;
+                    }
                     reportInteraction('grafana_traces_query_type_changed', {
                       datasourceType: 'tempo',
                       app: app ?? '',
@@ -185,12 +365,7 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
                       newQueryType: v,
                       previousQueryType: query.queryType ?? '',
                     });
-
-                    this.onClearResults();
-                    onChange({
-                      ...query,
-                      queryType: v,
-                    });
+                    this.onSafeChange({ ...query, queryType: v });
                   }}
                   size="md"
                 />
@@ -207,11 +382,69 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
             </InlineField>
           </InlineFieldRow>
         )}
+        {!isAlerting && kid && (
+          <div className={css({ marginBottom: this.props.theme.spacing(1) })}>
+            <span role="status">
+              {keyLoaded ? `Protected key loaded (${datasource.protectedKey?.kid})` : `Protected attributes locked (${kid})`}
+            </span>
+            <Stack gap={1} alignItems="center">
+              <input
+                aria-label="Protected key base64"
+                type="password"
+                autoComplete="off"
+                ref={this.keyTextInput}
+                disabled={this.state.keyBusy}
+              />
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={this.state.keyBusy}
+                onClick={() => void this.importKey(async () => this.keyTextInput.current?.value ?? '')}
+              >
+                Import key text
+              </Button>
+              <input
+                aria-label="Import protected key file"
+                type="file"
+                accept=".txt,.key,text/plain"
+                ref={this.keyFileInput}
+                disabled={this.state.keyBusy}
+                onChange={(event) => {
+                  const file = event.currentTarget.files?.[0];
+                  if (file) {
+                    void this.importKey(() => file.text());
+                  }
+                }}
+              />
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={this.state.keyBusy || !keyLoaded}
+                onClick={() => {
+                  datasource.clearProtectedKey();
+                  if (this.keyTextInput.current) {
+                    this.keyTextInput.current.value = '';
+                  }
+                  if (this.keyFileInput.current) {
+                    this.keyFileInput.current.value = '';
+                  }
+                  this.setState({ keyError: undefined });
+                }}
+              >
+                Clear key
+              </Button>
+            </Stack>
+            {this.state.keyError && <div role="alert">{this.state.keyError}</div>}
+          </div>
+        )}
+        {this.state.queryError && <div role="alert">{this.state.queryError}</div>}
         {query.queryType === 'traceqlSearch' && (
           <TraceQLSearch
-            datasource={this.props.datasource}
+            key={editorKey}
+            datasource={datasource}
             query={query}
-            onChange={onChange}
+            onChange={editorCommit}
+            onPendingChange={editorPending}
             onBlur={this.props.onBlur}
             app={app}
             onClearResults={this.onClearResults}
@@ -220,18 +453,38 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
           />
         )}
         {query.queryType === 'serviceMap' && (
-          <ServiceGraphSection graphDatasourceUid={graphDatasourceUid} query={query} onChange={onChange} />
+          <ServiceGraphSection graphDatasourceUid={graphDatasourceUid} query={query} onChange={this.onSafeChange} />
         )}
         {query.queryType === 'traceql' && (
           <QueryEditor
-            datasource={this.props.datasource}
+            key={editorKey}
+            datasource={datasource}
             query={query}
-            onRunQuery={this.props.onRunQuery}
-            onChange={onChange}
+            onRunQuery={this.onSafeRunQuery}
+            onChange={editorCommit}
+            onPendingChange={editorPending}
             app={app}
             onClearResults={this.onClearResults}
             range={this.props.range}
           />
+        )}
+        {kid && (
+          <section aria-label="Protected span attributes">
+            <h4>Protected span attributes</h4>
+            {this.state.protectedEntries.length === 0 ? (
+              <p>No protected span values in current results.</p>
+            ) : (
+              <ul>
+                {this.state.protectedEntries.map((entry, index) => (
+                  <li key={`${entry.traceID}:${entry.spanID ?? ''}:${entry.storedField}:${index}`}>
+                    <span>Trace {entry.traceID}</span>{' '}
+                    {entry.spanID && <span>Span {entry.spanID}</span>}{' '}
+                    <span>{entry.storedField}</span>: <span>{entry.value}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
         )}
       </>
     );

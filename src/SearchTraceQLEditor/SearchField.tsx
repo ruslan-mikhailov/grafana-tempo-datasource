@@ -12,6 +12,7 @@ import { type TraceqlFilter, TraceqlSearchScope } from '../dataquery';
 import { type TempoDatasource } from '../datasource';
 import { OPTIONS_LIMIT } from '../language_provider';
 import { operators as allOperators, stringOperators, numberOperators, keywordOperators } from '../traceql/traceql';
+import { classifyProtectedFilter } from '../protectedAttributes/model';
 
 import { filterScopedTag, operatorSelectableValue } from './utils';
 
@@ -77,12 +78,16 @@ const SearchField = ({
     () => filterScopedTag(filter, datasource.languageProvider),
     [datasource.languageProvider, filter]
   );
+  const protection = Boolean(datasource.instanceSettings?.jsonData?.protectedKeyId) &&
+    classifyProtectedFilter(filter).requiresSealing;
+  const explicitProtection = Boolean(datasource.instanceSettings?.jsonData?.protectedKeyId) &&
+    classifyProtectedFilter(filter).protectedReference;
   const [tagQuery, setTagQuery] = useState<string>('');
   const [tagValuesQuery, setTagValuesQuery] = useState<string>('');
 
   const updateOptions = async () => {
     try {
-      const result = filter.tag
+      const result = filter.tag && !protection && (!datasource.instanceSettings?.jsonData?.protectedKeyId || query)
         ? await datasource.languageProvider.getOptionsV2({
             tag: scopedTag,
             query,
@@ -107,6 +112,7 @@ const SearchField = ({
   const { loading: isLoadingValues, value: options } = useAsync(updateOptions, [
     scopedTag,
     datasource.languageProvider,
+    protection,
     setError,
     query,
     range,
@@ -139,6 +145,9 @@ const SearchField = ({
     case 'int':
     case 'float':
       operatorList = numberOperators;
+  }
+  if (protection) {
+    operatorList = ['=', '!='];
   }
   const operatorOptions = operatorList.map(operatorSelectableValue);
 
@@ -253,7 +262,7 @@ const SearchField = ({
             className={styles.dropdown}
             inputId={`${filter.id}-value`}
             isLoading={isLoadingValues}
-            options={addVariablesToOptions ? withTemplateVariableOptions(tagValueOptions) : tagValueOptions}
+            options={addVariablesToOptions && !explicitProtection ? withTemplateVariableOptions(tagValueOptions) : tagValueOptions}
             value={filter.value}
             onInputChange={(value: string, { action }: InputActionMeta) => {
               if (action === 'input-change') {
@@ -266,14 +275,14 @@ const SearchField = ({
                 updateFilter({
                   ...filter,
                   value: val.map((v) => v.value),
-                  valueType: val[0]?.type || uniqueOptionType,
+                  valueType: protection ? 'string' : val[0]?.type || uniqueOptionType,
                   isCustomValue: false,
                 });
               } else {
                 updateFilter({
                   ...filter,
                   value: val?.value,
-                  valueType: val?.type || uniqueOptionType,
+                  valueType: protection ? 'string' : val?.type || uniqueOptionType,
                   isCustomValue: false,
                 });
               }
@@ -282,7 +291,7 @@ const SearchField = ({
               updateFilter({
                 ...filter,
                 value: Array.isArray(filter.value) ? filter.value?.concat(val) : val,
-                valueType: uniqueOptionType ?? inferCustomValueType(val),
+                valueType: protection ? 'string' : uniqueOptionType ?? inferCustomValueType(val),
                 isCustomValue: true,
               });
             }}
