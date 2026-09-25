@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1260" height="750" viewBox="0 0 1260 750" role="img" aria-label="Expected Grafana Explore protected attribute display mockup">
+  <style>
+    text { font-family: "Nimbus Sans", sans-serif; font-size: 15px; fill: #dce0e6 }
+    .dim { fill: #a5adb9 }
+    .title { font-size: 18px; font-weight: 700 }
+    .heading { font-size: 14px; font-weight: 700 }
+    .mono { font-family: "Nimbus Mono PS", monospace; font-size: 15px }
+    .link { fill: #91baf4 }
+    .value { fill: #a8dfae; font-weight: 700 }
+  </style>
+  <rect width="1260" height="750" fill="#101217"/>
+  <rect x="18" y="18" width="1224" height="218" rx="7" fill="#1b1f24" stroke="#3d424b"/>
+  <text x="38" y="50" class="title">Explore  /  Tempo (no streaming)</text>
+  <text x="38" y="85" class="dim">Query type</text>
+  <rect x="146" y="62" width="112" height="33" rx="4" fill="#343b48"/>
+  <text x="161" y="85">TraceQL</text>
+  <text x="38" y="122">Protected attributes</text>
+  <text x="202" y="122" class="value">Key loaded · 630dcd29…25b4f</text>
+  <rect x="480" y="98" width="112" height="31" rx="4" fill="#343b48"/>
+  <text x="495" y="119">Replace key</text>
+  <rect x="600" y="98" width="100" height="31" rx="4" fill="#343b48"/>
+  <text x="615" y="119">Forget key</text>
+  <rect x="38" y="145" width="1184" height="33" rx="4" fill="#111318" stroke="#4a5060"/>
+  <text x="50" y="168" class="mono">{resource.service.name="protected-demo"} | select(span.enc.secret)</text>
+  <text x="38" y="207" class="dim">Search Options   Limit: 20   Spans Limit: 3   Table Format: Traces   Streaming: Disabled</text>
+  <rect x="18" y="255" width="1224" height="237" rx="7" fill="#1b1f24" stroke="#3d424b"/>
+  <text x="38" y="286" class="title">Table - Traces</text>
+  <rect x="38" y="305" width="1184" height="34" fill="#252a31"/>
+  <text x="67" y="328" class="heading">Trace ID</text>
+  <text x="400" y="328" class="heading">Start time</text>
+  <text x="665" y="328" class="heading">Service</text>
+  <text x="920" y="328" class="heading">Name</text>
+  <text x="39" y="364">⌄</text>
+  <text x="67" y="364" class="mono link">54e7f01d257543762f87a794493c112</text>
+  <text x="400" y="364">2026-09-25 15:36:33</text>
+  <text x="665" y="364">protected-demo</text>
+  <text x="920" y="364">protected-demo-request</text>
+  <rect x="38" y="382" width="1184" height="34" fill="#252a31"/>
+  <text x="67" y="405" class="heading">Span ID</text>
+  <text x="400" y="405" class="heading">Start time</text>
+  <text x="665" y="405" class="heading">enc.secret</text>
+  <text x="67" y="450" class="mono link">af8fdfc419aa7141</text>
+  <text x="400" y="450">2026-09-25 15:36:33</text>
+  <text x="665" y="450" class="value">abc</text>
+  <rect x="18" y="511" width="1224" height="209" rx="7" fill="#1b1f24" stroke="#3d424b"/>
+  <text x="38" y="544" class="title">Trace detail  /  protected-demo-request</text>
+  <text x="38" y="579" class="dim">Span af8fdfc419aa7141  /  Tags</text>
+  <rect x="38" y="599" width="1184" height="42" fill="#252a31"/>
+  <text x="65" y="625">enc.secret</text>
+  <text x="390" y="625" class="value">abc</text>
+  <text x="38" y="680" class="dim">Mockup only. Backend response and raw frame value remain enc:v1:…</text>
+</svg>

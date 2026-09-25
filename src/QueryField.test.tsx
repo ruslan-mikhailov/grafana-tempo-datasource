@@ -29,7 +29,11 @@ const mockEditorPendingCallbacks: Array<(pending: boolean) => void> = [];
 const mockEditorCommitCallbacks: Array<(query: TempoQuery) => void> = [];
 
 jest.mock('./traceql/QueryEditor', () => ({
-  QueryEditor: ({ onChange, onRunQuery, onPendingChange }: {
+  QueryEditor: ({
+    onChange,
+    onRunQuery,
+    onPendingChange,
+  }: {
     onChange: (query: TempoQuery) => void;
     onRunQuery: () => void;
     onPendingChange: (pending: boolean) => void;
@@ -38,14 +42,36 @@ jest.mock('./traceql/QueryEditor', () => ({
     mockEditorCommitCallbacks.push(onChange);
     return (
       <div data-testid="traceql-editor">
-        <button type="button" onClick={() => onChange({
-          refId: 'A', queryType: 'traceql', query: '{span.enc.password="secret"}',
-        } as TempoQuery)}>Unsafe host change</button>
-        <button type="button" onClick={() => onChange({
-          refId: 'A', queryType: 'traceql', query: '{span.http.route="public"}',
-        } as TempoQuery)}>Ordinary host change</button>
-        <button type="button" onClick={() => onPendingChange(true)}>Start protected seal</button>
-        <button type="button" onClick={onRunQuery}>Run from editor</button>
+        <button
+          type="button"
+          onClick={() =>
+            onChange({
+              refId: 'A',
+              queryType: 'traceql',
+              query: '{span.enc.password="secret"}',
+            } as TempoQuery)
+          }
+        >
+          Unsafe host change
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            onChange({
+              refId: 'A',
+              queryType: 'traceql',
+              query: '{span.http.route="public"}',
+            } as TempoQuery)
+          }
+        >
+          Ordinary host change
+        </button>
+        <button type="button" onClick={() => onPendingChange(true)}>
+          Start protected seal
+        </button>
+        <button type="button" onClick={onRunQuery}>
+          Run from editor
+        </button>
       </div>
     );
   },
@@ -71,10 +97,17 @@ jest.mock('@grafana/ui', () => {
         Mock file dropzone
       </button>
     ),
+    Input: React.forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTMLInputElement>>((props, ref) => (
+      <input {...props} ref={ref} />
+    )),
     InlineField: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
     InlineFieldRow: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-    Modal: ({ children, isOpen }: { children: React.ReactNode; isOpen: boolean }) =>
-      isOpen ? <div>{children}</div> : null,
+    Modal: ({ children, isOpen, title }: { children: React.ReactNode; isOpen: boolean; title: string }) =>
+      isOpen ? (
+        <div role="dialog" aria-label={title}>
+          {children}
+        </div>
+      ) : null,
     RadioButtonGroup: ({
       options,
       onChange,
@@ -297,31 +330,65 @@ describe('QueryField', () => {
     expect(screen.queryByTestId('query-with-assistant-button')).not.toBeInTheDocument();
   });
 
-  it('imports text and local file bytes without writing keys into host models; mismatch retains prior key', async () => {
+  it('loads pasted or local-file keys in the dialog without writing them into host models; mismatch keeps the prior key', async () => {
     const user = userEvent.setup();
     const onChange = jest.fn();
     const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
     jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
     renderQueryField({ datasource, onChange });
 
-    await user.type(screen.getByLabelText('Protected key base64'), master);
-    await user.click(screen.getByRole('button', { name: 'Import key text' }));
-    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(`Protected key loaded (${kid})`));
-    expect(screen.getByLabelText('Protected key base64')).toHaveValue('');
+    expect(screen.getByRole('status')).toHaveTextContent('Key needed');
+    expect(screen.queryByLabelText('Paste base64 key')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Load key' }));
+    expect(screen.getByRole('dialog', { name: 'Load protected key' })).toHaveTextContent(`Expected key ID: ${kid}`);
+    await user.type(screen.getByLabelText('Paste base64 key'), master);
+    await user.click(screen.getAllByRole('button', { name: 'Load key' })[1]);
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Key loaded · 630dcd29…25b4f'));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
     const previousKey = datasource.protectedKey;
-    await user.type(screen.getByLabelText('Protected key base64'), Buffer.alloc(32, 7).toString('base64'));
-    await user.click(screen.getByRole('button', { name: 'Import key text' }));
+    await user.click(screen.getByRole('button', { name: 'Replace key' }));
+    await user.type(screen.getByLabelText('Paste base64 key'), Buffer.alloc(32, 7).toString('base64'));
+    await user.click(screen.getByRole('button', { name: 'Load key' }));
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Unable to import key'));
     expect(datasource.protectedKey).toBe(previousKey);
-    expect(screen.getByLabelText('Protected key base64')).toHaveValue('');
+    expect(screen.getByLabelText('Paste base64 key')).toHaveValue('');
 
     const file = new File([master], 'key.txt', { type: 'text/plain' });
     Object.defineProperty(file, 'text', { value: async () => master });
-    await user.upload(screen.getByLabelText('Import protected key file'), file);
+    await user.upload(screen.getByLabelText('Protected key file'), file);
+    expect(screen.getByText('key.txt')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Load key' }));
     await waitFor(() => expect(datasource.protectedKey).not.toBe(previousKey));
-    expect(screen.getByLabelText('Import protected key file')).toHaveValue('');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(JSON.stringify(onChange.mock.calls)).not.toContain(master);
     expect(JSON.stringify(onChange.mock.calls)).not.toContain('secret');
+  });
+
+  it('keeps pasted and file keys exclusive and cancel discards the unsent key', async () => {
+    const user = userEvent.setup();
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
+    renderQueryField({ datasource });
+
+    await user.click(screen.getByRole('button', { name: 'Load key' }));
+    await user.click(screen.getAllByRole('button', { name: 'Load key' })[1]);
+    expect(screen.getByRole('alert')).toHaveTextContent('Paste a base64 key or choose a local key file.');
+    await user.type(screen.getByLabelText('Paste base64 key'), 'wrong');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    const file = new File([master], 'key.txt', { type: 'text/plain' });
+    await user.upload(screen.getByLabelText('Protected key file'), file);
+    expect(screen.getByLabelText('Paste base64 key')).toHaveValue('');
+    await user.type(screen.getByLabelText('Paste base64 key'), 'wrong-again');
+    expect(screen.queryByText('key.txt')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Protected key file')).toHaveValue('');
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(datasource.protectedKey).toBeUndefined();
+
+    await user.click(screen.getByRole('button', { name: 'Load key' }));
+    expect(screen.getByLabelText('Paste base64 key')).toHaveValue('');
+    expect(screen.queryByText('key.txt')).not.toBeInTheDocument();
   });
 
   it('notifies all mounted editors and clears only the shared datasource pane on key clear', async () => {
@@ -329,26 +396,37 @@ describe('QueryField', () => {
     const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
     jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
     await datasource.importProtectedKey(master);
-    const sealed = await (await importKey(master)).sealQueryModel(
-      '{span.enc.password="secret"}', JSON.stringify(['tempo-uid', 'query'])
-    );
+    const sealed = await (
+      await importKey(master)
+    ).sealQueryModel('{span.enc.password="secret"}', JSON.stringify(['tempo-uid', 'query']));
     const query = { refId: 'A', queryType: 'traceql', query: sealed } as TempoQuery;
     const first = renderQueryField({ datasource, query });
     const second = renderQueryField({ datasource, query });
     const originalEditors = screen.getAllByTestId('traceql-editor');
     const token = datasource.protectedValues.beginRequest();
-    datasource.protectedValues.replace('A', [{
-      traceID: 'trace1', spanID: 'span1', storedField: 'enc.password', status: 'decrypted', value: '<secret>',
-    }], datasource.protectedKeyEpoch, token);
+    datasource.protectedValues.replace(
+      'A',
+      [
+        {
+          traceID: 'trace1',
+          spanID: 'span1',
+          storedField: 'enc.password',
+          status: 'decrypted',
+          value: '<secret>',
+        },
+      ],
+      datasource.protectedKeyEpoch,
+      token
+    );
     await waitFor(() => expect(screen.getAllByText('<secret>')).toHaveLength(2));
     expect(first.container.innerHTML).toContain('&lt;secret&gt;');
 
-    await user.click(screen.getAllByRole('button', { name: 'Clear key' })[0]);
+    await user.click(screen.getAllByRole('button', { name: 'Forget key' })[0]);
     await waitFor(() => expect(screen.getAllByText('No protected span values in current results.')).toHaveLength(2));
     const nextEditors = screen.getAllByTestId('traceql-editor');
     expect(nextEditors[0]).not.toBe(originalEditors[0]);
     expect(nextEditors[1]).not.toBe(originalEditors[1]);
-    expect(second.container).toHaveTextContent(`Protected attributes locked (${kid})`);
+    expect(second.container).toHaveTextContent('Key needed');
     await user.click(screen.getAllByRole('button', { name: 'Run from editor' })[1]);
     expect(second.props.onRunQuery).not.toHaveBeenCalled();
   });
@@ -356,14 +434,18 @@ describe('QueryField', () => {
   it('does not let a late native histogram callback overwrite a sealed editor commit before host acknowledgement', async () => {
     let completeNative!: (enabled: boolean) => void;
     const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
-    jest.spyOn(datasource, 'getNativeHistograms').mockImplementation(() =>
-      new Promise<boolean>((resolve) => { completeNative = resolve; }));
+    jest.spyOn(datasource, 'getNativeHistograms').mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          completeNative = resolve;
+        })
+    );
     const onChange = jest.fn();
     const query = { refId: 'A', queryType: 'traceql' } as TempoQuery;
     renderQueryField({ datasource, query, onChange });
-    const sealed = await (await importKey(master)).sealQueryModel(
-      '{span.enc.password="secret"}', JSON.stringify(['tempo-uid', 'query'])
-    );
+    const sealed = await (
+      await importKey(master)
+    ).sealQueryModel('{span.enc.password="secret"}', JSON.stringify(['tempo-uid', 'query']));
     const pending = mockEditorPendingCallbacks[mockEditorPendingCallbacks.length - 1];
     const commit = mockEditorCommitCallbacks[mockEditorCommitCallbacks.length - 1];
     act(() => {
@@ -372,7 +454,9 @@ describe('QueryField', () => {
       pending(false);
     });
     expect(onChange).toHaveBeenCalledTimes(1);
-    await act(async () => { completeNative(false); });
+    await act(async () => {
+      completeNative(false);
+    });
     expect(onChange).toHaveBeenCalledTimes(1);
     expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ query: sealed }));
   });
@@ -389,7 +473,7 @@ describe('QueryField', () => {
     mounted.rerender(<QueryField {...mounted.props} query={accepted} />);
     onChange.mockClear();
     const stalePending = mockEditorPendingCallbacks[0];
-    await user.click(screen.getByRole('button', { name: 'Clear key' }));
+    await user.click(screen.getByRole('button', { name: 'Forget key' }));
     const currentPending = mockEditorPendingCallbacks[mockEditorPendingCallbacks.length - 1];
     expect(currentPending).not.toBe(stalePending);
     act(() => {
@@ -400,7 +484,7 @@ describe('QueryField', () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it('discards a deferred file read when another editor clears the shared key', async () => {
+  it('discards a deferred file read when another editor forgets the shared key', async () => {
     const user = userEvent.setup();
     const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
     jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
@@ -410,14 +494,22 @@ describe('QueryField', () => {
     renderQueryField({ datasource });
     let completeRead!: (value: string) => void;
     const file = new File([master], 'key.txt', { type: 'text/plain' });
-    Object.defineProperty(file, 'text', { value: () => new Promise<string>((resolve) => { completeRead = resolve; }) });
-    await user.upload(screen.getAllByLabelText('Import protected key file')[0], file);
-    await user.type(screen.getAllByLabelText('Protected key base64')[1], master);
-    await user.click(screen.getAllByRole('button', { name: 'Clear key' })[1]);
-    expect(screen.getAllByLabelText('Protected key base64')[1]).toHaveValue('');
-    await act(async () => { completeRead(master); });
+    Object.defineProperty(file, 'text', {
+      value: () =>
+        new Promise<string>((resolve) => {
+          completeRead = resolve;
+        }),
+    });
+    await user.click(screen.getAllByRole('button', { name: 'Replace key' })[0]);
+    await user.upload(screen.getByLabelText('Protected key file'), file);
+    await user.click(screen.getByRole('button', { name: 'Load key' }));
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    await user.click(screen.getAllByRole('button', { name: 'Forget key' })[1]);
+    await act(async () => {
+      completeRead(master);
+    });
     expect(importSpy).not.toHaveBeenCalled();
     expect(datasource.protectedKey).toBeUndefined();
-    expect(screen.getAllByLabelText('Import protected key file')[0]).toHaveValue('');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 });
