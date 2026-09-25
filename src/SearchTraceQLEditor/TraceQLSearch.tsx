@@ -9,7 +9,12 @@ import { Alert, Button, Stack, Select, useStyles2, TextLink } from '@grafana/ui'
 import { RawQuery } from '../_importedDependencies/datasources/prometheus/RawQuery';
 import { type TraceqlFilter, TraceqlSearchScope } from '../dataquery';
 import { type TempoDatasource } from '../datasource';
-import { assertProtectedQueryModelSafe, assertStaticProtectedFilterDefaultsSafe, openProtectedQueryModel, prepareProtectedQueryModel } from '../protectedAttributes/model';
+import {
+  assertProtectedQueryModelSafe,
+  assertStaticProtectedFilterDefaultsSafe,
+  openProtectedQueryModel,
+  prepareProtectedQueryModel,
+} from '../protectedAttributes/model';
 import { TempoQueryBuilderOptions } from '../traceql/TempoQueryBuilderOptions';
 import { traceqlGrammar } from '../traceql/traceql';
 import { type TempoQuery } from '../types';
@@ -52,12 +57,14 @@ const TraceQLSearch = ({
   const [isTagsLoading, setIsTagsLoading] = useState(true);
   const [traceQlQuery, setTraceQlQuery] = useState<string>('');
 
-  const kid = datasource.instanceSettings?.jsonData?.protectedKeyId;
+  const protectedMode = datasource.instanceSettings?.jsonData?.protectedAttributesEnabled;
   const key = datasource.protectedKey;
-  const [draftModel, setDraftModel] = useState<TempoQuery>(() => kid
-    ? { ...query, filters: (query.filters ?? []).map((filter) => ({ ...filter, value: undefined })) }
-    : query);
-  const [locked, setLocked] = useState(Boolean(kid));
+  const [draftModel, setDraftModel] = useState<TempoQuery>(() =>
+    protectedMode
+      ? { ...query, filters: (query.filters ?? []).map((filter) => ({ ...filter, value: undefined })) }
+      : query
+  );
+  const [locked, setLocked] = useState(Boolean(protectedMode));
   const [legacy, setLegacy] = useState(false);
   const [pending, setPending] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -68,14 +75,15 @@ const TraceQLSearch = ({
   const savedModel = useRef<TempoQuery | undefined>(undefined);
   const draftRef = useRef(draftModel);
   draftRef.current = draftModel;
+  const savedKey = useRef(key);
   const templateSrv = getTemplateSrv();
 
   useEffect(() => {
-    if (savedModel.current === query) {
+    if (savedKey.current === key && savedModel.current === query) {
       return;
     }
     const current = ++generation.current;
-    if (!kid) {
+    if (!protectedMode) {
       draftRef.current = query;
       setDraftModel(query);
       setLocked(false);
@@ -91,17 +99,28 @@ const TraceQLSearch = ({
       return;
     }
     try {
-      assertProtectedQueryModelSafe(query, kid);
+      assertProtectedQueryModelSafe(query, key?.kid);
     } catch {
       setLocked(true);
-      setLegacy(Boolean(key?.kid === kid && !query.query?.startsWith('qenc:')));
+      setLegacy(
+        Boolean(
+          key &&
+          !query.query?.startsWith('qenc:') &&
+          !query.filters?.some((filter) =>
+            (Array.isArray(filter.value) ? filter.value : [filter.value]).some((value) => value?.startsWith('qenc:'))
+          )
+        )
+      );
       setAlertText('Protected saved search must be corrected before editing');
       return;
     }
     setLegacy(false);
-    const hasSealedValues = Boolean(query.query?.startsWith('qenc:') ||
-      query.filters?.some((filter) => (Array.isArray(filter.value) ? filter.value : [filter.value])
-        .some((value) => value?.startsWith('qenc:'))));
+    const hasSealedValues = Boolean(
+      query.query?.startsWith('qenc:') ||
+      query.filters?.some((filter) =>
+        (Array.isArray(filter.value) ? filter.value : [filter.value]).some((value) => value?.startsWith('qenc:'))
+      )
+    );
     if (!hasSealedValues) {
       draftRef.current = query;
       setDraftModel(query);
@@ -109,7 +128,7 @@ const TraceQLSearch = ({
       return;
     }
     setLocked(true);
-    if (key?.kid !== kid) {
+    if (!key) {
       return;
     }
     void openProtectedQueryModel(query, key, datasource.uid).then(
@@ -129,73 +148,84 @@ const TraceQLSearch = ({
     );
     // Opening and editing share a generation; own host acknowledgements must
     // not cancel a newer local draft.
-  }, [query, key, kid, datasource.uid, datasource.search?.filters]);
+  }, [query, key, protectedMode, datasource.uid, datasource.search?.filters]);
 
-  useEffect(() => () => { generation.current++; }, []);
+  useEffect(
+    () => () => {
+      generation.current++;
+    },
+    []
+  );
   useEffect(() => {
     onPendingChange?.(locked || pending || dirty || copyPending);
   }, [locked, pending, dirty, copyPending, onPendingChange]);
   useEffect(() => () => onPendingChange?.(false), [onPendingChange]);
 
-  const emitDraft = useCallback((next: TempoQuery) => {
-    if (locked) {
-      return;
-    }
-    draftRef.current = next;
-    setDraftModel(next);
-    setDirty(true);
-    dirtyRef.current = true;
-    if (copyPendingRef.current) {
-      copyPendingRef.current = false;
-      setCopyPending(false);
-    }
-    onPendingChange?.(true);
-    const current = ++generation.current;
-    if (!kid) {
-      savedModel.current = next;
-      onChange(next);
-      dirtyRef.current = false;
-      setDirty(false);
-      onPendingChange?.(copyPendingRef.current);
-      return;
-    }
-    setPending(true);
-    try {
-      if (!key) {
-        assertProtectedQueryModelSafe(next, kid);
+  const emitDraft = useCallback(
+    (next: TempoQuery) => {
+      if (locked) {
+        return;
+      }
+      draftRef.current = next;
+      setDraftModel(next);
+      setDirty(true);
+      dirtyRef.current = true;
+      if (copyPendingRef.current) {
+        copyPendingRef.current = false;
+        setCopyPending(false);
+      }
+      onPendingChange?.(true);
+      const current = ++generation.current;
+      if (!protectedMode) {
         savedModel.current = next;
+        savedKey.current = key;
         onChange(next);
         dirtyRef.current = false;
         setDirty(false);
         onPendingChange?.(copyPendingRef.current);
-        setPending(false);
         return;
       }
-      void prepareProtectedQueryModel(next, key, datasource.uid, query).then(
-        (sealed) => {
-          if (generation.current !== current || datasource.protectedKey !== key) {
-            return;
-          }
-          savedModel.current = sealed;
-          onChange(sealed);
+      setPending(true);
+      try {
+        if (!key) {
+          assertProtectedQueryModelSafe(next);
+          savedKey.current = key;
+          savedModel.current = next;
+          onChange(next);
           dirtyRef.current = false;
           setDirty(false);
           onPendingChange?.(copyPendingRef.current);
           setPending(false);
-          setAlertText(undefined);
-        },
-        () => {
-          if (generation.current === current) {
-            setPending(false);
-            setAlertText('Complete or correct protected filter before saving');
-          }
+          return;
         }
-      );
-    } catch {
-      setPending(false);
-      setAlertText('Complete or correct protected filter before saving');
-    }
-  }, [locked, kid, key, datasource, onChange, onPendingChange, query]);
+        void prepareProtectedQueryModel(next, key, datasource.uid, query).then(
+          (sealed) => {
+            if (generation.current !== current || datasource.protectedKey !== key) {
+              return;
+            }
+            savedKey.current = key;
+            savedModel.current = sealed;
+            onChange(sealed);
+            dirtyRef.current = false;
+            setDirty(false);
+            onPendingChange?.(copyPendingRef.current);
+            setPending(false);
+            setAlertText(undefined);
+          },
+          () => {
+            if (generation.current === current) {
+              setPending(false);
+              setAlertText('Complete or correct protected filter before saving');
+            }
+          }
+        );
+      } catch {
+        setPending(false);
+        setAlertText('Complete or correct protected filter before saving');
+      }
+    },
+    [locked, protectedMode, key, datasource, onChange, onPendingChange, query]
+  );
 
   const updateFilter = useCallback(
     (filter: TraceqlFilter) => {
@@ -214,19 +244,21 @@ const TraceQLSearch = ({
 
   const templateVariables = getTemplateSrv().getVariables();
   useEffect(() => {
-    if (locked || pending || (kid && (dirtyRef.current || dirty))) {
+    if (locked || pending || (protectedMode && (dirtyRef.current || dirty))) {
       setTraceQlQuery('');
       return;
     }
     try {
-      setTraceQlQuery(datasource.languageProvider.generateQueryFromFilters({
-        traceqlFilters: kid ? draftModel.filters || [] : interpolateFilters(draftModel.filters || []),
-      }));
+      setTraceQlQuery(
+        datasource.languageProvider.generateQueryFromFilters({
+          traceqlFilters: protectedMode ? draftModel.filters || [] : interpolateFilters(draftModel.filters || []),
+        })
+      );
     } catch {
       setTraceQlQuery('');
       setAlertText('Protected search filter cannot be displayed until corrected');
     }
-  }, [datasource.languageProvider, draftModel, templateVariables, locked, pending, dirty, kid]);
+  }, [datasource.languageProvider, draftModel, templateVariables, locked, pending, dirty, protectedMode]);
 
   const findFilter = useCallback((id: string) => draftModel.filters?.find((f) => f.id === id), [draftModel.filters]);
 
@@ -250,7 +282,7 @@ const TraceQLSearch = ({
       return;
     }
     try {
-      if (kid) {
+      if (protectedMode) {
         assertStaticProtectedFilterDefaultsSafe(datasource.search.filters);
       }
       for (const filter of datasource.search.filters ?? []) {
@@ -261,7 +293,7 @@ const TraceQLSearch = ({
     } catch {
       setAlertText('Configured protected search defaults must be removed');
     }
-  }, [datasource.search?.filters, findFilter, updateFilter, locked, pending, kid]);
+  }, [datasource.search?.filters, findFilter, updateFilter, locked, pending, protectedMode]);
 
   // filter out tags that already exist in the static fields
   const staticTags = datasource.search?.filters?.map((f) => f.tag) || [];
@@ -287,7 +319,7 @@ const TraceQLSearch = ({
   // For example, if we already have a service.name value selected and try to add another one, we won't see the other
   // values if we send the full query since Tempo will only return the service.name that's already selected.
   const generateQueryWithoutFilter = (filter?: TraceqlFilter) => {
-    if (locked || pending || (kid && (dirtyRef.current || dirty))) {
+    if (locked || pending || (protectedMode && (dirtyRef.current || dirty))) {
       return '';
     }
     if (!filter) {
@@ -295,8 +327,9 @@ const TraceQLSearch = ({
     }
     try {
       return datasource.languageProvider.generateQueryFromFilters({
-        traceqlFilters: kid ? draftModel.filters?.filter((f) => f.id !== filter.id) || [] :
-          interpolateFilters(draftModel.filters?.filter((f) => f.id !== filter.id) || []),
+        traceqlFilters: protectedMode
+          ? draftModel.filters?.filter((f) => f.id !== filter.id) || []
+          : interpolateFilters(draftModel.filters?.filter((f) => f.id !== filter.id) || []),
       });
     } catch {
       return '';
@@ -307,221 +340,239 @@ const TraceQLSearch = ({
     <>
       {locked ? (
         <>
-          <TemporaryAlert severity="info" text="Import the matching key or correct the saved protected search before editing" />
-          {legacy && key?.kid === kid && (
-            <Button variant="secondary" onClick={() => {
-              const currentKey = datasource.protectedKey;
-              if (!currentKey || currentKey.kid !== kid) {
-                return;
-              }
-              const current = ++generation.current;
-              void prepareProtectedQueryModel(query, currentKey, datasource.uid, query).then(
-                (sealed) => {
-                  if (generation.current === current && datasource.protectedKey === currentKey) {
-                    savedModel.current = undefined;
-                    onChange(sealed);
-                  }
-                },
-                () => setAlertText('Correct legacy search filters before migrating them')
-              );
-            }}>Seal legacy search filters</Button>
+          <TemporaryAlert
+            severity="info"
+            text="Import the matching key or correct the saved protected search before editing"
+          />
+          {legacy && key && (
+            <Button
+              variant="secondary"
+              onClick={() => {
+                const currentKey = datasource.protectedKey;
+                if (!currentKey) {
+                  return;
+                }
+                const current = ++generation.current;
+                void prepareProtectedQueryModel(query, currentKey, datasource.uid, query).then(
+                  (sealed) => {
+                    if (generation.current === current && datasource.protectedKey === currentKey) {
+                      savedModel.current = undefined;
+                      onChange(sealed);
+                    }
+                  },
+                  () => setAlertText('Correct legacy search filters before migrating them')
+                );
+              }}
+            >
+              Seal legacy search filters
+            </Button>
           )}
         </>
       ) : (
-      <div className={styles.container}>
-        <div>
-          {datasource.search?.filters?.map(
-            (f) =>
-              f.tag && (
-                <InlineSearchField
-                  key={f.id}
-                  label={filterTitle(f, datasource.languageProvider)}
-                  tooltip={`Filter your search by ${filterScopedTag(
-                    f,
-                    datasource.languageProvider
-                  )}. To modify the default filters shown for search visit the Tempo datasource configuration page.`}
-                >
-                  <SearchField
-                    filter={findFilter(f.id) || f}
-                    datasource={datasource}
-                    setError={setError}
-                    updateFilter={updateFilter}
-                    tags={[]}
-                    hideScope={true}
-                    hideTag={true}
-                    query={generateQueryWithoutFilter(findFilter(f.id))}
-                    addVariablesToOptions={addVariablesToOptions}
-                    range={range}
-                    timeRangeForTags={datasource.timeRangeForTags}
-                  />
-                </InlineSearchField>
-              )
-          )}
-          <InlineSearchField label={'Status'}>
-            <SearchField
-              filter={
-                findFilter('status') || {
-                  id: 'status',
-                  tag: 'status',
-                  scope: TraceqlSearchScope.Intrinsic,
-                  operator: '=',
-                }
-              }
-              datasource={datasource}
-              setError={setError}
-              updateFilter={updateFilter}
-              tags={[]}
-              hideScope={true}
-              hideTag={true}
-              query={generateQueryWithoutFilter(findFilter('status'))}
-              isMulti={false}
-              allowCustomValue={false}
-              addVariablesToOptions={addVariablesToOptions}
-              range={range}
-              timeRangeForTags={datasource.timeRangeForTags}
-            />
-          </InlineSearchField>
-          <InlineSearchField
-            label={'Duration'}
-            tooltip="The trace or span duration, i.e. end - start time of the trace/span. Accepted units are ns, ms, s, m, h"
-          >
-            <Stack gap={0}>
-              <Select
-                width="auto"
-                options={[
-                  { label: 'span', value: 'span' },
-                  { label: 'trace', value: 'trace' },
-                ]}
-                value={findFilter('duration-type')?.value ?? 'span'}
-                onChange={(v) => {
-                  const filter = findFilter('duration-type') || {
-                    id: 'duration-type',
-                    value: 'span',
-                  };
-                  updateFilter({ ...filter, value: v?.value });
-                }}
-                aria-label={'duration type'}
-              />
-              <DurationInput
+        <div className={styles.container}>
+          <div>
+            {datasource.search?.filters?.map(
+              (f) =>
+                f.tag && (
+                  <InlineSearchField
+                    key={f.id}
+                    label={filterTitle(f, datasource.languageProvider)}
+                    tooltip={`Filter your search by ${filterScopedTag(
+                      f,
+                      datasource.languageProvider
+                    )}. To modify the default filters shown for search visit the Tempo datasource configuration page.`}
+                  >
+                    <SearchField
+                      filter={findFilter(f.id) || f}
+                      datasource={datasource}
+                      setError={setError}
+                      updateFilter={updateFilter}
+                      tags={[]}
+                      hideScope={true}
+                      hideTag={true}
+                      query={generateQueryWithoutFilter(findFilter(f.id))}
+                      addVariablesToOptions={addVariablesToOptions}
+                      range={range}
+                      timeRangeForTags={datasource.timeRangeForTags}
+                    />
+                  </InlineSearchField>
+                )
+            )}
+            <InlineSearchField label={'Status'}>
+              <SearchField
                 filter={
-                  findFilter('min-duration') || {
-                    id: 'min-duration',
-                    tag: 'duration',
-                    operator: '>',
-                    valueType: 'duration',
+                  findFilter('status') || {
+                    id: 'status',
+                    tag: 'status',
+                    scope: TraceqlSearchScope.Intrinsic,
+                    operator: '=',
                   }
                 }
-                operators={['>', '>=']}
+                datasource={datasource}
+                setError={setError}
                 updateFilter={updateFilter}
+                tags={[]}
+                hideScope={true}
+                hideTag={true}
+                query={generateQueryWithoutFilter(findFilter('status'))}
+                isMulti={false}
+                allowCustomValue={false}
+                addVariablesToOptions={addVariablesToOptions}
+                range={range}
+                timeRangeForTags={datasource.timeRangeForTags}
               />
-              <DurationInput
-                filter={
-                  findFilter('max-duration') || {
-                    id: 'max-duration',
-                    tag: 'duration',
-                    operator: '<',
-                    valueType: 'duration',
+            </InlineSearchField>
+            <InlineSearchField
+              label={'Duration'}
+              tooltip="The trace or span duration, i.e. end - start time of the trace/span. Accepted units are ns, ms, s, m, h"
+            >
+              <Stack gap={0}>
+                <Select
+                  width="auto"
+                  options={[
+                    { label: 'span', value: 'span' },
+                    { label: 'trace', value: 'trace' },
+                  ]}
+                  value={findFilter('duration-type')?.value ?? 'span'}
+                  onChange={(v) => {
+                    const filter = findFilter('duration-type') || {
+                      id: 'duration-type',
+                      value: 'span',
+                    };
+                    updateFilter({ ...filter, value: v?.value });
+                  }}
+                  aria-label={'duration type'}
+                />
+                <DurationInput
+                  filter={
+                    findFilter('min-duration') || {
+                      id: 'min-duration',
+                      tag: 'duration',
+                      operator: '>',
+                      valueType: 'duration',
+                    }
                   }
-                }
-                operators={['<', '<=']}
+                  operators={['>', '>=']}
+                  updateFilter={updateFilter}
+                />
+                <DurationInput
+                  filter={
+                    findFilter('max-duration') || {
+                      id: 'max-duration',
+                      tag: 'duration',
+                      operator: '<',
+                      valueType: 'duration',
+                    }
+                  }
+                  operators={['<', '<=']}
+                  updateFilter={updateFilter}
+                />
+              </Stack>
+            </InlineSearchField>
+            <InlineSearchField label={'Tags'}>
+              <TagsInput
+                filters={dynamicFilters}
+                datasource={datasource}
+                setError={setError}
                 updateFilter={updateFilter}
+                deleteFilter={deleteFilter}
+                staticTags={staticTags}
+                isTagsLoading={isTagsLoading}
+                generateQueryWithoutFilter={generateQueryWithoutFilter}
+                requireTagAndValue={true}
+                addVariablesToOptions={addVariablesToOptions}
+                range={range}
+                timeRangeForTags={datasource.timeRangeForTags}
               />
-            </Stack>
-          </InlineSearchField>
-          <InlineSearchField label={'Tags'}>
-            <TagsInput
-              filters={dynamicFilters}
-              datasource={datasource}
-              setError={setError}
-              updateFilter={updateFilter}
-              deleteFilter={deleteFilter}
-              staticTags={staticTags}
-              isTagsLoading={isTagsLoading}
-              generateQueryWithoutFilter={generateQueryWithoutFilter}
-              requireTagAndValue={true}
-              addVariablesToOptions={addVariablesToOptions}
-              range={range}
-              timeRangeForTags={datasource.timeRangeForTags}
+            </InlineSearchField>
+            <AggregateByAlert
+              query={draftModel}
+              onChange={() => {
+                const { groupBy, ...rest } = draftRef.current;
+                emitDraft(rest as TempoQuery);
+              }}
             />
-          </InlineSearchField>
-          <AggregateByAlert
-            query={draftModel}
-            onChange={() => {
-              const { groupBy, ...rest } = draftRef.current;
-              emitDraft(rest as TempoQuery);
-            }}
-          />
-        </div>
-        <div className={styles.rawQueryContainer}>
-          <RawQuery query={traceQlQuery ? templateSrv.replace(traceQlQuery) : ''} lang={{ grammar: traceqlGrammar, name: 'traceql' }} />
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => {
-              reportInteraction('grafana_traces_copy_to_traceql_clicked', {
-                app: app ?? '',
-                grafana_version: config.buildInfo.version,
-                location: 'search_tab',
-              });
+          </div>
+          <div className={styles.rawQueryContainer}>
+            <RawQuery
+              query={traceQlQuery ? templateSrv.replace(traceQlQuery) : ''}
+              lang={{ grammar: traceqlGrammar, name: 'traceql' }}
+            />
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                reportInteraction('grafana_traces_copy_to_traceql_clicked', {
+                  app: app ?? '',
+                  grafana_version: config.buildInfo.version,
+                  location: 'search_tab',
+                });
 
-              if (pending || dirty) {
-                setAlertText('Complete the protected filter before copying');
+                if (pending || dirty) {
+                  setAlertText('Complete the protected filter before copying');
+                  return;
+                }
+                copyPendingRef.current = true;
+                setCopyPending(true);
+                onPendingChange?.(true);
+                const current = ++generation.current;
+                try {
+                  const raw = datasource.languageProvider.generateQueryFromFilters({
+                    traceqlFilters: draftRef.current.filters || [],
+                  });
+                  const candidate: TempoQuery = { ...query, query: raw, queryType: 'traceql' };
+                  const result =
+                    protectedMode && key
+                      ? prepareProtectedQueryModel(candidate, key, datasource.uid, query)
+                      : Promise.resolve(candidate);
+                  void result
+                    .then((sealed) => {
+                      if (protectedMode) {
+                        assertProtectedQueryModelSafe(sealed, key?.kid);
+                      }
+                      if (generation.current === current && (!protectedMode || datasource.protectedKey === key)) {
+                        copyPendingRef.current = false;
+                        setCopyPending(false);
+                        onPendingChange?.(false);
+                        if (onClearResults() === false) {
+                          throw new Error('Cannot clear while the previous query is pending');
+                        }
+                        onChange(sealed);
+                      }
+                    })
+                    .catch(() => setAlertText('Unlock or correct protected search before copying'))
+                    .finally(() => {
+                      if (generation.current === current) {
+                        copyPendingRef.current = false;
+                        setCopyPending(false);
+                        onPendingChange?.(dirtyRef.current);
+                      }
+                    });
+                } catch {
+                  setAlertText('Unlock or correct protected search before copying');
+                  copyPendingRef.current = false;
+                  setCopyPending(false);
+                  onPendingChange?.(dirtyRef.current);
+                }
+              }}
+            >
+              Edit in TraceQL
+            </Button>
+          </div>
+          <TempoQueryBuilderOptions
+            onChange={(next) => {
+              if (pending || dirty || copyPending) {
+                setAlertText('Complete the protected filter before changing options');
                 return;
               }
-              copyPendingRef.current = true;
-              setCopyPending(true);
-              onPendingChange?.(true);
-              const current = ++generation.current;
-              try {
-                const raw = datasource.languageProvider.generateQueryFromFilters({ traceqlFilters: draftRef.current.filters || [] });
-                const candidate: TempoQuery = { ...query, query: raw, queryType: 'traceql' };
-                const result = kid && key ? prepareProtectedQueryModel(candidate, key, datasource.uid, query) : Promise.resolve(candidate);
-                void result.then((sealed) => {
-                  if (kid) {
-                    assertProtectedQueryModelSafe(sealed, kid);
-                  }
-                  if (generation.current === current && (!kid || datasource.protectedKey === key)) {
-                    copyPendingRef.current = false;
-                    setCopyPending(false);
-                    onPendingChange?.(false);
-                    if (onClearResults() === false) {
-                      throw new Error('Cannot clear while the previous query is pending');
-                    }
-                    onChange(sealed);
-                  }
-                }).catch(() => setAlertText('Unlock or correct protected search before copying'))
-                  .finally(() => {
-                    if (generation.current === current) {
-                      copyPendingRef.current = false;
-                      setCopyPending(false);
-                      onPendingChange?.(dirtyRef.current);
-                    }
-                  });
-              } catch {
-                setAlertText('Unlock or correct protected search before copying');
-                copyPendingRef.current = false;
-                setCopyPending(false);
-                onPendingChange?.(dirtyRef.current);
-              }
+              onChange(next);
             }}
-          >
-            Edit in TraceQL
-          </Button>
+            query={query}
+            searchStreaming={datasource.isStreamingSearchEnabled() ?? false}
+            metricsStreaming={datasource.isStreamingMetricsEnabled() ?? false}
+            app={app}
+          />
         </div>
-        <TempoQueryBuilderOptions
-          onChange={(next) => {
-            if (pending || dirty || copyPending) {
-              setAlertText('Complete the protected filter before changing options');
-              return;
-            }
-            onChange(next);
-          }}
-          query={query}
-          searchStreaming={datasource.isStreamingSearchEnabled() ?? false}
-          metricsStreaming={datasource.isStreamingMetricsEnabled() ?? false}
-          app={app}
-        />
-      </div>
       )}
       {error ? (
         <Alert title="Unable to connect to Tempo search" severity="info" className={styles.alert}>

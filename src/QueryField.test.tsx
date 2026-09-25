@@ -87,7 +87,15 @@ jest.mock('@grafana/ui', () => {
 
   return {
     ...actual,
-    Button: ({ children, onClick, disabled }: { children: React.ReactNode; onClick?: () => void; disabled?: boolean }) => (
+    Button: ({
+      children,
+      onClick,
+      disabled,
+    }: {
+      children: React.ReactNode;
+      onClick?: () => void;
+      disabled?: boolean;
+    }) => (
       <button onClick={onClick} disabled={disabled} type="button">
         {children}
       </button>
@@ -310,7 +318,7 @@ describe('QueryField', () => {
     const user = userEvent.setup();
     const onChange = jest.fn();
     const onRunQuery = jest.fn();
-    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedAttributesEnabled: true } });
     jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
     renderQueryField({ datasource, onChange, onRunQuery });
     await waitFor(() => expect(datasource.getNativeHistograms).toHaveBeenCalled());
@@ -330,17 +338,17 @@ describe('QueryField', () => {
     expect(screen.queryByTestId('query-with-assistant-button')).not.toBeInTheDocument();
   });
 
-  it('loads pasted or local-file keys in the dialog without writing them into host models; mismatch keeps the prior key', async () => {
+  it('loads a browser key without configured fingerprint, rejects invalid bytes without replacing it, and never writes key material to host models', async () => {
     const user = userEvent.setup();
     const onChange = jest.fn();
-    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedAttributesEnabled: true } });
     jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
     renderQueryField({ datasource, onChange });
 
     expect(screen.getByRole('status')).toHaveTextContent('Key needed');
     expect(screen.queryByLabelText('Paste base64 key')).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Load key' }));
-    expect(screen.getByRole('dialog', { name: 'Load protected key' })).toHaveTextContent(`Expected key ID: ${kid}`);
+    expect(screen.getByRole('dialog', { name: 'Load protected key' })).not.toHaveTextContent('Expected key ID');
     await user.type(screen.getByLabelText('Paste base64 key'), master);
     await user.click(screen.getAllByRole('button', { name: 'Load key' })[1]);
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Key loaded · 630dcd29…25b4f'));
@@ -348,7 +356,7 @@ describe('QueryField', () => {
 
     const previousKey = datasource.protectedKey;
     await user.click(screen.getByRole('button', { name: 'Replace key' }));
-    await user.type(screen.getByLabelText('Paste base64 key'), Buffer.alloc(32, 7).toString('base64'));
+    await user.type(screen.getByLabelText('Paste base64 key'), 'not-valid-base64');
     await user.click(screen.getByRole('button', { name: 'Load key' }));
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Unable to import key'));
     expect(datasource.protectedKey).toBe(previousKey);
@@ -367,7 +375,7 @@ describe('QueryField', () => {
 
   it('keeps pasted and file keys exclusive and cancel discards the unsent key', async () => {
     const user = userEvent.setup();
-    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedAttributesEnabled: true } });
     jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
     renderQueryField({ datasource });
 
@@ -393,7 +401,7 @@ describe('QueryField', () => {
 
   it('offers key entry immediately after forgetting a loaded key', async () => {
     const user = userEvent.setup();
-    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedAttributesEnabled: true } });
     jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
     await datasource.importProtectedKey(master);
     const onChange = jest.fn();
@@ -404,7 +412,9 @@ describe('QueryField', () => {
     expect(screen.getByRole('dialog', { name: 'Load protected key' })).toBeInTheDocument();
     expect(screen.getByLabelText('Paste base64 key')).toHaveValue('');
     await user.type(screen.getByLabelText('Paste base64 key'), master);
-    await user.click(within(screen.getByRole('dialog', { name: 'Load protected key' })).getByRole('button', { name: 'Load key' }));
+    await user.click(
+      within(screen.getByRole('dialog', { name: 'Load protected key' })).getByRole('button', { name: 'Load key' })
+    );
     await waitFor(() => expect(datasource.protectedKey?.kid).toBe(kid));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(JSON.stringify(onChange.mock.calls)).not.toContain(master);
@@ -412,7 +422,7 @@ describe('QueryField', () => {
 
   it('notifies mounted editors on key clear without rendering a separate protected-values pane', async () => {
     const user = userEvent.setup();
-    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedAttributesEnabled: true } });
     jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
     await datasource.importProtectedKey(master);
     const sealed = await (
@@ -436,7 +446,7 @@ describe('QueryField', () => {
 
   it('does not let a late native histogram callback overwrite a sealed editor commit before host acknowledgement', async () => {
     let completeNative!: (enabled: boolean) => void;
-    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedAttributesEnabled: true } });
     jest.spyOn(datasource, 'getNativeHistograms').mockImplementation(
       () =>
         new Promise<boolean>((resolve) => {
@@ -466,7 +476,7 @@ describe('QueryField', () => {
 
   it('ignores stale pending completion after a key epoch remount', async () => {
     const user = userEvent.setup();
-    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedAttributesEnabled: true } });
     jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
     await datasource.importProtectedKey(master);
     const onChange = jest.fn();
@@ -489,7 +499,7 @@ describe('QueryField', () => {
 
   it('discards a deferred file read when another editor forgets the shared key', async () => {
     const user = userEvent.setup();
-    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedAttributesEnabled: true } });
     jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
     await datasource.importProtectedKey(master);
     const importSpy = jest.spyOn(datasource, 'importProtectedKey');

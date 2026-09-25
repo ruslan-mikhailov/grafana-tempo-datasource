@@ -138,9 +138,10 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
       this.setState({ queryError: 'Complete or unlock the protected query before changing it.' });
       return false;
     }
-    const kid = this.props.datasource.instanceSettings.jsonData.protectedKeyId;
+    const protectedMode = this.props.datasource.instanceSettings.jsonData.protectedAttributesEnabled;
+    const kid = this.props.datasource.protectedKey?.kid;
     try {
-      if (kid) {
+      if (protectedMode) {
         assertProtectedQueryModelSafe(next, kid);
       }
     } catch {
@@ -148,7 +149,7 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
       return false;
     }
     this.setState({ queryError: undefined });
-    if (kid && next !== this.props.query) {
+    if (protectedMode && next !== this.props.query) {
       this.awaitingHostCommit = next;
     }
     this.props.onChange(next);
@@ -164,20 +165,17 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
       return;
     }
     const datasource = this.props.datasource;
-    const kid = datasource.instanceSettings.jsonData.protectedKeyId;
+    const protectedMode = datasource.instanceSettings.jsonData.protectedAttributesEnabled;
+    const kid = datasource.protectedKey?.kid;
     try {
-      if (kid) {
+      if (protectedMode) {
         assertProtectedQueryModelSafe(target, kid);
         const sealed =
           target.query?.startsWith('qenc:') ||
           target.filters?.some((filter) =>
             (Array.isArray(filter.value) ? filter.value : [filter.value]).some((value) => value?.startsWith('qenc:'))
           );
-        if (
-          sealed &&
-          (target.queryType === 'traceql' || target.queryType === 'traceqlSearch') &&
-          datasource.protectedKey?.kid !== kid
-        ) {
+        if (sealed && (target.queryType === 'traceql' || target.queryType === 'traceqlSearch') && !kid) {
           throw new Error('Key unavailable');
         }
       }
@@ -221,7 +219,7 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
       }
     } catch {
       if (this._isMounted && this.props.datasource === datasource && datasource.protectedKeyEpoch === epoch) {
-        this.setState({ keyError: 'Unable to import key. Check its base64 bytes and configured key ID.' });
+        this.setState({ keyError: 'Unable to import key. Check that it contains 32 valid base64-encoded bytes.' });
       }
     } finally {
       if (this.keyTextInput.current) {
@@ -308,8 +306,9 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
   render() {
     const { query, datasource, app } = this.props;
     const isAlerting = app === CoreApp.UnifiedAlerting;
-    const kid = datasource.instanceSettings.jsonData.protectedKeyId;
-    const keyLoaded = Boolean(kid && datasource.protectedKey?.kid === kid);
+    const protectedMode = datasource.instanceSettings.jsonData.protectedAttributesEnabled;
+    const kid = datasource.protectedKey?.kid;
+    const keyLoaded = Boolean(kid);
     const editorKey = `${datasource.uid}:${this.state.keyEpoch}`;
     if (
       this.editorCommitSource !== datasource ||
@@ -350,7 +349,7 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
 
     // Assistant receives host query objects, not browser-only drafts.
     const showAssistant =
-      !kid &&
+      !protectedMode &&
       config.featureToggles.queryWithAssistant &&
       (app === CoreApp.Explore || app === CoreApp.Dashboard || app === CoreApp.PanelEditor);
     return (
@@ -423,7 +422,7 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
             </InlineField>
           </InlineFieldRow>
         )}
-        {!isAlerting && kid && (
+        {!isAlerting && protectedMode && (
           <>
             <div
               className={css({
@@ -435,7 +434,7 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
               })}
             >
               <span>Protected attributes</span>
-              <span role="status">{keyLoaded ? `Key loaded · ${kid.slice(0, 8)}…${kid.slice(-5)}` : 'Key needed'}</span>
+              <span role="status">{kid ? `Key loaded · ${kid.slice(0, 8)}…${kid.slice(-5)}` : 'Key needed'}</span>
               <Button
                 variant="secondary"
                 size="sm"
@@ -444,10 +443,14 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
                 {keyLoaded ? 'Replace key' : 'Load key'}
               </Button>
               {keyLoaded && (
-                <Button variant="secondary" size="sm" onClick={() => {
-                  datasource.clearProtectedKey();
-                  this.setState({ keyModalOpen: true });
-                }}>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    datasource.clearProtectedKey();
+                    this.setState({ keyModalOpen: true });
+                  }}
+                >
                   Forget key
                 </Button>
               )}
@@ -460,9 +463,6 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
                   padding: this.props.theme.spacing(2),
                 })}
               >
-                <p>
-                  Expected key ID: <code>{kid}</code>
-                </p>
                 <label htmlFor={`protected-key-${datasource.uid}`}>Paste base64 key</label>
                 <Input
                   id={`protected-key-${datasource.uid}`}

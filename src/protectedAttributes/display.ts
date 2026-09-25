@@ -2,7 +2,7 @@ import { type ProtectedAttributeKey } from './crypto';
 
 const displaySymbol = Symbol.for('grafana.tempo.protected-attribute-display.v1');
 const displayChangeEvent = 'grafana.tempo.protected-attribute-display-change';
-const envelopePattern = /^enc:v1:([0-9a-f]{32}):([A-Za-z0-9_-]+)$/;
+const envelopePattern = /^enc:v1:([0-9a-f]{32}):([A-Za-z0-9_-]{22,})$/;
 const envelopeKidPattern = /^enc:[^:]*:([0-9a-f]{32}):/;
 
 interface DisplayRegistry {
@@ -10,7 +10,7 @@ interface DisplayRegistry {
   resolve(storedField: string, envelope: string): string | undefined;
 }
 
-const configuredKids = new Set<string>();
+let protectedModeRegistered = false;
 const importedKeys = new Map<string, { owner: object; key: ProtectedAttributeKey }>();
 
 function resolve(storedField: string, envelope: string): string | undefined {
@@ -22,11 +22,24 @@ function resolve(storedField: string, envelope: string): string | undefined {
   ) {
     return undefined;
   }
-  const kid = envelopeKidPattern.exec(envelope)?.[1];
-  if (!kid || !configuredKids.has(kid)) {
+  if (!protectedModeRegistered) {
     return undefined;
   }
-  if (!envelopePattern.test(envelope)) {
+  const kid = envelopeKidPattern.exec(envelope)?.[1];
+  if (!kid) {
+    return undefined;
+  }
+  const match = envelopePattern.exec(envelope);
+  const encoded = match?.[2];
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  const remainder = encoded ? encoded.length % 4 : 1;
+  const trailing = encoded ? alphabet.indexOf(encoded[encoded.length - 1]) : -1;
+  if (
+    !encoded ||
+    remainder === 1 ||
+    (remainder === 2 && trailing % 16 !== 0) ||
+    (remainder === 3 && trailing % 4 !== 0)
+  ) {
     return '[encrypted: invalid data]';
   }
   const key = importedKeys.get(kid)?.key;
@@ -56,10 +69,10 @@ function changed(): void {
   }
 }
 
-/** Register the configured key ID without exposing the key or plaintext to Grafana. */
-export function registerProtectedDisplayKid(kid: string | undefined): void {
-  if (kid && /^[0-9a-f]{32}$/.test(kid) && !configuredKids.has(kid)) {
-    configuredKids.add(kid);
+/** Enable locked display for encrypted values before any browser key is imported. */
+export function registerProtectedDisplayMode(): void {
+  if (!protectedModeRegistered) {
+    protectedModeRegistered = true;
     changed();
   }
 }
@@ -69,12 +82,17 @@ export function setProtectedDisplayKey(owner: object, kid: string | undefined, k
   if (!kid || typeof window === 'undefined') {
     return;
   }
-  registerProtectedDisplayKid(kid);
-  const current = importedKeys.get(kid);
+  registerProtectedDisplayMode();
   if (key) {
+    for (const [oldKid, current] of importedKeys) {
+      if (oldKid !== kid && current.owner === owner) {
+        importedKeys.delete(oldKid);
+      }
+    }
     importedKeys.set(kid, { owner, key });
-  } else if (current?.owner === owner) {
+    changed();
+  } else if (importedKeys.get(kid)?.owner === owner) {
     importedKeys.delete(kid);
+    changed();
   }
-  changed();
 }

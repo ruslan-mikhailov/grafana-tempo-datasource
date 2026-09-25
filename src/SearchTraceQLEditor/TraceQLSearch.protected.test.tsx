@@ -12,16 +12,29 @@ jest.mock('./SearchField', () => {
   const React = jest.requireActual<typeof ReactType>('react');
   return {
     __esModule: true,
-    default: ({ filter, updateFilter, query }: {
-      filter: TraceqlFilter; updateFilter: (value: TraceqlFilter) => void; query: string;
+    default: ({
+      filter,
+      updateFilter,
+      query,
+    }: {
+      filter: TraceqlFilter;
+      updateFilter: (value: TraceqlFilter) => void;
+      query: string;
     }) =>
-      React.createElement('button', {
-        'aria-label': `change ${filter.id}`,
-        'data-context-query': query,
-        onClick: () => updateFilter(filter.id === 'route'
-          ? { ...filter, tag: 'http.route=1} //', value: 'first' }
-          : { ...filter, value: filter.value === 'first' ? 'second' : 'first' }),
-      }, 'Change filter'),
+      React.createElement(
+        'button',
+        {
+          'aria-label': `change ${filter.id}`,
+          'data-context-query': query,
+          onClick: () =>
+            updateFilter(
+              filter.id === 'route'
+                ? { ...filter, tag: 'http.route=1} //', value: 'first' }
+                : { ...filter, value: filter.value === 'first' ? 'second' : 'first' }
+            ),
+        },
+        'Change filter'
+      ),
   };
 });
 jest.mock('./TagsInput', () => ({ __esModule: true, default: () => null }));
@@ -41,7 +54,7 @@ test('overlapping protected value edits never emit plaintext or let an earlier s
   const datasource = {
     uid: 'tempo-uid',
     protectedKey: key,
-    instanceSettings: { jsonData: { protectedKeyId: kid } },
+    instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
     search: { filters: [filter] },
     languageProvider: {
       start: jest.fn().mockResolvedValue(undefined),
@@ -51,6 +64,7 @@ test('overlapping protected value edits never emit plaintext or let an earlier s
     isStreamingSearchEnabled: () => false,
     isStreamingMetricsEnabled: () => false,
   } as unknown as TempoDatasource;
+  Object.assign(datasource.languageProvider, { datasource });
   const saved: TempoQuery = { refId: 'A', queryType: 'traceqlSearch', filters: [] };
   const hostChange = jest.fn();
   render(<TraceQLSearch datasource={datasource} query={saved} onChange={hostChange} onClearResults={() => {}} />);
@@ -60,10 +74,14 @@ test('overlapping protected value edits never emit plaintext or let an earlier s
   expect(hostChange).not.toHaveBeenCalled();
   expect(sealQueryModel).toHaveBeenCalledWith('first', JSON.stringify(['tempo-uid', 'filters', 'password', 'value']));
   expect(sealQueryModel).toHaveBeenCalledWith('second', JSON.stringify(['tempo-uid', 'filters', 'password', 'value']));
-  await act(async () => { resolves[1](`qenc:v1:${kid}:${'B'.repeat(40)}`); });
+  await act(async () => {
+    resolves[1](`qenc:v1:${kid}:${'B'.repeat(40)}`);
+  });
   await waitFor(() => expect(hostChange).toHaveBeenCalledTimes(1));
   expect(hostChange.mock.calls[0][0].filters[0].value).toBe(`qenc:v1:${kid}:${'B'.repeat(40)}`);
-  await act(async () => { resolves[0](`qenc:v1:${kid}:${'A'.repeat(40)}`); });
+  await act(async () => {
+    resolves[0](`qenc:v1:${kid}:${'A'.repeat(40)}`);
+  });
   expect(hostChange).toHaveBeenCalledTimes(1);
   expect(saved.filters).toEqual([]);
 });
@@ -76,16 +94,25 @@ test('rejected builder draft cannot contribute a malformed tag to metadata conte
     sealQueryModel: jest.fn(),
   };
   const route: TraceqlFilter = {
-    id: 'route', tag: 'http.route', scope: TraceqlSearchScope.Span, operator: '=', value: 'initial', valueType: 'string',
+    id: 'route',
+    tag: 'http.route',
+    scope: TraceqlSearchScope.Span,
+    operator: '=',
+    value: 'initial',
+    valueType: 'string',
   };
   const password: TraceqlFilter = {
-    id: 'password', tag: 'enc.password', scope: TraceqlSearchScope.Span, operator: '=',
-    value: `qenc:v1:${kid}:${'A'.repeat(38)}`, valueType: 'string',
+    id: 'password',
+    tag: 'enc.password',
+    scope: TraceqlSearchScope.Span,
+    operator: '=',
+    value: `qenc:v1:${kid}:${'A'.repeat(38)}`,
+    valueType: 'string',
   };
   const datasource = {
     uid: 'tempo-uid',
     protectedKey: key,
-    instanceSettings: { jsonData: { protectedKeyId: kid } },
+    instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
     search: { filters: [{ ...route, value: undefined }] },
     languageProvider: {
       start: jest.fn().mockResolvedValue(undefined),
@@ -95,12 +122,47 @@ test('rejected builder draft cannot contribute a malformed tag to metadata conte
     isStreamingSearchEnabled: () => false,
     isStreamingMetricsEnabled: () => false,
   } as unknown as TempoDatasource;
+  Object.assign(datasource.languageProvider, { datasource });
   const saved: TempoQuery = { refId: 'A', queryType: 'traceqlSearch', filters: [route, password] };
   const hostChange = jest.fn();
   render(<TraceQLSearch datasource={datasource} query={saved} onChange={hostChange} onClearResults={() => {}} />);
   const button = await screen.findByRole('button', { name: 'change route' });
-  await waitFor(() => expect(button).toHaveAttribute('data-context-query', '{span.http.route="safe" && span.enc.password="abc"}'));
+  await waitFor(() =>
+    expect(button).toHaveAttribute('data-context-query', '{span.http.route="safe" && span.enc.password="abc"}')
+  );
   fireEvent.click(button);
-  await waitFor(() => expect(screen.getByRole('button', { name: 'change route' })).toHaveAttribute('data-context-query', ''));
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'change route' })).toHaveAttribute('data-context-query', '')
+  );
   expect(hostChange).not.toHaveBeenCalled();
+});
+
+test('rejects protected builder values before a key is imported', async () => {
+  initTemplateSrv([], {});
+  const filter: TraceqlFilter = { id: 'password', scope: TraceqlSearchScope.Span, tag: 'enc.password', operator: '=' };
+  const datasource = {
+    uid: 'tempo-uid',
+    instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
+    search: { filters: [filter] },
+    languageProvider: {
+      start: jest.fn().mockResolvedValue(undefined),
+      getIntrinsics: jest.fn().mockReturnValue([]),
+      generateQueryFromFilters: jest.fn().mockReturnValue('{}'),
+    },
+    isStreamingSearchEnabled: () => false,
+    isStreamingMetricsEnabled: () => false,
+  } as unknown as TempoDatasource;
+  Object.assign(datasource.languageProvider, { datasource });
+  const hostChange = jest.fn();
+  render(
+    <TraceQLSearch
+      datasource={datasource}
+      query={{ refId: 'A', queryType: 'traceqlSearch', filters: [] }}
+      onChange={hostChange}
+      onClearResults={() => {}}
+    />
+  );
+  fireEvent.click(await screen.findByRole('button', { name: 'change password' }));
+  expect(hostChange).not.toHaveBeenCalled();
+  expect(screen.getByText(/Complete or correct protected filter/)).toBeInTheDocument();
 });

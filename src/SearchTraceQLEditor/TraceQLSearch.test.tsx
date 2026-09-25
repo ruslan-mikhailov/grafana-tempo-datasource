@@ -267,7 +267,7 @@ describe('TraceQLSearch', () => {
     const protectedDatasource = {
       ...datasource,
       uid: 'tempo-uid',
-      instanceSettings: { jsonData: { protectedKeyId: kid } },
+      instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
       search: { filters: [{ id: 'password', tag: 'enc.password', scope: TraceqlSearchScope.Span, operator: '=' }] },
     } as unknown as TempoDatasource;
     const protectedLp = new TempoLanguageProvider(protectedDatasource);
@@ -285,6 +285,15 @@ describe('TraceQLSearch', () => {
     );
     expect(screen.getByText(/Import the matching key/)).toBeInTheDocument();
     expect(screen.queryByLabelText('select password value')).not.toBeInTheDocument();
+    const wrongKey = { kid: '00000000000000000000000000000000', openQueryModel: jest.fn() };
+    Object.defineProperty(protectedDatasource, 'protectedKey', { value: wrongKey, configurable: true });
+    await act(async () => {
+      view.rerender(
+        <TraceQLSearch datasource={protectedDatasource} query={saved} onChange={hostChange} onClearResults={onClearResults} />
+      );
+    });
+    expect(screen.queryByLabelText('select password value')).not.toBeInTheDocument();
+    expect(wrongKey.openQueryModel).not.toHaveBeenCalled();
     const loadedKey = { kid, openQueryModel: jest.fn().mockResolvedValue('abc') };
     Object.defineProperty(protectedDatasource, 'protectedKey', { value: loadedKey, configurable: true });
     await act(async () => {

@@ -32,7 +32,10 @@ export const interpolateFilters = (filters: TraceqlFilter[], scopedVars?: Scoped
 };
 
 export const isProtectedBuilderValue = (filter: TraceqlFilter, lp: TempoLanguageProvider): boolean =>
-  Boolean(lp.datasource.instanceSettings?.jsonData?.protectedKeyId && classifyProtectedFilter(filter).requiresSealing);
+  Boolean(
+    lp.datasource.instanceSettings?.jsonData?.protectedAttributesEnabled &&
+    classifyProtectedFilter(filter).requiresSealing
+  );
 
 export function quoteTraceQLStringValue(value: string): string {
   if (/[\u0000-\u001f\u007f]/.test(value)) {

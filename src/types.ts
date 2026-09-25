@@ -4,8 +4,8 @@ import { type NodeGraphOptions, type TraceToLogsOptions } from '@grafana/o11y-ds
 import { type TempoQuery as TempoBase, type TempoQueryType, type TraceqlFilter } from './dataquery';
 
 export interface TempoJsonData extends DataSourceJsonData {
-  /** Public 128-bit fingerprint of the browser-imported key; never the key itself. */
-  protectedKeyId?: string;
+  /** Enable browser-only protected attribute handling without configuring a key ID. */
+  protectedAttributesEnabled?: boolean;
   tracesToLogs?: TraceToLogsOptions;
   serviceMap?: {
     datasourceUid?: string;

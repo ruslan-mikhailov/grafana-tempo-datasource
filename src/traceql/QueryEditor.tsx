@@ -7,7 +7,11 @@ import { config, reportInteraction } from '@grafana/runtime';
 import { Alert, Button, InlineLabel, TextLink, useStyles2 } from '@grafana/ui';
 
 import { type TempoDatasource } from '../datasource';
-import { assertProtectedQueryModelSafe, openProtectedQueryModel, prepareProtectedQueryModel } from '../protectedAttributes/model';
+import {
+  assertProtectedQueryModelSafe,
+  openProtectedQueryModel,
+  prepareProtectedQueryModel,
+} from '../protectedAttributes/model';
 import { defaultQuery, type MyDataSourceOptions, type TempoQuery } from '../types';
 
 import { TempoQueryBuilderOptions } from './TempoQueryBuilderOptions';
@@ -24,7 +28,7 @@ export function QueryEditor(props: Props) {
   const styles = useStyles2(getStyles);
   const query = defaults(props.query, defaultQuery);
   const [showCopyFromSearchButton, setShowCopyFromSearchButton] = useState(() => {
-    if (props.datasource.instanceSettings?.jsonData?.protectedKeyId) {
+    if (props.datasource.instanceSettings?.jsonData?.protectedAttributesEnabled) {
       return false;
     }
     const genQuery = props.datasource.languageProvider.generateQueryFromFilters({
@@ -38,41 +42,52 @@ export function QueryEditor(props: Props) {
   latestQuery.current = query;
   const rawPending = useRef(false);
   const copyPending = useRef(false);
-  const onRawPendingChange = useCallback((pending: boolean) => {
-    rawPending.current = pending;
-    if (pending) {
+  const onRawPendingChange = useCallback(
+    (pending: boolean) => {
+      rawPending.current = pending;
+      if (pending) {
+        generation.current++;
+        copyPending.current = false;
+      }
+      props.onPendingChange?.(pending || copyPending.current);
+    },
+    [props.onPendingChange]
+  );
+  useEffect(
+    () => () => {
       generation.current++;
-      copyPending.current = false;
-    }
-    props.onPendingChange?.(pending || copyPending.current);
-  }, [props.onPendingChange]);
-  useEffect(() => () => { generation.current++; }, []);
+    },
+    []
+  );
   const copyFromSearch = async () => {
     const current = ++generation.current;
     const original = query;
     copyPending.current = true;
     props.onPendingChange?.(true);
     try {
-      const kid = props.datasource.instanceSettings?.jsonData?.protectedKeyId;
+      const protectedMode = props.datasource.instanceSettings?.jsonData?.protectedAttributesEnabled;
       const key = props.datasource.protectedKey;
-      if (kid) {
-        assertProtectedQueryModelSafe(query, kid);
+      if (protectedMode) {
+        assertProtectedQueryModelSafe(query, key?.kid);
       }
-      const opened = kid && key?.kid === kid
-        ? await openProtectedQueryModel(query, key, props.datasource.uid)
-        : query;
+      const opened = protectedMode && key ? await openProtectedQueryModel(query, key, props.datasource.uid) : query;
       const raw = props.datasource.languageProvider.generateQueryFromFilters({
         traceqlFilters: opened.filters || [],
       });
       const candidate: TempoQuery = { ...query, query: raw, queryType: 'traceql' };
-      const sealed = kid && key?.kid === kid
-        ? await prepareProtectedQueryModel(candidate, key, props.datasource.uid, query)
-        : candidate;
-      if (kid) {
-        assertProtectedQueryModelSafe(sealed, kid);
+      const sealed =
+        protectedMode && key
+          ? await prepareProtectedQueryModel(candidate, key, props.datasource.uid, query)
+          : candidate;
+      if (protectedMode) {
+        assertProtectedQueryModelSafe(sealed, key?.kid);
       }
-      if (generation.current === current && latestQuery.current === original &&
-        !rawPending.current && (!kid || props.datasource.protectedKey === key)) {
+      if (
+        generation.current === current &&
+        latestQuery.current === original &&
+        !rawPending.current &&
+        (!protectedMode || props.datasource.protectedKey === key)
+      ) {
         copyPending.current = false;
         props.onPendingChange?.(false);
         if (props.onClearResults() === false) {

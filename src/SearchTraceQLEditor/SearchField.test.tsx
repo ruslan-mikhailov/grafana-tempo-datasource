@@ -443,28 +443,41 @@ describe('SearchField', () => {
   it('does not request tag values while a protected builder draft has no safe contextual query', async () => {
     const getOptionsV2 = jest.fn().mockResolvedValue([]);
     const datasource = {
-      instanceSettings: { jsonData: { protectedKeyId: '630dcd2966c4336691125448bbb25b4f' } },
+      instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
       languageProvider: {
         getOptionsV2,
         getIntrinsics: jest.fn().mockReturnValue([]),
         getTags: jest.fn().mockReturnValue([]),
       },
     } as unknown as TempoDatasource;
+    datasource.languageProvider.datasource = datasource;
     const filter: TraceqlFilter = {
-      id: 'route', scope: TraceqlSearchScope.Span, tag: 'http.route', operator: '=', valueType: 'string',
+      id: 'route',
+      scope: TraceqlSearchScope.Span,
+      tag: 'http.route',
+      operator: '=',
+      valueType: 'string',
     };
     const props = {
-      datasource, filter, updateFilter: jest.fn(), setError: jest.fn(),
-      tags: [], query: '',
+      datasource,
+      filter,
+      updateFilter: jest.fn(),
+      setError: jest.fn(),
+      tags: [],
+      query: '',
     };
     const { rerender } = render(<SearchField {...props} />);
     await act(async () => {});
     expect(getOptionsV2).not.toHaveBeenCalled();
     rerender(<SearchField {...props} query={'{span.http.route="safe"}'} />);
-    await waitFor(() => expect(getOptionsV2).toHaveBeenCalledWith(expect.objectContaining({
-      tag: 'span.http.route',
-      query: '{span.http.route="safe"}',
-    })));
+    await waitFor(() =>
+      expect(getOptionsV2).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tag: 'span.http.route',
+          query: '{span.http.route="safe"}',
+        })
+      )
+    );
   });
 });
 
@@ -510,6 +523,7 @@ const renderSearchField = (
     },
     languageProvider,
   } as TempoDatasource;
+  (languageProvider as TempoLanguageProvider).datasource = datasource;
 
   return render(
     <SearchField

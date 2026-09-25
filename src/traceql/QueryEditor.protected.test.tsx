@@ -25,7 +25,7 @@ test('a newer raw draft cancels an in-flight Search-to-TraceQL copy before host 
   const datasource = {
     uid: 'tempo-uid',
     protectedKey: key,
-    instanceSettings: { jsonData: { protectedKeyId: kid } },
+    instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
     languageProvider: { generateQueryFromFilters: jest.fn().mockReturnValue('{span.enc.password="old"}') },
     isStreamingSearchEnabled: () => false,
     isStreamingMetricsEnabled: () => false,
@@ -57,7 +57,7 @@ test('successful protected copy releases the pending gate before clearing result
   const datasource = {
     uid: 'tempo-uid',
     protectedKey: key,
-    instanceSettings: { jsonData: { protectedKeyId: kid } },
+    instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
     languageProvider: { generateQueryFromFilters: jest.fn().mockReturnValue('{span.enc.password=\"abc\"}') },
     isStreamingSearchEnabled: () => false,
     isStreamingMetricsEnabled: () => false,

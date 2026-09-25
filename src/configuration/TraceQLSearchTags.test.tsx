@@ -31,14 +31,13 @@ jest.mock('../SearchTraceQLEditor/TagsInput', () => ({
   ),
 }));
 
-const kid = '630dcd2966c4336691125448bbb25b4f';
 const protectedDefault: TraceqlFilter = {
   id: 'secret', scope: TraceqlSearchScope.Span, tag: 'enc.password', operator: '=', value: 'secret',
 };
 
-function renderTags(filters: TraceqlFilter[], protectedKeyId?: string) {
+function renderTags(filters: TraceqlFilter[], protectedAttributesEnabled = true) {
   const onOptionsChange = jest.fn();
-  const options = { jsonData: { protectedKeyId: protectedKeyId ?? kid, search: { filters } } } as DataSourcePluginOptionsEditorProps<TempoJsonData>['options'];
+  const options = { jsonData: { protectedAttributesEnabled, search: { filters } } } as DataSourcePluginOptionsEditorProps<TempoJsonData>['options'];
   render(<TraceQLSearchTags options={options} onOptionsChange={onOptionsChange} datasource={{} as never} />);
   return onOptionsChange;
 }
@@ -72,7 +71,7 @@ test('does not mutate or persist retained protected defaults, but permits explic
 
 test('retains ordinary unconfigured static-filter behavior', async () => {
   const user = userEvent.setup();
-  const onOptionsChange = renderTags([], '');
+  const onOptionsChange = renderTags([], false);
   await user.click(screen.getByRole('button', { name: 'Add dynamic filter' }));
   expect(onOptionsChange).toHaveBeenCalledWith(expect.objectContaining({
     jsonData: expect.objectContaining({ search: { filters: [expect.objectContaining({ value: 'secret' })] } }),

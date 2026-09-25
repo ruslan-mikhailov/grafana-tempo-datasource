@@ -78,23 +78,26 @@ const SearchField = ({
     () => filterScopedTag(filter, datasource.languageProvider),
     [datasource.languageProvider, filter]
   );
-  const protection = Boolean(datasource.instanceSettings?.jsonData?.protectedKeyId) &&
+  const protection =
+    Boolean(datasource.instanceSettings?.jsonData?.protectedAttributesEnabled) &&
     classifyProtectedFilter(filter).requiresSealing;
-  const explicitProtection = Boolean(datasource.instanceSettings?.jsonData?.protectedKeyId) &&
+  const explicitProtection =
+    Boolean(datasource.instanceSettings?.jsonData?.protectedAttributesEnabled) &&
     classifyProtectedFilter(filter).protectedReference;
   const [tagQuery, setTagQuery] = useState<string>('');
   const [tagValuesQuery, setTagValuesQuery] = useState<string>('');
 
   const updateOptions = async () => {
     try {
-      const result = filter.tag && !protection && (!datasource.instanceSettings?.jsonData?.protectedKeyId || query)
-        ? await datasource.languageProvider.getOptionsV2({
-            tag: scopedTag,
-            query,
-            timeRangeForTags,
-            range,
-          })
-        : [];
+      const result =
+        filter.tag && !protection && (!datasource.instanceSettings?.jsonData?.protectedAttributesEnabled || query)
+          ? await datasource.languageProvider.getOptionsV2({
+              tag: scopedTag,
+              query,
+              timeRangeForTags,
+              range,
+            })
+          : [];
       setAlertText(undefined);
       setError(null);
       return result;
@@ -262,7 +265,11 @@ const SearchField = ({
             className={styles.dropdown}
             inputId={`${filter.id}-value`}
             isLoading={isLoadingValues}
-            options={addVariablesToOptions && !explicitProtection ? withTemplateVariableOptions(tagValueOptions) : tagValueOptions}
+            options={
+              addVariablesToOptions && !explicitProtection
+                ? withTemplateVariableOptions(tagValueOptions)
+                : tagValueOptions
+            }
             value={filter.value}
             onInputChange={(value: string, { action }: InputActionMeta) => {
               if (action === 'input-change') {
@@ -291,7 +298,7 @@ const SearchField = ({
               updateFilter({
                 ...filter,
                 value: Array.isArray(filter.value) ? filter.value?.concat(val) : val,
-                valueType: protection ? 'string' : uniqueOptionType ?? inferCustomValueType(val),
+                valueType: protection ? 'string' : (uniqueOptionType ?? inferCustomValueType(val)),
                 isCustomValue: true,
               });
             }}
@@ -309,7 +316,9 @@ const SearchField = ({
             id={`${filter.id}-label`}
             placeholder="Label (optional)"
             value={filter.label ?? ''}
-            onChange={(e) => updateFilter({ ...filter, label: e.currentTarget.value.trim() ? e.currentTarget.value : undefined })}
+            onChange={(e) =>
+              updateFilter({ ...filter, label: e.currentTarget.value.trim() ? e.currentTarget.value : undefined })
+            }
             aria-label={`select ${filter.id} label`}
           />
         )}

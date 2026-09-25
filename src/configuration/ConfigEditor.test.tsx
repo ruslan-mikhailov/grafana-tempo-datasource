@@ -20,8 +20,11 @@ jest.mock('@grafana/plugin-ui', () => ({
   DataSourceDescription: () => null,
 }));
 jest.mock('@grafana/o11y-ds-frontend', () => ({
-  NodeGraphSection: () => null, SpanBarSection: () => null, TraceToLogsSection: () => null,
-  TraceToMetricsSection: () => null, TraceToProfilesSection: () => null,
+  NodeGraphSection: () => null,
+  SpanBarSection: () => null,
+  TraceToLogsSection: () => null,
+  TraceToMetricsSection: () => null,
+  TraceToProfilesSection: () => null,
 }));
 jest.mock('./QuerySettings', () => ({ QuerySettings: () => null }));
 jest.mock('./ServiceGraphSettings', () => ({ ServiceGraphSettings: () => null }));
@@ -30,33 +33,54 @@ jest.mock('./TagLimitSettings', () => ({ TagLimitSection: () => null }));
 jest.mock('./TagsTimeRangeSettings', () => ({ TagsTimeRangeSettings: () => null }));
 jest.mock('./TraceQLSearchSettings', () => ({ TraceQLSearchSettings: () => null }));
 
-const kid = '630dcd2966c4336691125448bbb25b4f';
-
-test('persists only a valid public fingerprint and rejects uppercase or incomplete IDs', async () => {
+test('enables protected attributes without a configured key ID', async () => {
   const user = userEvent.setup();
   const onOptionsChange = jest.fn();
   const options = { jsonData: {} } as DataSourcePluginOptionsEditorProps<TempoJsonData>['options'];
   render(<ConfigEditor options={options} onOptionsChange={onOptionsChange} />);
-  const input = screen.getByRole('textbox', { name: 'Protected key ID' });
-  await user.type(input, kid.toUpperCase());
-  expect(onOptionsChange).not.toHaveBeenCalled();
-  await user.clear(input);
-  onOptionsChange.mockClear();
-  await user.type(input, kid);
-  expect(onOptionsChange).toHaveBeenCalledTimes(1);
-  expect(onOptionsChange).toHaveBeenCalledWith(expect.objectContaining({
-    jsonData: { protectedKeyId: kid },
-  }));
+  await user.click(screen.getByLabelText('Enable protected attributes'));
+  expect(onOptionsChange).toHaveBeenCalledWith(
+    expect.objectContaining({
+      jsonData: { protectedAttributesEnabled: true },
+    })
+  );
+});
+
+test('migrates a legacy fingerprint-only datasource without persisting the key ID', async () => {
+  const user = userEvent.setup();
+  const onOptionsChange = jest.fn();
+  const options = {
+    jsonData: { protectedKeyId: '630dcd2966c4336691125448bbb25b4f' },
+  } as unknown as DataSourcePluginOptionsEditorProps<TempoJsonData>['options'];
+  render(<ConfigEditor options={options} onOptionsChange={onOptionsChange} />);
+  await user.click(screen.getByLabelText('Enable protected attributes'));
+  expect(onOptionsChange).toHaveBeenCalledWith(
+    expect.objectContaining({
+      jsonData: { protectedAttributesEnabled: true },
+    })
+  );
 });
 
 test('refuses to enable protection while a valued protected static default remains saved', async () => {
   const user = userEvent.setup();
   const onOptionsChange = jest.fn();
-  const options = { jsonData: { search: { filters: [{
-    id: 'secret', scope: TraceqlSearchScope.Span, tag: 'enc.password', operator: '=', value: 'sensitive',
-  }] } } } as DataSourcePluginOptionsEditorProps<TempoJsonData>['options'];
+  const options = {
+    jsonData: {
+      search: {
+        filters: [
+          {
+            id: 'secret',
+            scope: TraceqlSearchScope.Span,
+            tag: 'enc.password',
+            operator: '=',
+            value: 'sensitive',
+          },
+        ],
+      },
+    },
+  } as DataSourcePluginOptionsEditorProps<TempoJsonData>['options'];
   render(<ConfigEditor options={options} onOptionsChange={onOptionsChange} />);
-  await user.type(screen.getByRole('textbox', { name: 'Protected key ID' }), kid);
+  await user.click(screen.getByLabelText('Enable protected attributes'));
   expect(onOptionsChange).not.toHaveBeenCalled();
   expect(screen.getByRole('alert')).toHaveTextContent('span.enc.password');
   expect(screen.getByRole('alert')).not.toHaveTextContent('sensitive');

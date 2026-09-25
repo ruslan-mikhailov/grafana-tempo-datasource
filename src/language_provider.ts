@@ -11,7 +11,12 @@ import {
 import { DEFAULT_TIME_RANGE_FOR_TAGS } from './configuration/TagsTimeRangeSettings';
 import { type TraceqlFilter, TraceqlSearchScope } from './dataquery';
 import { type TempoDatasource } from './datasource';
-import { assertStaticProtectedFilterDefaultsSafe, classifyProtectedFilter, isProtectedTagValueRequest, isVariableBearing } from './protectedAttributes/model';
+import {
+  assertStaticProtectedFilterDefaultsSafe,
+  classifyProtectedFilter,
+  isProtectedTagValueRequest,
+  isVariableBearing,
+} from './protectedAttributes/model';
 import { enumIntrinsics, intrinsics, intrinsicsV1 } from './traceql/traceql';
 import { type Scope } from './types';
 
@@ -143,7 +148,7 @@ export default class TempoLanguageProvider extends LanguageProvider {
   };
 
   async getOptionsV2({ tag, query, timeRangeForTags, range }: GetOptionsV2): Promise<Array<SelectableValue<string>>> {
-    if (this.datasource.instanceSettings.jsonData.protectedKeyId && isProtectedTagValueRequest(tag)) {
+    if (this.datasource.instanceSettings.jsonData.protectedAttributesEnabled && isProtectedTagValueRequest(tag)) {
       // Do not request or cache frequency dictionaries containing ciphertext.
       return [];
     }
@@ -207,7 +212,7 @@ export default class TempoLanguageProvider extends LanguageProvider {
     traceqlFilters?: TraceqlFilter[];
     adhocFilters?: AdHocVariableFilter[];
   }) {
-    if (this.datasource.instanceSettings?.jsonData?.protectedKeyId) {
+    if (this.datasource.instanceSettings?.jsonData?.protectedAttributesEnabled) {
       assertStaticProtectedFilterDefaultsSafe(this.datasource.search?.filters);
     }
     if (!traceqlFilters && !adhocFilters) {
@@ -228,20 +233,29 @@ export default class TempoLanguageProvider extends LanguageProvider {
     }
 
     return filters
-      .filter((f) => f.tag && f.operator && (f.value?.length || (f.value === '' &&
-        this.datasource.instanceSettings?.jsonData?.protectedKeyId && classifyProtectedFilter(f).requiresSealing)))
+      .filter(
+        (f) =>
+          f.tag &&
+          f.operator &&
+          (f.value?.length ||
+            (f.value === '' &&
+              this.datasource.instanceSettings?.jsonData?.protectedAttributesEnabled &&
+              classifyProtectedFilter(f).requiresSealing))
+      )
       .map((f) => filterToQuerySection(f, filters, this));
   }
 
   private generateQueryFromAdHocFilters = (filters: AdHocVariableFilter[]) => {
-    if (this.datasource.instanceSettings?.jsonData?.protectedKeyId) {
+    if (this.datasource.instanceSettings?.jsonData?.protectedAttributesEnabled) {
       for (const filter of filters) {
         const key = filter.key;
-        if (isVariableBearing(key) ||
+        if (
+          isVariableBearing(key) ||
           (!intrinsics.includes(key) && !adHocStaticName.test(key.replace(adHocQuotedName, 'x'))) ||
           !adHocOperators.includes(filter.operator) ||
           isProtectedTagValueRequest(key) ||
-          isProtectedTagValueRequest(key.replace(/^(?:resource|event|link|instrumentation)\./, 'span.'))) {
+          isProtectedTagValueRequest(key.replace(/^(?:resource|event|link|instrumentation)\./, 'span.'))
+        ) {
           throw new Error('Protected or malformed host ad-hoc filters are not supported');
         }
       }
@@ -253,7 +267,10 @@ export default class TempoLanguageProvider extends LanguageProvider {
 
   adHocValueHelper = (f: AdHocVariableFilter) => {
     if (enumIntrinsics.includes(f.key)) {
-      if (this.datasource.instanceSettings?.jsonData?.protectedKeyId && !/^[\p{L}\p{N}_-]+$/u.test(f.value)) {
+      if (
+        this.datasource.instanceSettings?.jsonData?.protectedAttributesEnabled &&
+        !/^[\p{L}\p{N}_-]+$/u.test(f.value)
+      ) {
         throw new Error('Malformed host ad-hoc filter value');
       }
       return f.value;

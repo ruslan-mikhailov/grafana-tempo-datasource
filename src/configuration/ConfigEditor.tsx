@@ -1,5 +1,5 @@
 import { css } from '@emotion/css';
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 
 import { type DataSourcePluginOptionsEditorProps, type GrafanaTheme2 } from '@grafana/data';
 import {
@@ -20,7 +20,7 @@ import {
   DataSourceDescription,
 } from '@grafana/plugin-ui';
 import { config } from '@grafana/runtime';
-import { SecureSocksProxySettings, useStyles2, Divider, Stack, InlineField, Input } from '@grafana/ui';
+import { SecureSocksProxySettings, useStyles2, Divider, Stack, InlineField, InlineSwitch } from '@grafana/ui';
 
 import { type TempoJsonData } from '../types';
 import { QuerySettings } from './QuerySettings';
@@ -35,26 +35,23 @@ export type ConfigEditorProps = DataSourcePluginOptionsEditorProps<TempoJsonData
 
 const ConfigEditor = ({ options, onOptionsChange }: ConfigEditorProps) => {
   const styles = useStyles2(getStyles);
-  const [keyIdDraft, setKeyIdDraft] = useState(options.jsonData.protectedKeyId ?? '');
-  const [keyIdError, setKeyIdError] = useState<string>();
-
-  useEffect(() => {
-    setKeyIdDraft(options.jsonData.protectedKeyId ?? '');
-  }, [options.jsonData.protectedKeyId]);
+  const [protectionError, setProtectionError] = useState<string>();
 
   const guardedOptionsChange: ConfigEditorProps['onOptionsChange'] = (next) => {
-    const keyId = next.jsonData.protectedKeyId;
-    if (keyId && !/^[0-9a-f]{32}$/.test(keyId)) {
-      setKeyIdError('Key ID must be exactly 32 lowercase hexadecimal characters.');
+    if ('protectedKeyId' in next.jsonData && !next.jsonData.protectedAttributesEnabled) {
+      setProtectionError('Enable protected attributes before saving this legacy datasource.');
       return;
     }
-    const unsafeFilter = keyId ? protectedStaticFilterError(next.jsonData.search?.filters) : undefined;
+    const unsafeFilter = next.jsonData.protectedAttributesEnabled
+      ? protectedStaticFilterError(next.jsonData.search?.filters)
+      : undefined;
     if (unsafeFilter) {
-      setKeyIdError(unsafeFilter);
+      setProtectionError(unsafeFilter);
       return;
     }
-    setKeyIdError(undefined);
-    onOptionsChange(next);
+    setProtectionError(undefined);
+    const { protectedKeyId: _legacyKeyId, ...jsonData } = next.jsonData as TempoJsonData & { protectedKeyId?: string };
+    onOptionsChange({ ...next, jsonData });
   };
   return (
     <div className={styles.container}>
@@ -103,28 +100,22 @@ const ConfigEditor = ({ options, onOptionsChange }: ConfigEditorProps) => {
 
           <ConfigSubSection
             title="Protected span attributes"
-            description="Configure the public fingerprint of the browser-imported key. This is not the key and does not encrypt existing traces."
+            description="Protect enc.* span attributes in queries. Import a key in the browser to unlock protected data; the key is never sent to Grafana or Tempo."
           >
-            <InlineField label="Key ID" labelWidth={26} tooltip="32 lowercase hexadecimal characters; import the matching key in Explore.">
-              <Input
-                aria-label="Protected key ID"
-                value={keyIdDraft}
-                placeholder="32 lowercase hexadecimal characters"
-                onChange={(event) => {
-                  const value = event.currentTarget.value;
-                  setKeyIdDraft(value);
-                  if (value && !/^[0-9a-f]{32}$/.test(value)) {
-                    setKeyIdError('Key ID must be exactly 32 lowercase hexadecimal characters.');
-                    return;
-                  }
+            <InlineField label="Enable protected attributes" labelWidth={26}>
+              <InlineSwitch
+                id="protectedAttributesEnabled"
+                aria-label="Enable protected attributes"
+                value={options.jsonData.protectedAttributesEnabled ?? false}
+                onChange={(event) =>
                   guardedOptionsChange({
                     ...options,
-                    jsonData: { ...options.jsonData, protectedKeyId: value || undefined },
-                  });
-                }}
+                    jsonData: { ...options.jsonData, protectedAttributesEnabled: event.currentTarget.checked },
+                  })
+                }
               />
             </InlineField>
-            {keyIdError && <div role="alert">{keyIdError}</div>}
+            {protectionError && <div role="alert">{protectionError}</div>}
           </ConfigSubSection>
 
           <ConfigSubSection

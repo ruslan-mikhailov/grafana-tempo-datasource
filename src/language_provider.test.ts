@@ -300,7 +300,7 @@ describe('Language_provider', () => {
         const datasource = {
           search: { filters: [] },
           metadataRequest,
-          instanceSettings: { jsonData: { protectedKeyId: '630dcd2966c4336691125448bbb25b4f' } },
+          instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
         } as unknown as TempoDatasource;
         const provider = new TempoLanguageProvider(datasource);
         const punctuation = 'x"} // span.enc.password="secret';
@@ -376,7 +376,7 @@ describe('Language_provider', () => {
       const metadataRequest = jest.fn().mockResolvedValue({ tagValues: [{ type: 'string', value: 'visible' }] });
       const datasource = {
         metadataRequest,
-        instanceSettings: { jsonData: { protectedKeyId: '630dcd2966c4336691125448bbb25b4f' } },
+        instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
       } as unknown as TempoDatasource;
       const lp = new TempoLanguageProvider(datasource);
       expect(await lp.getOptionsV2({ tag: 'span.enc.password', query: '{span.enc.password=\"secret\"}' })).toEqual([]);

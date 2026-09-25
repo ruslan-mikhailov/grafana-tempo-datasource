@@ -14,7 +14,15 @@ jest.mock('@grafana/ui', () => {
   const React = jest.requireActual<typeof ReactType>('react');
   return {
     ...ui,
-    CodeEditor: ({ value, onChange, readOnly }: { value: string; onChange: (value: string) => void; readOnly?: boolean }) => {
+    CodeEditor: ({
+      value,
+      onChange,
+      readOnly,
+    }: {
+      value: string;
+      onChange: (value: string) => void;
+      readOnly?: boolean;
+    }) => {
       const firstChange = React.useRef(onChange);
       return React.createElement('textarea', {
         'aria-label': 'raw traceql',
@@ -39,7 +47,7 @@ test('unlocking Monaco keeps its initial handler current and host receives only 
   const datasource = {
     uid: 'tempo-uid',
     protectedKey: key,
-    instanceSettings: { jsonData: { protectedKeyId: kid } },
+    instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
     languageProvider: {
       start: jest.fn().mockResolvedValue(undefined),
       shouldRefreshLabels: () => false,
@@ -48,8 +56,16 @@ test('unlocking Monaco keeps its initial handler current and host receives only 
   const query: TempoQuery = { refId: 'A', queryType: 'traceql', query: saved, filters: [] };
   const hostChange = jest.fn();
   const pending = jest.fn();
-  render(<TraceQLEditor placeholder="TraceQL" query={query} datasource={datasource}
-    onChange={hostChange} onRunQuery={() => {}} onPendingChange={pending} />);
+  render(
+    <TraceQLEditor
+      placeholder="TraceQL"
+      query={query}
+      datasource={datasource}
+      onChange={hostChange}
+      onRunQuery={() => {}}
+      onPendingChange={pending}
+    />
+  );
   const editor = screen.getByRole('textbox', { name: 'raw traceql' });
   expect(editor).toHaveAttribute('readonly');
   await waitFor(() => expect(editor).not.toHaveAttribute('readonly'));
@@ -61,4 +77,60 @@ test('unlocking Monaco keeps its initial handler current and host receives only 
   expect(pending).toHaveBeenCalledWith(true);
   expect(pending).toHaveBeenLastCalledWith(false);
   expect(query.query).toBe(saved);
+});
+
+test('keeps a sealed query locked without a key or with a different imported key ID', async () => {
+  const saved = `qenc:v1:${kid}:${'A'.repeat(40)}`;
+  const query: TempoQuery = { refId: 'A', queryType: 'traceql', query: saved, filters: [] };
+  const datasource = {
+    uid: 'tempo-uid',
+    instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
+    languageProvider: { start: jest.fn().mockResolvedValue(undefined), shouldRefreshLabels: () => false },
+  } as unknown as TempoDatasource;
+  const hostChange = jest.fn();
+  const props = { placeholder: 'TraceQL', query, datasource, onChange: hostChange, onRunQuery: jest.fn() };
+  const view = render(<TraceQLEditor {...props} />);
+  const editor = screen.getByRole('textbox', { name: 'raw traceql' });
+  expect(editor).toHaveAttribute('readonly');
+  expect(editor).toHaveValue('');
+
+  const wrongKey = { kid: '00000000000000000000000000000000', openQueryModel: jest.fn() };
+  Object.defineProperty(datasource, 'protectedKey', { value: wrongKey, configurable: true });
+  view.rerender(<TraceQLEditor {...props} />);
+  expect(editor).toHaveAttribute('readonly');
+  expect(wrongKey.openQueryModel).not.toHaveBeenCalled();
+  expect(hostChange).not.toHaveBeenCalled();
+
+  const matchingKey = { kid, openQueryModel: jest.fn().mockResolvedValue('{span.enc.password="old"}') };
+  Object.defineProperty(datasource, 'protectedKey', { value: matchingKey, configurable: true });
+  view.rerender(<TraceQLEditor {...props} />);
+  await waitFor(() => expect(editor).not.toHaveAttribute('readonly'));
+  expect(editor).toHaveValue('{span.enc.password="old"}');
+  expect(hostChange).not.toHaveBeenCalled();
+});
+
+test('allows ordinary raw edits without an imported key but rejects protected plaintext', async () => {
+  const datasource = {
+    uid: 'tempo-uid',
+    instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
+    languageProvider: { start: jest.fn().mockResolvedValue(undefined), shouldRefreshLabels: () => false },
+  } as unknown as TempoDatasource;
+  const query: TempoQuery = { refId: 'A', queryType: 'traceql', query: '{span.http.route="old"}', filters: [] };
+  const hostChange = jest.fn();
+  render(
+    <TraceQLEditor
+      placeholder="TraceQL"
+      query={query}
+      datasource={datasource}
+      onChange={hostChange}
+      onRunQuery={jest.fn()}
+    />
+  );
+  const editor = screen.getByRole('textbox', { name: 'raw traceql' });
+  await waitFor(() => expect(editor).not.toHaveAttribute('readonly'));
+  fireEvent.change(editor, { target: { value: '{span.http.route="new"}' } });
+  expect(hostChange).toHaveBeenCalledWith(expect.objectContaining({ query: '{span.http.route="new"}' }));
+  hostChange.mockClear();
+  fireEvent.change(editor, { target: { value: '{span.enc.password="secret"}' } });
+  expect(hostChange).not.toHaveBeenCalled();
 });

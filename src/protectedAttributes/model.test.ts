@@ -1,5 +1,3 @@
-/** @jest-environment node */
-
 import { webcrypto } from 'node:crypto';
 
 import { TraceqlSearchScope } from '../dataquery';
@@ -17,9 +15,18 @@ import {
 const uid = 'tempo-uid';
 const master = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
 const kid = '630dcd2966c4336691125448bbb25b4f';
+const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
 
 beforeAll(() => {
   Object.defineProperty(globalThis, 'crypto', { value: webcrypto, configurable: true });
+});
+
+afterAll(() => {
+  if (originalCrypto) {
+    Object.defineProperty(globalThis, 'crypto', originalCrypto);
+  } else {
+    Reflect.deleteProperty(globalThis, 'crypto');
+  }
 });
 
 function query(raw = '', filters: TempoQuery['filters'] = []): TempoQuery {
@@ -27,7 +34,11 @@ function query(raw = '', filters: TempoQuery['filters'] = []): TempoQuery {
 }
 
 const protectedFilter = (value: string | string[]) => ({
-  id: 'password', scope: TraceqlSearchScope.Span, tag: 'enc.password', operator: '=', value,
+  id: 'password',
+  scope: TraceqlSearchScope.Span,
+  tag: 'enc.password',
+  operator: '=',
+  value,
 });
 
 test('host raw query stays plain only for a fixed ordinary field; protected and dynamic names seal', async () => {
@@ -61,8 +72,16 @@ test('each protected filter array element authenticates against its filter ID an
   expect(values).toHaveLength(3);
   expect(values.every((v) => v.startsWith('qenc:v1:') && !v.includes('π🙂'))).toBe(true);
   expect((await openProtectedQueryModel(sealed, key, uid)).filters[0].value).toEqual(['', '123', 'π🙂']);
-  await expect(openProtectedQueryModel({ ...sealed, filters: [{ ...sealed.filters[0], value: [values[1], values[0], values[2]] }] }, key, uid)).rejects.toThrow();
-  await expect(openProtectedQueryModel({ ...sealed, filters: [{ ...sealed.filters[0], id: 'other' }] }, key, uid)).rejects.toThrow();
+  await expect(
+    openProtectedQueryModel(
+      { ...sealed, filters: [{ ...sealed.filters[0], value: [values[1], values[0], values[2]] }] },
+      key,
+      uid
+    )
+  ).rejects.toThrow();
+  await expect(
+    openProtectedQueryModel({ ...sealed, filters: [{ ...sealed.filters[0], id: 'other' }] }, key, uid)
+  ).rejects.toThrow();
   expect(() => assertProtectedQueryModelSafe(source, kid)).toThrow();
 });
 test('a qenc-looking user literal is sealed as plaintext; only unchanged source slots retain prior envelopes', async () => {
@@ -83,15 +102,30 @@ test('a qenc-looking user literal is sealed as plaintext; only unchanged source 
 
 test('dynamic tag or scope keeps adjacent builder value sealed even if it currently resolves ordinary', async () => {
   const key = await importKey(master);
-  const ordinaryInterior = query('', [{
-    id: 'ordinary', scope: TraceqlSearchScope.Span, tag: 'http.enc.password', operator: '=', value: 'abc', valueType: 'string',
-  }]);
+  const ordinaryInterior = query('', [
+    {
+      id: 'ordinary',
+      scope: TraceqlSearchScope.Span,
+      tag: 'http.enc.password',
+      operator: '=',
+      value: 'abc',
+      valueType: 'string',
+    },
+  ]);
   expect(await prepareProtectedQueryModel(ordinaryInterior, key, uid)).toEqual(ordinaryInterior);
-  const quoted = query('', [{
-    id: 'quoted', scope: TraceqlSearchScope.Span, tag: '\"enc\".\"password\"', operator: '=', value: 'abc',
-  }]);
+  const quoted = query('', [
+    {
+      id: 'quoted',
+      scope: TraceqlSearchScope.Span,
+      tag: '\"enc\".\"password\"',
+      operator: '=',
+      value: 'abc',
+    },
+  ]);
   expect((await prepareProtectedQueryModel(quoted, key, uid)).filters[0].value).toMatch(/^qenc:v1:/);
-  const source = query('', [{ id: 'variable', scope: TraceqlSearchScope.Span, tag: '${attribute}', operator: '=', value: 'abc' }]);
+  const source = query('', [
+    { id: 'variable', scope: TraceqlSearchScope.Span, tag: '${attribute}', operator: '=', value: 'abc' },
+  ]);
   expect(classifyProtectedFilter(source.filters[0]).requiresSealing).toBe(true);
   const sealed = await prepareProtectedQueryModel(source, key, uid);
   expect(sealed.filters[0].value).toMatch(/^qenc:v1:/);
@@ -104,19 +138,57 @@ test('dynamic tag or scope keeps adjacent builder value sealed even if it curren
 test('unsupported/ambiguous plaintext cannot cross model gate; static provisioned defaults fail closed', async () => {
   const key = await importKey(master);
   expect(() => assertProtectedQueryModelSafe(query('', [protectedFilter('secret')]), kid)).toThrow();
-  await expect(prepareProtectedQueryModel(query('', [{ ...protectedFilter('secret'), operator: '=~' }]), key, uid)).rejects.toThrow();
-  await expect(prepareProtectedQueryModel(query('', [{ ...protectedFilter('secret'), scope: TraceqlSearchScope.Resource }]), key, uid)).rejects.toThrow();
+  await expect(
+    prepareProtectedQueryModel(query('', [{ ...protectedFilter('secret'), operator: '=~' }]), key, uid)
+  ).rejects.toThrow();
+  await expect(
+    prepareProtectedQueryModel(
+      query('', [{ ...protectedFilter('secret'), scope: TraceqlSearchScope.Resource }]),
+      key,
+      uid
+    )
+  ).rejects.toThrow();
   await expect(prepareProtectedQueryModel(query('', [protectedFilter('a\nb')]), key, uid)).rejects.toThrow();
-  expect(() => assertProtectedQueryModelSafe(query('', [{
-    id: 'injected', scope: TraceqlSearchScope.Span, tag: 'http.route=\"x\" && span.enc.password',
-    operator: '=', value: 'abc', valueType: 'string',
-  }]), kid)).toThrow();
-  expect(() => assertProtectedQueryModelSafe(query('', [{
-    id: 'quoted', scope: TraceqlSearchScope.Span, tag: '\"enc.password\"', operator: '=', value: 'abc',
-  }]), kid)).toThrow();
+  expect(() =>
+    assertProtectedQueryModelSafe(
+      query('', [
+        {
+          id: 'injected',
+          scope: TraceqlSearchScope.Span,
+          tag: 'http.route=\"x\" && span.enc.password',
+          operator: '=',
+          value: 'abc',
+          valueType: 'string',
+        },
+      ]),
+      kid
+    )
+  ).toThrow();
+  expect(() =>
+    assertProtectedQueryModelSafe(
+      query('', [
+        {
+          id: 'quoted',
+          scope: TraceqlSearchScope.Span,
+          tag: '\"enc.password\"',
+          operator: '=',
+          value: 'abc',
+        },
+      ]),
+      kid
+    )
+  ).toThrow();
   expect(() => assertStaticProtectedFilterDefaultsSafe([protectedFilter('secret')])).toThrow();
-  expect(() => assertStaticProtectedFilterDefaultsSafe([{ id: 'dynamic', scope: TraceqlSearchScope.Span, tag: '${attribute}', value: 'secret' }])).toThrow();
-  expect(() => assertStaticProtectedFilterDefaultsSafe([{ id: 'ordinary', scope: TraceqlSearchScope.Resource, tag: 'service.name', value: 'frontend' }])).not.toThrow();
+  expect(() =>
+    assertStaticProtectedFilterDefaultsSafe([
+      { id: 'dynamic', scope: TraceqlSearchScope.Span, tag: '${attribute}', value: 'secret' },
+    ])
+  ).toThrow();
+  expect(() =>
+    assertStaticProtectedFilterDefaultsSafe([
+      { id: 'ordinary', scope: TraceqlSearchScope.Resource, tag: 'service.name', value: 'frontend' },
+    ])
+  ).not.toThrow();
 });
 
 test('known scoped intrinsics remain usable while malformed colon names and mismatched scopes fail closed', () => {
@@ -126,10 +198,10 @@ test('known scoped intrinsics remain usable while malformed colon names and mism
     { id: 'trace-duration', scope: TraceqlSearchScope.Intrinsic, tag: 'trace:duration', operator: '>', value: '100ms' },
   ]);
   expect(() => assertProtectedQueryModelSafe(safe, kid)).not.toThrow();
-  expect(() => assertProtectedQueryModelSafe(query('', [
-    { ...safe.filters[0], tag: 'span:enc.password' },
-  ]), kid)).toThrow();
-  expect(() => assertProtectedQueryModelSafe(query('', [
-    { ...safe.filters[1], scope: TraceqlSearchScope.Resource },
-  ]), kid)).toThrow();
+  expect(() =>
+    assertProtectedQueryModelSafe(query('', [{ ...safe.filters[0], tag: 'span:enc.password' }]), kid)
+  ).toThrow();
+  expect(() =>
+    assertProtectedQueryModelSafe(query('', [{ ...safe.filters[1], scope: TraceqlSearchScope.Resource }]), kid)
+  ).toThrow();
 });

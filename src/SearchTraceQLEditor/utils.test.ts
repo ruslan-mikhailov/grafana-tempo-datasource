@@ -238,7 +238,7 @@ describe('filterToQuerySection returns the correct query section for a filter', 
   });
   it('quotes protected numeric-looking, empty and escaped string values without unsupported escapes', () => {
     const protectedDatasource = {
-      instanceSettings: { jsonData: { protectedKeyId: '630dcd2966c4336691125448bbb25b4f' } },
+      instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
     } as TempoDatasource;
     const provider = new TempoLanguageProvider(protectedDatasource);
     const filter: TraceqlFilter = {
@@ -257,7 +257,7 @@ describe('filterToQuerySection returns the correct query section for a filter', 
     const protectedDatasource = {
       search: { filters: [] },
       metadataRequest,
-      instanceSettings: { jsonData: { protectedKeyId: '630dcd2966c4336691125448bbb25b4f' } },
+      instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
     } as unknown as TempoDatasource;
     const provider = new TempoLanguageProvider(protectedDatasource);
     const ordinary: TraceqlFilter = {
@@ -287,7 +287,7 @@ describe('filterToQuerySection returns the correct query section for a filter', 
     expect(() => assertProtectedQueryModelSafe({ ...saved, filters: [{ ...filter, valueType: undefined }] }, kid)).toThrow();
     const provider = new TempoLanguageProvider({
       search: { filters: [] },
-      instanceSettings: { jsonData: { protectedKeyId: kid } },
+      instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
     } as unknown as TempoDatasource);
     const q = provider.generateQueryFromFilters({ traceqlFilters: saved.filters });
     expect(q).toBe(`{span.http.route=${JSON.stringify(value)}}`);

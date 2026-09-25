@@ -22,36 +22,41 @@ export function protectedStaticFilterError(filters: TraceqlFilter[] | undefined)
     assertStaticProtectedFilterDefaultsSafe(filters);
     return undefined;
   } catch {
-    const index = filters?.findIndex((filter) => {
-      try {
-        assertStaticProtectedFilterDefaultsSafe([filter]);
-        return false;
-      } catch {
-        return true;
-      }
-    }) ?? -1;
+    const index =
+      filters?.findIndex((filter) => {
+        try {
+          assertStaticProtectedFilterDefaultsSafe([filter]);
+          return false;
+        } catch {
+          return true;
+        }
+      }) ?? -1;
     const filter = index >= 0 ? filters?.[index] : undefined;
     const scope = String(filter?.scope ?? 'unscoped');
-    const field = filter?.tag && /^[a-zA-Z0-9_.-]+$/.test(filter.tag) && /^[a-zA-Z0-9_-]+$/.test(scope)
-      ? `${scope}.${filter.tag}`
-      : `filter ${index + 1} (dynamic or invalid field)`;
+    const field =
+      filter?.tag && /^[a-zA-Z0-9_.-]+$/.test(filter.tag) && /^[a-zA-Z0-9_-]+$/.test(scope)
+        ? `${scope}.${filter.tag}`
+        : `filter ${index + 1} (dynamic or invalid field)`;
     return `Cannot save static search filter ${field}: its value could target a protected attribute. Remove its value or filter.`;
   }
 }
 
 export function TraceQLSearchTags({ options, onOptionsChange, datasource }: Props) {
   const [protectionError, setProtectionError] = useState<string>();
-  const saveFilters = useCallback((filters: TraceqlFilter[]) => {
-    const message = options.jsonData.protectedKeyId ? protectedStaticFilterError(filters) : undefined;
-    setProtectionError(message);
-    if (message) {
-      return;
-    }
-    updateDatasourcePluginJsonDataOption({ onOptionsChange, options }, 'search', {
-      ...options.jsonData.search,
-      filters,
-    });
-  }, [onOptionsChange, options]);
+  const saveFilters = useCallback(
+    (filters: TraceqlFilter[]) => {
+      const message = options.jsonData.protectedAttributesEnabled ? protectedStaticFilterError(filters) : undefined;
+      setProtectionError(message);
+      if (message) {
+        return;
+      }
+      updateDatasourcePluginJsonDataOption({ onOptionsChange, options }, 'search', {
+        ...options.jsonData.search,
+        filters,
+      });
+    },
+    [onOptionsChange, options]
+  );
 
   const fetchTags = async () => {
     if (!datasource) {
@@ -113,7 +118,11 @@ export function TraceQLSearchTags({ options, onOptionsChange, datasource }: Prop
       ) : (
         <div>Invalid data source, please create a valid data source and try again</div>
       )}
-      {protectionError && <Alert title="Unsafe static search filter" severity="error">{protectionError}</Alert>}
+      {protectionError && (
+        <Alert title="Unsafe static search filter" severity="error">
+          {protectionError}
+        </Alert>
+      )}
       {error && (
         <Alert title={'Unable to fetch TraceQL tags'} severity={'error'} topSpacing={1}>
           {error.message}

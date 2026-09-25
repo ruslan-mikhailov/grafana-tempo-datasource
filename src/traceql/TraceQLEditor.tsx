@@ -8,7 +8,11 @@ import { Button, CodeEditor, type Monaco, type monacoTypes, useTheme2 } from '@g
 
 import { DEFAULT_TIME_RANGE_FOR_TAGS } from '../configuration/TagsTimeRangeSettings';
 import { type TempoDatasource } from '../datasource';
-import { assertProtectedQueryModelSafe, openProtectedQueryModel, prepareProtectedQueryModel } from '../protectedAttributes/model';
+import {
+  assertProtectedQueryModelSafe,
+  openProtectedQueryModel,
+  prepareProtectedQueryModel,
+} from '../protectedAttributes/model';
 import { type TempoQuery } from '../types';
 
 import { CompletionProvider, type CompletionItemType } from './autocomplete';
@@ -28,8 +32,12 @@ interface Props {
 
 export function TraceQLEditor(props: Props) {
   const [alertText, setAlertText] = useState<string>();
-  const [draft, setDraft] = useState(() => props.datasource.instanceSettings?.jsonData?.protectedKeyId ? '' : props.query.query || '');
-  const [locked, setLocked] = useState(() => Boolean(props.datasource.instanceSettings?.jsonData?.protectedKeyId));
+  const [draft, setDraft] = useState(() =>
+    props.datasource.instanceSettings?.jsonData?.protectedAttributesEnabled ? '' : props.query.query || ''
+  );
+  const [locked, setLocked] = useState(() =>
+    Boolean(props.datasource.instanceSettings?.jsonData?.protectedAttributesEnabled)
+  );
   const [draftPending, setDraftPending] = useState(false);
   const [dirty, setDirty] = useState(false);
 
@@ -51,25 +59,26 @@ export function TraceQLEditor(props: Props) {
   queryRef.current = query;
   const generation = useRef(0);
   const savedEnvelope = useRef<string | undefined>(undefined);
+  const savedKey = useRef(props.datasource.protectedKey);
   const [legacy, setLegacy] = useState(false);
   const committed = useRef(true);
-  const configuredKid = props.datasource.instanceSettings?.jsonData?.protectedKeyId;
+  const protectedMode = props.datasource.instanceSettings?.jsonData?.protectedAttributesEnabled;
   const key = props.datasource.protectedKey;
 
   useEffect(() => {
     // A host acknowledgement of our own seal must not replace a newer Monaco draft.
-    if (savedEnvelope.current !== undefined && savedEnvelope.current === query.query) {
+    if (savedKey.current === key && savedEnvelope.current !== undefined && savedEnvelope.current === query.query) {
       return;
     }
     const current = ++generation.current;
-    if (!configuredKid) {
+    if (!protectedMode) {
       setDraft(query.query || '');
       setLocked(false);
       setLegacy(false);
       return;
     }
     try {
-      assertProtectedQueryModelSafe(query, configuredKid);
+      assertProtectedQueryModelSafe(query, key?.kid);
     } catch {
       // Existing legacy plaintext remains in the host model. Only a key holder
       // may explicitly edit and migrate it; never forward it again unchanged.
@@ -87,7 +96,7 @@ export function TraceQLEditor(props: Props) {
     }
     setDraft('');
     setLocked(true);
-    if (key?.kid !== configuredKid) {
+    if (!key) {
       return;
     }
     void openProtectedQueryModel(query, key, props.datasource.uid).then(
@@ -106,9 +115,14 @@ export function TraceQLEditor(props: Props) {
     );
     // A new model increments generation at the beginning of this effect;
     // an acknowledgement of our own seal must not invalidate a newer edit.
-  }, [query.query, configuredKid, key, props.datasource.uid]);
+  }, [query.query, protectedMode, key, props.datasource.uid]);
 
-  useEffect(() => () => { generation.current++; }, []);
+  useEffect(
+    () => () => {
+      generation.current++;
+    },
+    []
+  );
   useEffect(() => {
     props.onPendingChange?.(locked || dirty);
   }, [locked, dirty, props.onPendingChange]);
@@ -126,7 +140,7 @@ export function TraceQLEditor(props: Props) {
     const current = ++generation.current;
     setDraftPending(false);
     const candidate = { ...queryRef.current, query: value };
-    if (!configuredKid) {
+    if (!protectedMode) {
       onChange(candidate);
       committed.current = true;
       setDirty(false);
@@ -135,7 +149,7 @@ export function TraceQLEditor(props: Props) {
     }
     try {
       if (!key) {
-        assertProtectedQueryModelSafe(candidate, configuredKid);
+        assertProtectedQueryModelSafe(candidate);
         onChange(candidate);
         committed.current = true;
         setDirty(false);
@@ -149,6 +163,7 @@ export function TraceQLEditor(props: Props) {
             return;
           }
           savedEnvelope.current = sealed.query;
+          savedKey.current = key;
           onChange(sealed);
           committed.current = true;
           setDraftPending(false);
@@ -265,27 +280,33 @@ export function TraceQLEditor(props: Props) {
         }}
       />
       {locked && <TemporaryAlert severity="info" text="Import the matching key to unlock this query" />}
-      {legacy && key?.kid === configuredKid && (
-        <Button variant="secondary" onClick={() => {
-          const currentKey = props.datasource.protectedKey;
-          if (!currentKey || currentKey.kid !== configuredKid) {
-            return;
-          }
-          const current = ++generation.current;
-          void prepareProtectedQueryModel(queryRef.current, currentKey, props.datasource.uid, queryRef.current).then(
-            (sealed) => {
-              if (generation.current === current && props.datasource.protectedKey === currentKey) {
-                savedEnvelope.current = sealed.query;
-                onChange(sealed);
-                setLegacy(false);
-                setLocked(false);
-                setDirty(false);
-                props.onPendingChange?.(false);
-              }
-            },
-            () => setAlertText('Correct the legacy query before migrating it')
-          );
-        }}>Seal legacy query</Button>
+      {legacy && key && (
+        <Button
+          variant="secondary"
+          onClick={() => {
+            const currentKey = props.datasource.protectedKey;
+            if (!currentKey) {
+              return;
+            }
+            const current = ++generation.current;
+            void prepareProtectedQueryModel(queryRef.current, currentKey, props.datasource.uid, queryRef.current).then(
+              (sealed) => {
+                if (generation.current === current && props.datasource.protectedKey === currentKey) {
+                  savedEnvelope.current = sealed.query;
+                  savedKey.current = currentKey;
+                  onChange(sealed);
+                  setLegacy(false);
+                  setLocked(false);
+                  setDirty(false);
+                  props.onPendingChange?.(false);
+                }
+              },
+              () => setAlertText('Correct the legacy query before migrating it')
+            );
+          }}
+        >
+          Seal legacy query
+        </Button>
       )}
       {alertText && <TemporaryAlert severity="error" text={alertText} />}
     </>
