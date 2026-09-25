@@ -34,9 +34,12 @@ const getTags = jest.fn().mockImplementation(() => {
 });
 
 jest.mock('../language_provider', () => {
-  return jest.fn().mockImplementation(() => {
-    return { getOptionsV2, getTags };
-  });
+  return jest.fn().mockImplementation((datasource: TempoDatasource) => ({
+    datasource,
+    getOptionsV2,
+    getTags,
+    start: jest.fn().mockResolvedValue(undefined),
+  }));
 });
 
 describe('TraceQLSearch', () => {
@@ -245,22 +248,20 @@ describe('TraceQLSearch', () => {
     });
   });
 
-  it('should render group by alert when query contains group by', async () => {
+  it('should render group by alert when query contains group by', () => {
     const onChange = jest.fn();
-    await waitFor(async () => {
-      render(
-        <TraceQLSearch
-          datasource={datasource}
-          query={{ ...query, groupBy: [] }}
-          onChange={onChange}
-          onClearResults={onClearResults}
-        />
-      );
-      const button = screen.queryByRole('button', { name: 'Remove aggregate by from this query' });
-      expect(button).toBeInTheDocument();
-    });
+    render(
+      <TraceQLSearch
+        datasource={datasource}
+        query={{ ...query, groupBy: [] }}
+        onChange={onChange}
+        onClearResults={onClearResults}
+      />
+    );
+    expect(screen.getByRole('button', { name: 'Remove aggregate by from this query' })).toBeInTheDocument();
   });
   it('keeps sealed filters locked without a key and reopens only into the local editor with a matching key', async () => {
+    jest.useRealTimers();
     const kid = '630dcd2966c4336691125448bbb25b4f';
     const envelope = `qenc:v1:${kid}:${'A'.repeat(40)}`;
     const protectedDatasource = {
@@ -269,6 +270,10 @@ describe('TraceQLSearch', () => {
       instanceSettings: { jsonData: { protectedKeyId: kid } },
       search: { filters: [{ id: 'password', tag: 'enc.password', scope: TraceqlSearchScope.Span, operator: '=' }] },
     } as unknown as TempoDatasource;
+    const protectedLp = new TempoLanguageProvider(protectedDatasource);
+    protectedLp.getIntrinsics = () => ['duration'];
+    protectedLp.generateQueryFromFilters = () => '{}';
+    protectedDatasource.languageProvider = protectedLp;
     const saved = {
       refId: 'A', queryType: 'traceqlSearch', filters: [{
         id: 'password', tag: 'enc.password', scope: TraceqlSearchScope.Span, operator: '=', value: envelope,
@@ -282,14 +287,16 @@ describe('TraceQLSearch', () => {
     expect(screen.queryByLabelText('select password value')).not.toBeInTheDocument();
     const loadedKey = { kid, openQueryModel: jest.fn().mockResolvedValue('abc') };
     Object.defineProperty(protectedDatasource, 'protectedKey', { value: loadedKey, configurable: true });
-    view.rerender(
-      <TraceQLSearch datasource={protectedDatasource} query={saved} onChange={hostChange} onClearResults={onClearResults} />
-    );
-    await waitFor(() => expect(screen.getByLabelText('select password value')).toBeInTheDocument());
+    await act(async () => {
+      view.rerender(
+        <TraceQLSearch datasource={protectedDatasource} query={saved} onChange={hostChange} onClearResults={onClearResults} />
+      );
+    });
     expect(loadedKey.openQueryModel).toHaveBeenCalledWith(
       envelope,
       JSON.stringify(['tempo-uid', 'filters', 'password', 'value'])
     );
+    await waitFor(() => expect(screen.getByLabelText('select password value')).toBeInTheDocument());
     expect(hostChange).not.toHaveBeenCalled();
     expect(saved.filters[0].value).toBe(envelope);
   });

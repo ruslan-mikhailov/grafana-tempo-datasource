@@ -267,10 +267,14 @@ export function TraceQLEditor(props: Props) {
       {locked && <TemporaryAlert severity="info" text="Import the matching key to unlock this query" />}
       {legacy && key?.kid === configuredKid && (
         <Button variant="secondary" onClick={() => {
+          const currentKey = props.datasource.protectedKey;
+          if (!currentKey || currentKey.kid !== configuredKid) {
+            return;
+          }
           const current = ++generation.current;
-          void prepareProtectedQueryModel(queryRef.current, key, props.datasource.uid, queryRef.current).then(
+          void prepareProtectedQueryModel(queryRef.current, currentKey, props.datasource.uid, queryRef.current).then(
             (sealed) => {
-              if (generation.current === current && props.datasource.protectedKey === key) {
+              if (generation.current === current && props.datasource.protectedKey === currentKey) {
                 savedEnvelope.current = sealed.query;
                 onChange(sealed);
                 setLegacy(false);

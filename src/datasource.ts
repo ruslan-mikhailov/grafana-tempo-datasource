@@ -55,7 +55,7 @@ import {
   nativeHistogramDurationMetric,
 } from './graphTransform';
 import { importKey, type ProtectedAttributeKey } from './protectedAttributes/crypto';
-import { extractProtectedDisplayEntries, ProtectedValuesStore } from './protectedAttributes/decrypt';
+import { registerProtectedDisplayKid, setProtectedDisplayKey } from './protectedAttributes/display';
 import {
   assertProtectedQueryModelSafe,
   assertStaticProtectedFilterDefaultsSafe,
@@ -282,7 +282,6 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
   private keyEpoch = 0;
   private importGeneration = 0;
   private readonly keyListeners = new Set<(epoch: number) => void>();
-  readonly protectedValues = new ProtectedValuesStore(() => this.protectedKeyEpoch);
 
   get protectedKey(): ProtectedAttributeKey | undefined {
     return this.importedProtectedKey;
@@ -304,7 +303,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     }
     const generation = ++this.importGeneration;
     const next = await importKey(base64);
-    if (generation !== this.importGeneration) {
+    if (generation !== this.importGeneration || this.instanceSettings.jsonData.protectedKeyId !== expected) {
       next.clear();
       throw new Error('Protected key import was superseded.');
     }
@@ -312,22 +311,27 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
       next.clear();
       throw new Error(`Protected key ID mismatch: expected ${expected}, received ${next.kid}.`);
     }
+    if (this.importedProtectedKey && this.importedProtectedKey.kid !== expected) {
+      setProtectedDisplayKey(this, this.importedProtectedKey.kid);
+    }
     this.importedProtectedKey?.clear();
     this.importedProtectedKey = next;
+    setProtectedDisplayKey(this, expected, next);
     this.notifyProtectedKeyChange();
     return next.kid;
   }
 
   clearProtectedKey(): void {
     this.importGeneration++;
+    const currentKid = this.importedProtectedKey?.kid ?? this.instanceSettings.jsonData.protectedKeyId;
     this.importedProtectedKey?.clear();
     this.importedProtectedKey = undefined;
+    setProtectedDisplayKey(this, currentKid);
     this.notifyProtectedKeyChange();
   }
 
   private notifyProtectedKeyChange(): void {
     this.keyEpoch++;
-    this.protectedValues.clear();
     for (const listener of this.keyListeners) {
       listener(this.keyEpoch);
     }
@@ -338,6 +342,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     private readonly templateSrv: TemplateSrv = getTemplateSrv()
   ) {
     super(instanceSettings);
+    registerProtectedDisplayKid(instanceSettings.jsonData.protectedKeyId);
 
     this.tracesToLogs = instanceSettings.jsonData.tracesToLogs;
     this.serviceMap = instanceSettings.jsonData.serviceMap;
@@ -570,15 +575,9 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
   }
 
   query(options: DataQueryRequest<TempoQuery>): Observable<DataQueryResponse> {
-    return defer(() => {
-      const displayToken = this.instanceSettings.jsonData.protectedKeyId
-        ? this.protectedValues.beginRequest()
-        : undefined;
-      const displayEpoch = this.protectedKeyEpoch;
-      return from(this.prepareTargets(options)).pipe(
-        mergeMap((prepared) => this.dispatchPreparedQueries(prepared, displayToken, displayEpoch))
-      );
-    }).pipe(
+    return defer(() => from(this.prepareTargets(options)).pipe(
+      mergeMap((prepared) => this.dispatchPreparedQueries(prepared))
+    )).pipe(
       catchError((error) =>
         of({
           error: {
@@ -755,11 +754,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     return request;
   }
 
-  private dispatchPreparedQueries(
-    options: DataQueryRequest<TempoQuery>,
-    displayToken?: number,
-    displayEpoch?: number
-  ): Observable<DataQueryResponse> {
+  private dispatchPreparedQueries(options: DataQueryRequest<TempoQuery>): Observable<DataQueryResponse> {
     const subQueries: Array<Observable<DataQueryResponse>> = [];
     const targets: { [type: string]: TempoQuery[] } = groupBy(options.targets, (t) => t.queryType || 'traceql');
     if (targets.clear) {
@@ -785,7 +780,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
         grafana_version: config.buildInfo.version,
         hasQuery: traceIdTargets.some((target) => !!target.query),
       });
-      subQueries.push(this.handleTraceIdQuery(options, traceIdTargets, traceIdTargets[0].query ?? '', displayToken, displayEpoch));
+      subQueries.push(this.handleTraceIdQuery(options, traceIdTargets, traceIdTargets[0].query ?? ''));
     }
     if (metricsTargets.length) {
       const useStreaming =
@@ -822,8 +817,8 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
       );
       subQueries.push(
         useStreaming
-          ? this.handleStreamingQuery(options, searchTargets, searchTargets[0].query ?? '', displayToken)
-          : this.handleTraceQlQuery(options, { traceql: searchTargets }, displayToken, displayEpoch)
+          ? this.handleStreamingQuery(options, searchTargets, searchTargets[0].query ?? '')
+          : this.handleTraceQlQuery(options, { traceql: searchTargets })
       );
     }
     // Upload
@@ -942,42 +937,6 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     return interpolated;
   }
 
-  private async publishProtectedResponse(
-    response: DataQueryResponse,
-    targets: TempoQuery[],
-    displayToken?: number,
-    displayEpoch?: number
-  ): Promise<DataQueryResponse> {
-    if (
-      displayToken === undefined ||
-      displayEpoch === undefined ||
-      displayEpoch !== this.protectedKeyEpoch ||
-      response.error ||
-      response.errors?.length
-    ) {
-      return response;
-    }
-    try {
-      // The extractor sees a read-only view of each refId's encrypted frames.
-      // The actual Grafana response is returned unchanged.
-      const partitions = await Promise.all(
-        targets.map(async (target) => {
-          const data = response.data.filter(
-            (frame) => frame.refId === target.refId || (targets.length === 1 && !frame.refId)
-          );
-          const entries = await extractProtectedDisplayEntries({ ...response, data }, this.protectedKey);
-          return { refId: target.refId, entries };
-        })
-      );
-      for (const { refId, entries } of partitions) {
-        this.protectedValues.replace(refId, entries, displayEpoch, displayToken);
-      }
-    } catch {
-      // A browser-only pane failure must not replace or expose host ciphertext frames.
-    }
-    return response;
-  }
-
   /**
    * Handles the simplest of the queries where we have just a trace id and return trace data for it.
    * @param options
@@ -987,9 +946,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
   handleTraceIdQuery(
     options: DataQueryRequest<TempoQuery>,
     targets: TempoQuery[],
-    query: string,
-    displayToken?: number,
-    displayEpoch?: number
+    query: string
   ): Observable<DataQueryResponse> {
     const validTargets = targets
       .filter((t) => t.query)
@@ -1004,7 +961,6 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     const startTime = performance.now();
     const request = this.makeTraceIdRequest(options, validTargets);
     return super.query(request).pipe(
-      concatMap((response) => from(this.publishProtectedResponse(response, validTargets, displayToken, displayEpoch))),
       map((response) => {
         if (response.error) {
           reportTempoQueryMetrics('grafana_traces_traceID_response', options, {
@@ -1043,9 +999,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
 
   handleTraceQlQuery(
     options: DataQueryRequest<TempoQuery>,
-    targets: { [type: string]: TempoQuery[] },
-    displayToken?: number,
-    displayEpoch?: number
+    targets: { [type: string]: TempoQuery[] }
   ) {
     const startTime = performance.now();
     const queries = targets.traceqlSearch || targets.traceql;
@@ -1053,7 +1007,6 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
       return EMPTY;
     }
     return super.query({ ...options, targets: queries }).pipe(
-      concatMap((response) => from(this.publishProtectedResponse(response, queries, displayToken, displayEpoch))),
       map((response: DataQueryResponse) => {
         reportTempoQueryMetrics('grafana_traces_traceql_response', options, {
           success: !response.error,
@@ -1160,8 +1113,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
   handleStreamingQuery(
     options: DataQueryRequest<TempoQuery>,
     targets: TempoQuery[],
-    query: string,
-    displayToken?: number
+    query: string
   ): Observable<DataQueryResponse> {
     const validTargets = targets.filter((target) => !!target.query);
     if (!validTargets.length) {
@@ -1170,7 +1122,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
 
     const startTime = performance.now();
     return merge(
-      ...validTargets.map((target) => doTempoSearchStreaming(target, this, options, this.instanceSettings, displayToken))
+      ...validTargets.map((target) => doTempoSearchStreaming(target, this, options, this.instanceSettings))
     ).pipe(
       catchError((error) => {
         reportTempoQueryMetrics('grafana_traces_traceql_response', options, {

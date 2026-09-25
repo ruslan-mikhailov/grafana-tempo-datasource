@@ -60,7 +60,7 @@ function encodeBase64url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-function decodeBase64(input: string, url: boolean, code: ProtectedAttributeCryptoErrorCode): Uint8Array {
+function decodeBase64(input: string, url: boolean, code: ProtectedAttributeCryptoErrorCode): Uint8Array<ArrayBuffer> {
   if (typeof input !== 'string') {
     throw error(code);
   }
@@ -86,7 +86,7 @@ function decodeBase64(input: string, url: boolean, code: ProtectedAttributeCrypt
   }
 }
 
-function associatedData(prefix: Uint8Array, name: string): Uint8Array {
+function associatedData(prefix: Uint8Array, name: string): Uint8Array<ArrayBuffer> {
   const encoded = encoder.encode(name);
   if (encoded.length > 0xffffffff) {
     throw error('invalid-context');
@@ -98,14 +98,14 @@ function associatedData(prefix: Uint8Array, name: string): Uint8Array {
   return result;
 }
 
-function fieldData(storedField: string): Uint8Array {
+function fieldData(storedField: string): Uint8Array<ArrayBuffer> {
   if (typeof storedField !== 'string' || !storedField.startsWith('enc.') || storedField.length <= 4) {
     throw error('invalid-field');
   }
   return associatedData(attributePrefix, storedField);
 }
 
-function modelData(context: string): Uint8Array {
+function modelData(context: string): Uint8Array<ArrayBuffer> {
   if (typeof context !== 'string') {
     throw error('invalid-context');
   }
@@ -126,7 +126,7 @@ function modelData(context: string): Uint8Array {
   return associatedData(modelPrefix, context);
 }
 
-function parseEnvelope(envelope: string, kind: 'enc' | 'qenc', kid: string, minBytes: number): Uint8Array {
+function parseEnvelope(envelope: string, kind: 'enc' | 'qenc', kid: string, minBytes: number): Uint8Array<ArrayBuffer> {
   if (typeof envelope !== 'string') {
     throw error('invalid-envelope');
   }
@@ -199,7 +199,7 @@ class ImportedKey implements ProtectedAttributeKey {
     if (typeof plaintext !== 'string') {
       throw error('invalid-context');
     }
-    const nonce = webCrypto().getRandomValues(new Uint8Array(12));
+    const nonce: Uint8Array<ArrayBuffer> = webCrypto().getRandomValues(new Uint8Array(12));
     const encoded = encoder.encode(plaintext);
     try {
       let encrypted: ArrayBuffer;
@@ -261,7 +261,7 @@ export async function importKey(base64: string): Promise<ProtectedAttributeKey> 
     throw error('invalid-key');
   }
   let attributeKey: Uint8Array | undefined;
-  let modelBytes: Uint8Array | undefined;
+  let modelBytes: Uint8Array<ArrayBuffer> | undefined;
   try {
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', master));
     const kid = Array.from(digest.subarray(0, 16), (byte) => byte.toString(16).padStart(2, '0')).join('');

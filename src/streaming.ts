@@ -1,5 +1,5 @@
 import { capitalize } from 'lodash';
-import { concatMap, type Observable, map, scan, takeWhile } from 'rxjs';
+import { type Observable, map, scan, takeWhile } from 'rxjs';
 import { v4 as uuidv4 } from 'uuid';
 import {
   type DataFrame,
@@ -22,7 +22,6 @@ import { getGrafanaLiveSrv } from '@grafana/runtime';
 
 import { MetricsQueryType, SearchStreamingState } from './dataquery';
 import { DEFAULT_SPSS, type TempoDatasource } from './datasource';
-import { extractProtectedSearchEntries } from './protectedAttributes/decrypt';
 import { formatTraceQLResponse } from './resultTransformer';
 import { type SearchMetrics, type TempoJsonData, type TempoQuery, type TraceSearchMetadata } from './types';
 import { stepToNanos } from './utils';
@@ -35,16 +34,13 @@ export function doTempoSearchStreaming(
   query: TempoQuery,
   ds: TempoDatasource,
   options: DataQueryRequest<TempoQuery>,
-  instanceSettings: DataSourceInstanceSettings<TempoJsonData>,
-  displayRequestToken?: number
+  instanceSettings: DataSourceInstanceSettings<TempoJsonData>
 ): Observable<DataQueryResponse> {
   const range = options.range;
 
   let frames: DataFrame[] | undefined = undefined;
   let state: LoadingState = LoadingState.NotStarted;
   const requestTime = performance.now();
-  const protectedKey = ds.protectedKey;
-  const protectedKeyEpoch = ds.protectedKeyEpoch;
 
   return getGrafanaLiveSrv()
     .getStream<MutableDataFrame>({
@@ -72,7 +68,7 @@ export function doTempoSearchStreaming(
       }, true)
     )
     .pipe(
-      concatMap(async (evt) => {
+      map((evt) => {
         if ('message' in evt && evt?.message) {
           const currentTime = performance.now();
           const elapsedTime = currentTime - requestTime;
@@ -96,10 +92,6 @@ export function doTempoSearchStreaming(
               throw new Error(error);
           }
 
-          if (displayRequestToken !== undefined) {
-            const entries = await extractProtectedSearchEntries(traces, protectedKey);
-            ds.protectedValues.replace(query.refId, entries, protectedKeyEpoch, displayRequestToken);
-          }
 
           // The order of the frames is important. The metrics frame should always be the last frame.
           // This is because the metrics frame is used to display the progress of the streaming query

@@ -21,7 +21,6 @@ import TraceQLSearch from './SearchTraceQLEditor/TraceQLSearch';
 import { ServiceGraphSection } from './ServiceGraphSection';
 import { type TempoQueryType } from './dataquery';
 import { type TempoDatasource } from './datasource';
-import { type ProtectedDisplayEntry } from './protectedAttributes/decrypt';
 import { assertProtectedQueryModelSafe } from './protectedAttributes/model';
 import { QueryEditor } from './traceql/QueryEditor';
 import { type TempoQuery } from './types';
@@ -39,7 +38,6 @@ interface State {
   keyError?: string;
   queryError?: string;
   keyEpoch: number;
-  protectedEntries: readonly ProtectedDisplayEntry[];
 }
 
 // This needs to default to traceql for data sources like Splunk, where clicking on a
@@ -49,7 +47,6 @@ const DEFAULT_QUERY_TYPE: TempoQueryType = 'traceql';
 class TempoQueryFieldComponent extends PureComponent<Props, State> {
   private _isMounted = false;
   private unsubscribeKey?: () => void;
-  private unsubscribeValues?: () => void;
   private sealPending = false;
   private awaitingHostCommit?: TempoQuery;
   private editorCommitSource?: TempoDatasource;
@@ -67,13 +64,11 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
       keyBusy: false,
       keyModalOpen: false,
       keyEpoch: props.datasource.protectedKeyEpoch,
-      protectedEntries: props.datasource.protectedValues.snapshot(),
     };
   }
 
   private subscribeDatasource = (datasource: TempoDatasource) => {
     this.unsubscribeKey?.();
-    this.unsubscribeValues?.();
     this.unsubscribeKey = datasource.subscribeProtectedKey((keyEpoch) => {
       if (this.props.datasource === datasource) {
         this.sealPending = false;
@@ -89,20 +84,13 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
           keyModalOpen: false,
           keyFile: undefined,
           keyError: undefined,
-          protectedEntries: datasource.protectedValues.snapshot(),
         });
-      }
-    });
-    this.unsubscribeValues = datasource.protectedValues.subscribe((protectedEntries) => {
-      if (this.props.datasource === datasource) {
-        this.setState({ protectedEntries });
       }
     });
     this.setState({
       keyEpoch: datasource.protectedKeyEpoch,
       keyModalOpen: false,
       keyFile: undefined,
-      protectedEntries: datasource.protectedValues.snapshot(),
       keyError: undefined,
       queryError: undefined,
     });
@@ -299,7 +287,6 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
   componentWillUnmount() {
     this._isMounted = false;
     this.unsubscribeKey?.();
-    this.unsubscribeValues?.();
   }
 
   onClearResults = (): boolean => {
@@ -523,7 +510,7 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
                 />
                 <p>
                   The key stays in browser memory and is forgotten on reload. It is not saved or sent to Grafana or
-                  Tempo. Run the query again after loading to refresh protected values.
+                  Tempo. Existing encrypted results become readable when the key loads.
                 </p>
                 <details>
                   <summary>About protected attributes</summary>
@@ -575,23 +562,6 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
             onClearResults={this.onClearResults}
             range={this.props.range}
           />
-        )}
-        {kid && (
-          <section aria-label="Protected span attributes">
-            <h4>Protected span attributes</h4>
-            {this.state.protectedEntries.length === 0 ? (
-              <p>No protected span values in current results.</p>
-            ) : (
-              <ul>
-                {this.state.protectedEntries.map((entry, index) => (
-                  <li key={`${entry.traceID}:${entry.spanID ?? ''}:${entry.storedField}:${index}`}>
-                    <span>Trace {entry.traceID}</span> {entry.spanID && <span>Span {entry.spanID}</span>}{' '}
-                    <span>{entry.storedField}</span>: <span>{entry.value}</span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
         )}
       </>
     );

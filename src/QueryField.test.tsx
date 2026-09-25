@@ -69,7 +69,7 @@ jest.mock('./traceql/QueryEditor', () => ({
         <button type="button" onClick={() => onPendingChange(true)}>
           Start protected seal
         </button>
-        <button type="button" onClick={onRunQuery}>
+        <button type="button" onClick={() => onRunQuery()}>
           Run from editor
         </button>
       </div>
@@ -87,8 +87,8 @@ jest.mock('@grafana/ui', () => {
 
   return {
     ...actual,
-    Button: ({ children, onClick }: { children: React.ReactNode; onClick?: () => void }) => (
-      <button onClick={onClick} type="button">
+    Button: ({ children, onClick, disabled }: { children: React.ReactNode; onClick?: () => void; disabled?: boolean }) => (
+      <button onClick={onClick} disabled={disabled} type="button">
         {children}
       </button>
     ),
@@ -391,7 +391,7 @@ describe('QueryField', () => {
     expect(screen.queryByText('key.txt')).not.toBeInTheDocument();
   });
 
-  it('notifies all mounted editors and clears only the shared datasource pane on key clear', async () => {
+  it('notifies mounted editors on key clear without rendering a separate protected-values pane', async () => {
     const user = userEvent.setup();
     const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
     jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
@@ -400,33 +400,17 @@ describe('QueryField', () => {
       await importKey(master)
     ).sealQueryModel('{span.enc.password="secret"}', JSON.stringify(['tempo-uid', 'query']));
     const query = { refId: 'A', queryType: 'traceql', query: sealed } as TempoQuery;
-    const first = renderQueryField({ datasource, query });
+    renderQueryField({ datasource, query });
     const second = renderQueryField({ datasource, query });
     const originalEditors = screen.getAllByTestId('traceql-editor');
-    const token = datasource.protectedValues.beginRequest();
-    datasource.protectedValues.replace(
-      'A',
-      [
-        {
-          traceID: 'trace1',
-          spanID: 'span1',
-          storedField: 'enc.password',
-          status: 'decrypted',
-          value: '<secret>',
-        },
-      ],
-      datasource.protectedKeyEpoch,
-      token
-    );
-    await waitFor(() => expect(screen.getAllByText('<secret>')).toHaveLength(2));
-    expect(first.container.innerHTML).toContain('&lt;secret&gt;');
+    expect(screen.queryByRole('region', { name: 'Protected span attributes' })).not.toBeInTheDocument();
 
     await user.click(screen.getAllByRole('button', { name: 'Forget key' })[0]);
-    await waitFor(() => expect(screen.getAllByText('No protected span values in current results.')).toHaveLength(2));
     const nextEditors = screen.getAllByTestId('traceql-editor');
     expect(nextEditors[0]).not.toBe(originalEditors[0]);
     expect(nextEditors[1]).not.toBe(originalEditors[1]);
     expect(second.container).toHaveTextContent('Key needed');
+    expect(screen.queryByRole('region', { name: 'Protected span attributes' })).not.toBeInTheDocument();
     await user.click(screen.getAllByRole('button', { name: 'Run from editor' })[1]);
     expect(second.props.onRunQuery).not.toHaveBeenCalled();
   });

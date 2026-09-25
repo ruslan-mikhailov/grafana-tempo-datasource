@@ -96,10 +96,7 @@ function decodedIdentifier(source: string): string {
 function attribute(node: SyntaxNode, query: string): Attribute {
   const parts = children(node);
   const scope = parts[0]?.type.id;
-  const name = parts.find((part) => part.type.id === Identifier);
-  if (!name) {
-    invalid();
-  }
+  const name = parts.find((part) => part.type.id === Identifier) ?? invalid();
   const raw = query.slice(name.from, name.to);
   const dynamic = raw.includes('$') || parts.some((part) => part.type.id === TemplateVariable);
   // A variable can change the stored field, even if today's value is ordinary.
@@ -386,16 +383,14 @@ export async function rewriteProtectedTraceQL(
   if (!predicates.length) {
     return query;
   }
-  if (!key) {
-    invalid();
-  }
+  const protectedKey = key ?? invalid();
   const edits: Edit[] = [];
   const fields = new Map<string, string>();
   for (const predicate of predicates) {
     if (!fields.has(predicate.field)) {
       fields.set(predicate.field, query.slice(predicate.lhs.from, predicate.lhs.to));
     }
-    const encrypted = JSON.stringify(key.encrypt(predicate.field, literal(predicate.rhs, query)));
+    const encrypted = JSON.stringify(protectedKey.encrypt(predicate.field, literal(predicate.rhs, query)));
     if (predicate.op === '=') {
       edits.push({ from: predicate.rhs.from, to: predicate.rhs.to, text: encrypted });
     } else {

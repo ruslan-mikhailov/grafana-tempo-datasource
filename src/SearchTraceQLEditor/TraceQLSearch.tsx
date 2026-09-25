@@ -310,10 +310,14 @@ const TraceQLSearch = ({
           <TemporaryAlert severity="info" text="Import the matching key or correct the saved protected search before editing" />
           {legacy && key?.kid === kid && (
             <Button variant="secondary" onClick={() => {
+              const currentKey = datasource.protectedKey;
+              if (!currentKey || currentKey.kid !== kid) {
+                return;
+              }
               const current = ++generation.current;
-              void prepareProtectedQueryModel(query, key, datasource.uid, query).then(
+              void prepareProtectedQueryModel(query, currentKey, datasource.uid, query).then(
                 (sealed) => {
-                  if (generation.current === current && datasource.protectedKey === key) {
+                  if (generation.current === current && datasource.protectedKey === currentKey) {
                     savedModel.current = undefined;
                     onChange(sealed);
                   }

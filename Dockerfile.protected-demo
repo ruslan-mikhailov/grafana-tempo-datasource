@@ -14,7 +14,7 @@ RUN go mod download
 COPY pkg ./pkg
 RUN mkdir -p /out && arch=${TARGETARCH:-$(go env GOARCH)} && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "/out/gpx_grafana-tempo-datasource_linux_${arch}" ./pkg
 
-FROM grafana/grafana:13.1.3
+FROM grafana-base
 COPY --from=frontend --chown=472:0 /app/dist/ /var/lib/grafana/plugins/grafana-tempo-datasource/
 COPY --from=backend --chown=472:0 /out/ /var/lib/grafana/plugins/grafana-tempo-datasource/
 COPY --chown=472:0 custom.ini /etc/grafana/grafana.ini
