@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Display protected Tempo span values in the stock Grafana Traces table and trace detail when the browser key is loaded; keep returned frames and host actions encrypted. Requires the accompanying `grafana-h` host build.
+- Open the protected key entry dialog after forgetting a key, with the old key and input cleared.
 
 ## 13.2.0
 

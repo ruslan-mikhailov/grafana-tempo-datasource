@@ -444,7 +444,10 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
                 {keyLoaded ? 'Replace key' : 'Load key'}
               </Button>
               {keyLoaded && (
-                <Button variant="secondary" size="sm" onClick={() => datasource.clearProtectedKey()}>
+                <Button variant="secondary" size="sm" onClick={() => {
+                  datasource.clearProtectedKey();
+                  this.setState({ keyModalOpen: true });
+                }}>
                   Forget key
                 </Button>
               )}

@@ -1,5 +1,5 @@
 import { webcrypto } from 'node:crypto';
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import React from 'react';
 
@@ -391,6 +391,25 @@ describe('QueryField', () => {
     expect(screen.queryByText('key.txt')).not.toBeInTheDocument();
   });
 
+  it('offers key entry immediately after forgetting a loaded key', async () => {
+    const user = userEvent.setup();
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
+    jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
+    await datasource.importProtectedKey(master);
+    const onChange = jest.fn();
+    renderQueryField({ datasource, onChange });
+
+    await user.click(screen.getByRole('button', { name: 'Forget key' }));
+    expect(datasource.protectedKey).toBeUndefined();
+    expect(screen.getByRole('dialog', { name: 'Load protected key' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Paste base64 key')).toHaveValue('');
+    await user.type(screen.getByLabelText('Paste base64 key'), master);
+    await user.click(within(screen.getByRole('dialog', { name: 'Load protected key' })).getByRole('button', { name: 'Load key' }));
+    await waitFor(() => expect(datasource.protectedKey?.kid).toBe(kid));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(JSON.stringify(onChange.mock.calls)).not.toContain(master);
+  });
+
   it('notifies mounted editors on key clear without rendering a separate protected-values pane', async () => {
     const user = userEvent.setup();
     const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedKeyId: kid } });
@@ -474,8 +493,8 @@ describe('QueryField', () => {
     jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
     await datasource.importProtectedKey(master);
     const importSpy = jest.spyOn(datasource, 'importProtectedKey');
-    renderQueryField({ datasource });
-    renderQueryField({ datasource });
+    const pendingEditor = renderQueryField({ datasource });
+    const forgetter = renderQueryField({ datasource });
     let completeRead!: (value: string) => void;
     const file = new File([master], 'key.txt', { type: 'text/plain' });
     Object.defineProperty(file, 'text', {
@@ -494,6 +513,8 @@ describe('QueryField', () => {
     });
     expect(importSpy).not.toHaveBeenCalled();
     expect(datasource.protectedKey).toBeUndefined();
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(within(pendingEditor.container).queryByRole('dialog')).not.toBeInTheDocument();
+    expect(within(forgetter.container).getByRole('dialog', { name: 'Load protected key' })).toBeInTheDocument();
+    expect(within(forgetter.container).getByLabelText('Paste base64 key')).toHaveValue('');
   });
 });
