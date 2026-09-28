@@ -38,16 +38,25 @@ describe('protected TraceQL compiler', () => {
   });
 
   it('merges missing fields into the existing select and recognizes equivalent quoted fields', async () => {
-    expect(await rewriteProtectedTraceQL('{span.enc.password=""} | select(resource.service.name) with (most_recent=true)', key, 'search')).toBe(
-      `{span.enc.password="${empty}"} | select(resource.service.name, span.enc.password) with (most_recent=true)`
-    );
-    expect(await rewriteProtectedTraceQL('{span.enc.password="abc"} | select(span."enc.password", resource.service.name)', key, 'search')).toBe(
-      `{span.enc.password="${abc}"} | select(span."enc.password", resource.service.name)`
-    );
+    expect(
+      await rewriteProtectedTraceQL(
+        '{span.enc.password=""} | select(resource.service.name) with (most_recent=true)',
+        key,
+        'search'
+      )
+    ).toBe(`{span.enc.password="${empty}"} | select(resource.service.name, span.enc.password) with (most_recent=true)`);
+    expect(
+      await rewriteProtectedTraceQL(
+        '{span.enc.password="abc"} | select(span."enc.password", resource.service.name)',
+        key,
+        'search'
+      )
+    ).toBe(`{span.enc.password="${abc}"} | select(span."enc.password", resource.service.name)`);
   });
 
   it('preserves comments around predicates, pipeline stages, and query hints', async () => {
-    const query = '/* lead */ {span.enc.password /* field */ = "abc"} /* stage */ | select(resource.service.name) // note\n with (most_recent=true)';
+    const query =
+      '/* lead */ {span.enc.password /* field */ = "abc"} /* stage */ | select(resource.service.name) // note\n with (most_recent=true)';
     expect(await rewriteProtectedTraceQL(query, key, 'search')).toBe(
       `/* lead */ {span.enc.password /* field */ = "${abc}"} /* stage */ | select(resource.service.name, span.enc.password) // note\n with (most_recent=true)`
     );
@@ -70,7 +79,9 @@ describe('protected TraceQL compiler', () => {
     expect(await rewriteProtectedTraceQL('{span.enc.password="abc"} | rate()', key, 'metrics')).toBe(
       `{span.enc.password="${abc}"} | rate()`
     );
-    expect(await rewriteProtectedTraceQL('{span.enc.password="abc"}', key, 'metadata')).toBe(`{span.enc.password="${abc}"}`);
+    expect(await rewriteProtectedTraceQL('{span.enc.password="abc"}', key, 'metadata')).toBe(
+      `{span.enc.password="${abc}"}`
+    );
     expect(await rewriteProtectedTraceQL('{span.password="abc"}', undefined, 'search')).toBe('{span.password="abc"}');
     expect(await rewriteProtectedTraceQL('{span.enc.password="abc"} | select(span.enc.password)', key, 'search')).toBe(
       `{span.enc.password="${abc}"} | select(span.enc.password)`
@@ -115,7 +126,9 @@ describe('protected TraceQL compiler', () => {
       dynamicReferences: true,
     });
     expect(classifyProtectedTraceQL('${query}').requiresSealing).toBe(true);
-    expect(classifyProtectedTraceQL('{span.enc.password="abc"} | select(span.enc.password)').requiresSealing).toBe(true);
+    expect(classifyProtectedTraceQL('{span.enc.password="abc"} | select(span.enc.password)').requiresSealing).toBe(
+      true
+    );
   });
 
   it.each([
@@ -134,7 +147,9 @@ describe('protected TraceQL compiler', () => {
     '{span.enc.password="\\u0041"}',
   ])('rejects unsupported protected syntax without sending original query: %s', async (query) => {
     expect(() => classifyProtectedTraceQL(query)).toThrow('Invalid or unsupported protected TraceQL query.');
-    await expect(rewriteProtectedTraceQL(query, key, 'search')).rejects.toThrow('Invalid or unsupported protected TraceQL query.');
+    await expect(rewriteProtectedTraceQL(query, key, 'search')).rejects.toThrow(
+      'Invalid or unsupported protected TraceQL query.'
+    );
   });
 
   it('rejects unresolved template scopes and query fragments at the outbound boundary', async () => {
@@ -142,10 +157,41 @@ describe('protected TraceQL compiler', () => {
     await expect(rewriteProtectedTraceQL('${query}', key, 'search')).rejects.toThrow();
   });
 
+  it('searches all loaded key histories and preserves canonical ciphertext even without keys', async () => {
+    const secondEnvelope = `enc:v1:${'a'.repeat(32)}:${'A'.repeat(22)}`;
+    const second = {
+      encrypt: jest.fn(() => secondEnvelope),
+    } as unknown as ProtectedAttributeKey;
+    expect(await rewriteProtectedTraceQL('{span.enc.password="abc"}', [key, second], 'search')).toBe(
+      `{(span.enc.password="${abc}" || span.enc.password="${secondEnvelope}")} | select(span.enc.password)`
+    );
+    expect(await rewriteProtectedTraceQL('{span.enc.password!="abc"}', [key, second], 'metrics')).toBe(
+      `{(span.enc.password!="${abc}" && span.enc.password!="${secondEnvelope}" && span.enc.password != nil)}`
+    );
+    const raw = `{span.enc.password="${abc}"}`;
+    expect(classifyProtectedTraceQL(raw).requiresSealing).toBe(false);
+    expect(await rewriteProtectedTraceQL(raw, undefined, 'search')).toBe(`${raw} | select(span.enc.password)`);
+    expect(await rewriteProtectedTraceQL(raw, [key, second], 'metrics')).toBe(raw);
+    expect(second.encrypt).toHaveBeenCalledTimes(2);
+    expect(second.encrypt).toHaveBeenCalledWith('enc.password', 'abc');
+    expect(
+      classifyProtectedTraceQL('{span.enc.password="enc:v1:630dcd2966c4336691125448bbb25b4f:AAAAA"}').requiresSealing
+    ).toBe(true);
+    await expect(
+      rewriteProtectedTraceQL(
+        '{span.enc.password="enc:v1:630dcd2966c4336691125448bbb25b4f:AAAAA"}',
+        undefined,
+        'search'
+      )
+    ).rejects.toThrow();
+  });
+
   it('fails closed without a key and on ambiguous search projection paths', async () => {
     await expect(rewriteProtectedTraceQL('{span.enc.password="abc"}', undefined, 'search')).rejects.toThrow();
     await expect(rewriteProtectedTraceQL('{span.enc.password="abc"} || {span.x="y"}', key, 'search')).rejects.toThrow();
     await expect(rewriteProtectedTraceQL('{span.enc.password="abc"} | rate()', key, 'search')).rejects.toThrow();
-    await expect(rewriteProtectedTraceQL('{span.enc.password="abc"} | select(span.x) | select(span.y)', key, 'search')).rejects.toThrow();
+    await expect(
+      rewriteProtectedTraceQL('{span.enc.password="abc"} | select(span.x) | select(span.y)', key, 'search')
+    ).rejects.toThrow();
   });
 });

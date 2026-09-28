@@ -28,6 +28,20 @@ const invalid = (): never => {
   throw new Error('Invalid or unsupported protected TraceQL query.');
 };
 
+/** Only canonical stored-attribute envelopes may bypass browser-side encryption. */
+export function isEncryptedAttributeEnvelope(value: string): boolean {
+  const match = /^enc:v1:[0-9a-f]{32}:([A-Za-z0-9_-]{22,})$/.exec(value);
+  if (!match) {
+    return false;
+  }
+  const payload = match[1];
+  const remainder = payload.length % 4;
+  const last = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'.indexOf(payload[payload.length - 1]);
+  return (
+    remainder !== 1 && (remainder === 0 || (remainder === 2 && last % 16 === 0) || (remainder === 3 && last % 4 === 0))
+  );
+}
+
 type Edit = { from: number; to: number; text: string };
 type Predicate = { field: string; lhs: SyntaxNode; rhs: SyntaxNode; comparison: SyntaxNode; op: '=' | '!=' };
 type Attribute = { field: string; protected: boolean; dynamic: boolean };
@@ -137,7 +151,12 @@ function directSelect(attributeNode: SyntaxNode): SyntaxNode | undefined {
   const expression = attributeNode.parent;
   const args = expression?.parent;
   const parts = expression ? children(expression) : [];
-  if (expression?.type.id !== FieldExpression || parts.length !== 1 || !sameNode(parts[0], attributeNode) || args?.type.id !== SelectArgs) {
+  if (
+    expression?.type.id !== FieldExpression ||
+    parts.length !== 1 ||
+    !sameNode(parts[0], attributeNode) ||
+    args?.type.id !== SelectArgs
+  ) {
     return undefined;
   }
   for (let current: SyntaxNode | null = args; current; current = current.parent) {
@@ -155,11 +174,21 @@ function predicateFor(attributeNode: SyntaxNode, query: string): Predicate {
   const lhs = attributeNode.parent;
   const comparison = lhs?.parent;
   const lhsParts = lhs ? children(lhs) : [];
-  if (lhs?.type.id !== FieldExpression || lhsParts.length !== 1 || !sameNode(lhsParts[0], attributeNode) || comparison?.type.id !== FieldExpression) {
+  if (
+    lhs?.type.id !== FieldExpression ||
+    lhsParts.length !== 1 ||
+    !sameNode(lhsParts[0], attributeNode) ||
+    comparison?.type.id !== FieldExpression
+  ) {
     return invalid();
   }
   const nodes = children(comparison);
-  if (nodes.length !== 3 || !sameNode(nodes[0], lhs) || nodes[1].type.id !== FieldOp || nodes[2].type.id !== FieldExpression) {
+  if (
+    nodes.length !== 3 ||
+    !sameNode(nodes[0], lhs) ||
+    nodes[1].type.id !== FieldOp ||
+    nodes[2].type.id !== FieldExpression
+  ) {
     return invalid();
   }
   const op = query.slice(nodes[1].from, nodes[1].to);
@@ -196,15 +225,26 @@ function variableMayNameField(node: SyntaxNode, query: string): boolean {
       continue;
     }
     const operator = query.slice(parts[1].from, parts[1].to);
-    if (operator === '=' || operator === '!=' || operator === '>' || operator === '<' ||
-      operator === '>=' || operator === '<=' || operator === '=~' || operator === '!~') {
+    if (
+      operator === '=' ||
+      operator === '!=' ||
+      operator === '>' ||
+      operator === '<' ||
+      operator === '>=' ||
+      operator === '<=' ||
+      operator === '=~' ||
+      operator === '!~'
+    ) {
       return node.from >= parts[0].from && node.to <= parts[0].to;
     }
   }
   return true; // A free-standing template expression may supply a whole field or query fragment.
 }
 
-function inspect(query: string, allowVariableRecovery = false): {
+function inspect(
+  query: string,
+  allowVariableRecovery = false
+): {
   classification: ProtectedTraceQLClassification;
   predicates: Predicate[];
   selects: SyntaxNode[];
@@ -277,7 +317,10 @@ function inspect(query: string, allowVariableRecovery = false): {
     classification: {
       protectedReferences,
       dynamicReferences,
-      requiresSealing: protectedReferences || dynamicReferences,
+      requiresSealing:
+        dynamicReferences ||
+        (protectedReferences &&
+          (!predicates.length || predicates.some(({ rhs }) => !isEncryptedAttributeEnvelope(literal(rhs, query))))),
       protectedRhsRanges: predicates.map(({ rhs }) => ({ from: rhs.from, to: rhs.to })),
     },
   };
@@ -317,7 +360,12 @@ function pipelineSelect(root: SyntaxNode, selects: SyntaxNode[]): SyntaxNode | u
   const stages: SyntaxNode[] = [];
   const walk = (node: SyntaxNode): void => {
     const parts = children(node);
-    if (parts.length === 3 && parts[1].type.id === Pipe && parts[0].type.id === SpansetPipelineExpression && parts[2].type.id === SpansetPipelineExpression) {
+    if (
+      parts.length === 3 &&
+      parts[1].type.id === Pipe &&
+      parts[0].type.id === SpansetPipelineExpression &&
+      parts[2].type.id === SpansetPipelineExpression
+    ) {
       walk(parts[0]);
       walk(parts[2]);
     } else if (parts.length === 1 && parts[0].type.id === SpansetPipeline) {
@@ -331,7 +379,13 @@ function pipelineSelect(root: SyntaxNode, selects: SyntaxNode[]): SyntaxNode | u
     }
   };
   walk(top);
-  if (stages.length < 1 || stages[0].type.id !== SpansetFilter || stages.length > 2 || (stages.length === 2 && stages[1].type.id !== SelectOperation) || selects.length > 1) {
+  if (
+    stages.length < 1 ||
+    stages[0].type.id !== SpansetFilter ||
+    stages.length > 2 ||
+    (stages.length === 2 && stages[1].type.id !== SelectOperation) ||
+    selects.length > 1
+  ) {
     invalid();
   }
   return stages[1];
@@ -373,7 +427,7 @@ function selectedFields(select: SyntaxNode, query: string): Set<string> {
 /** Translate finalized TraceQL only, never a persisted model or editor draft. */
 export async function rewriteProtectedTraceQL(
   query: string,
-  key: ProtectedAttributeKey | undefined,
+  keys: readonly ProtectedAttributeKey[] | ProtectedAttributeKey | undefined,
   mode: 'search' | 'metrics' | 'metadata'
 ): Promise<string> {
   const { root, predicates, selects, classification } = inspect(query);
@@ -383,23 +437,35 @@ export async function rewriteProtectedTraceQL(
   if (!predicates.length) {
     return query;
   }
-  const protectedKey = key ?? invalid();
+  const protectedKeys = keys === undefined ? [] : Array.isArray(keys) ? keys : [keys as ProtectedAttributeKey];
   const edits: Edit[] = [];
   const fields = new Map<string, string>();
   for (const predicate of predicates) {
     if (!fields.has(predicate.field)) {
       fields.set(predicate.field, query.slice(predicate.lhs.from, predicate.lhs.to));
     }
-    const encrypted = JSON.stringify(protectedKey.encrypt(predicate.field, literal(predicate.rhs, query)));
+    const value = literal(predicate.rhs, query);
+    const encrypted = isEncryptedAttributeEnvelope(value)
+      ? JSON.stringify(value)
+      : protectedKeys.map((key) => JSON.stringify(key.encrypt(predicate.field, value)));
+    const ciphertexts = Array.isArray(encrypted) ? encrypted : [encrypted];
+    if (!ciphertexts.length) {
+      invalid();
+    }
+    const lhs = query.slice(predicate.lhs.from, predicate.lhs.to);
+    const between = query.slice(predicate.lhs.to, predicate.rhs.from);
+    const comparisons = ciphertexts.map((ciphertext) => `${lhs}${between}${ciphertext}`);
     if (predicate.op === '=') {
-      edits.push({ from: predicate.rhs.from, to: predicate.rhs.to, text: encrypted });
-    } else {
-      const lhs = query.slice(predicate.lhs.from, predicate.lhs.to);
-      const between = query.slice(predicate.lhs.to, predicate.rhs.from);
       edits.push({
         from: predicate.comparison.from,
         to: predicate.comparison.to,
-        text: `(${lhs}${between}${encrypted} && ${lhs} != nil)`,
+        text: comparisons.length === 1 ? comparisons[0] : `(${comparisons.join(' || ')})`,
+      });
+    } else {
+      edits.push({
+        from: predicate.comparison.from,
+        to: predicate.comparison.to,
+        text: `(${comparisons.join(' && ')} && ${lhs} != nil)`,
       });
     }
   }
@@ -409,7 +475,11 @@ export async function rewriteProtectedTraceQL(
       const projected = selectedFields(select, query);
       const missing = [...fields].filter(([field]) => !projected.has(field));
       if (missing.length) {
-        edits.push({ from: select.to - 1, to: select.to - 1, text: `, ${missing.map(([, spelling]) => spelling).join(', ')}` });
+        edits.push({
+          from: select.to - 1,
+          to: select.to - 1,
+          text: `, ${missing.map(([, spelling]) => spelling).join(', ')}`,
+        });
       }
     } else {
       const end = children(root)[0].to;

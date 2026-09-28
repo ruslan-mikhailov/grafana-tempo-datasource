@@ -3,7 +3,7 @@ import { type TempoQuery } from '../types';
 import { intrinsics } from '../traceql/traceql';
 
 import { type ProtectedAttributeKey } from './crypto';
-import { classifyProtectedTraceQL } from './traceql';
+import { classifyProtectedTraceQL, isEncryptedAttributeEnvelope } from './traceql';
 
 // The shortest envelope seals an empty value: 12-byte nonce and 16-byte tag.
 // The canonical base64url spelling is checked here; opening authenticates it.
@@ -166,14 +166,14 @@ function assertNoLegacyCarriers(model: TempoQuery): void {
   }
 }
 
-export function assertProtectedQueryModelSafe(model: TempoQuery, kid?: string): void {
-  if (kid !== undefined && !/^[0-9a-f]{32}$/.test(kid)) {
+export function assertProtectedQueryModelSafe(model: TempoQuery, kids?: string | readonly string[]): void {
+  if ((typeof kids === 'string' ? [kids] : (kids ?? [])).some((kid) => !/^[0-9a-f]{32}$/.test(kid))) {
     throw unsafe();
   }
   assertNoLegacyCarriers(model);
   if (model.query) {
     if (model.query.startsWith('qenc:')) {
-      if (!isProtectedModelEnvelope(model.query) || (kid && !model.query.startsWith(`qenc:v1:${kid}:`))) {
+      if (!isProtectedModelEnvelope(model.query)) {
         throw unsafe();
       }
     } else if (classifyRaw(model.query)) {
@@ -187,21 +187,44 @@ export function assertProtectedQueryModelSafe(model: TempoQuery, kid?: string): 
     const values = Array.isArray(filter.value) ? filter.value : filter.value === undefined ? [] : [filter.value];
     for (const value of values) {
       if (value.startsWith('qenc:')) {
-        if (!isProtectedModelEnvelope(value) || (kid && !value.startsWith(`qenc:v1:${kid}:`)) || !requiresSealing) {
+        if (!isProtectedModelEnvelope(value) || !requiresSealing) {
           throw unsafe();
         }
-      } else if (requiresSealing) {
+      } else if (requiresSealing && !isDirectEncryptedFilter(filter, value)) {
         throw unsafe();
       }
     }
   }
 }
 
+function isDirectEncryptedFilter(filter: TraceqlFilter, value: string): boolean {
+  const { protectedReference, dynamicReference } = classifyProtectedFilter(filter);
+  return (
+    protectedReference &&
+    !dynamicReference &&
+    filter.scope === TraceqlSearchScope.Span &&
+    (filter.operator === '=' || filter.operator === '!=') &&
+    isEncryptedAttributeEnvelope(value)
+  );
+}
+
+type KeyLookup = ProtectedAttributeKey | ((kid: string) => ProtectedAttributeKey | undefined) | undefined;
+
+function keyForEnvelope(envelope: string, keys: KeyLookup): ProtectedAttributeKey {
+  const kid = modelEnvelope.exec(envelope)?.[1];
+  const key = kid && (typeof keys === 'function' ? keys(kid) : keys?.kid === kid ? keys : undefined);
+  if (!key) {
+    throw unsafe();
+  }
+  return key;
+}
+
 export async function prepareProtectedQueryModel(
   draft: TempoQuery,
   key: ProtectedAttributeKey,
   uid: string,
-  source?: TempoQuery
+  source?: TempoQuery,
+  lookup?: (kid: string) => ProtectedAttributeKey | undefined
 ): Promise<TempoQuery> {
   if (!key || !uid) {
     throw unsafe();
@@ -209,7 +232,7 @@ export async function prepareProtectedQueryModel(
   assertNoLegacyCarriers(draft);
   let query = draft.query;
   if (query && source?.query === query && isProtectedModelEnvelope(query)) {
-    await key.openQueryModel(query, queryContext(uid));
+    await keyForEnvelope(query, lookup ?? key).openQueryModel(query, queryContext(uid));
   } else if (query && classifyRaw(query)) {
     query = await key.sealQueryModel(query, queryContext(uid));
   }
@@ -227,7 +250,10 @@ export async function prepareProtectedQueryModel(
           index === undefined ? sourceValue : Array.isArray(sourceValue) ? sourceValue[index] : undefined;
         const context = filterContext(uid, filter, index);
         if (original === value && isProtectedModelEnvelope(value)) {
-          await key.openQueryModel(value, context);
+          await keyForEnvelope(value, lookup ?? key).openQueryModel(value, context);
+          return value;
+        }
+        if (isDirectEncryptedFilter(filter, value)) {
           return value;
         }
         return key.sealQueryModel(value, context);
@@ -243,32 +269,13 @@ export async function prepareProtectedQueryModel(
   return prepared;
 }
 
-export async function openProtectedQueryModel(
-  model: TempoQuery,
-  key: ProtectedAttributeKey | undefined,
-  uid: string
-): Promise<TempoQuery> {
+export async function openProtectedQueryModel(model: TempoQuery, keys: KeyLookup, uid: string): Promise<TempoQuery> {
   if (!uid) {
     throw unsafe();
   }
-  if (!key) {
-    assertNoLegacyCarriers(model);
-    assertFilterIds(model.filters ?? []);
-    if (
-      (model.query && (model.query.startsWith('qenc:') || classifyRaw(model.query))) ||
-      (model.filters ?? []).some((filter) =>
-        (Array.isArray(filter.value) ? filter.value : filter.value === undefined ? [] : [filter.value]).some(
-          (value) => value.startsWith('qenc:') || classifyProtectedFilter(filter).requiresSealing
-        )
-      )
-    ) {
-      throw unsafe();
-    }
-    return model;
-  }
-  assertProtectedQueryModelSafe(model, key.kid);
+  assertProtectedQueryModelSafe(model);
   const query = model.query?.startsWith('qenc:')
-    ? await key.openQueryModel(model.query, queryContext(uid))
+    ? await keyForEnvelope(model.query, keys).openQueryModel(model.query, queryContext(uid))
     : model.query;
   const filters = await Promise.all(
     (model.filters ?? []).map(async (filter) => {
@@ -276,7 +283,9 @@ export async function openProtectedQueryModel(
         return filter;
       }
       const open = (value: string, index?: number) =>
-        value.startsWith('qenc:') ? key.openQueryModel(value, filterContext(uid, filter, index)) : value;
+        value.startsWith('qenc:')
+          ? keyForEnvelope(value, keys).openQueryModel(value, filterContext(uid, filter, index))
+          : value;
       const value = Array.isArray(filter.value)
         ? await Promise.all(filter.value.map((item, index) => open(item, index)))
         : await open(filter.value);

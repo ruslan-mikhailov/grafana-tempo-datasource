@@ -99,7 +99,10 @@ const TraceQLSearch = ({
       return;
     }
     try {
-      assertProtectedQueryModelSafe(query, key?.kid);
+      assertProtectedQueryModelSafe(
+        query,
+        (datasource.protectedKeys ?? (key ? [key] : [])).map((item) => item.kid)
+      );
     } catch {
       setLocked(true);
       setLegacy(
@@ -128,10 +131,23 @@ const TraceQLSearch = ({
       return;
     }
     setLocked(true);
-    if (!key) {
+    const keys = datasource.protectedKeys ?? (key ? [key] : []);
+    const envelopes = [
+      query.query,
+      ...(query.filters ?? []).flatMap((filter) => (Array.isArray(filter.value) ? filter.value : [filter.value])),
+    ];
+    if (
+      envelopes.some(
+        (value) => value?.startsWith('qenc:') && !keys.some((item) => value.startsWith(`qenc:v1:${item.kid}:`))
+      )
+    ) {
       return;
     }
-    void openProtectedQueryModel(query, key, datasource.uid).then(
+    void openProtectedQueryModel(
+      query,
+      datasource.getProtectedKey?.bind(datasource) ?? ((kid) => keys.find((item) => item.kid === kid)),
+      datasource.uid
+    ).then(
       (opened) => {
         if (generation.current === current) {
           draftRef.current = opened;
@@ -198,7 +214,13 @@ const TraceQLSearch = ({
           setPending(false);
           return;
         }
-        void prepareProtectedQueryModel(next, key, datasource.uid, query).then(
+        void prepareProtectedQueryModel(
+          next,
+          key,
+          datasource.uid,
+          query,
+          datasource.getProtectedKey?.bind(datasource)
+        ).then(
           (sealed) => {
             if (generation.current !== current || datasource.protectedKey !== key) {
               return;
@@ -353,7 +375,13 @@ const TraceQLSearch = ({
                   return;
                 }
                 const current = ++generation.current;
-                void prepareProtectedQueryModel(query, currentKey, datasource.uid, query).then(
+                void prepareProtectedQueryModel(
+                  query,
+                  currentKey,
+                  datasource.uid,
+                  query,
+                  datasource.getProtectedKey?.bind(datasource)
+                ).then(
                   (sealed) => {
                     if (generation.current === current && datasource.protectedKey === currentKey) {
                       savedModel.current = undefined;
@@ -523,7 +551,13 @@ const TraceQLSearch = ({
                   const candidate: TempoQuery = { ...query, query: raw, queryType: 'traceql' };
                   const result =
                     protectedMode && key
-                      ? prepareProtectedQueryModel(candidate, key, datasource.uid, query)
+                      ? prepareProtectedQueryModel(
+                          candidate,
+                          key,
+                          datasource.uid,
+                          query,
+                          datasource.getProtectedKey?.bind(datasource)
+                        )
                       : Promise.resolve(candidate);
                   void result
                     .then((sealed) => {

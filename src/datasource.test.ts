@@ -1705,6 +1705,55 @@ describe('protected datasource transport boundary', () => {
     window.removeEventListener('grafana.tempo.protected-attribute-display-change', displayChange);
   });
 
+  it('validates every key before a single batch commit, retaining old keys on later invalid input', async () => {
+    const ds = new TempoDatasource({ ...settings, uid: 'tempo-batch-import' });
+    const otherMaster = Buffer.alloc(32, 7).toString('base64');
+    const thirdMaster = Buffer.alloc(32, 8).toString('base64');
+    const otherKid = (await importKey(otherMaster)).kid;
+    const thirdKid = (await importKey(thirdMaster)).kid;
+    const epochs: number[] = [];
+    ds.subscribeProtectedKey((epoch) => epochs.push(epoch));
+
+    expect(await ds.importProtectedKeys([master, otherMaster])).toEqual([kid, otherKid]);
+    expect(ds.protectedKeys.map((key) => key.kid)).toEqual([kid, otherKid]);
+    expect(epochs).toEqual([1]);
+    const before = ds.protectedKeys;
+    await expect(ds.importProtectedKeys([thirdMaster, Buffer.alloc(31, 7).toString('base64')])).rejects.toThrow(
+      'invalid-key'
+    );
+    expect(ds.protectedKeys).toEqual(before);
+    expect(ds.protectedKey).toBe(before[1]);
+    expect(epochs).toEqual([1]);
+    expect(settings.jsonData).not.toHaveProperty('protectedKeyId');
+    expect(await ds.importProtectedKeys([thirdMaster, thirdMaster])).toEqual([thirdKid, thirdKid]);
+    expect(ds.protectedKeys.map((key) => key.kid)).toEqual([kid, otherKid, thirdKid]);
+    expect(epochs).toEqual([1, 2]);
+    ds.clearAllProtectedKeys();
+  });
+
+  it('supersedes a pending multi-key import on forget before any staged key can commit', async () => {
+    const ds = new TempoDatasource({ ...settings, uid: 'tempo-batch-forget' });
+    await ds.importProtectedKey(master);
+    const oldKey = ds.protectedKey;
+    const pending = ds.importProtectedKeys([Buffer.alloc(32, 7).toString('base64'), master]);
+    ds.clearProtectedKey(oldKey!.kid);
+    await expect(pending).rejects.toThrow('superseded');
+    expect(ds.protectedKeys).toEqual([]);
+    expect(ds.protectedKey).toBeUndefined();
+  });
+
+  it('rejects a cancelled batch without adding a staged key or dropping existing keys', async () => {
+    const ds = new TempoDatasource({ ...settings, uid: 'tempo-batch-cancel' });
+    await ds.importProtectedKey(master);
+    const oldKey = ds.protectedKey;
+    const controller = new AbortController();
+    const pending = ds.importProtectedKeys([Buffer.alloc(32, 7).toString('base64'), master], controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toThrow('superseded');
+    expect(ds.protectedKeys).toEqual([oldKey]);
+    ds.clearAllProtectedKeys();
+  });
+
   it('isolates distinct imported key IDs and never revives an older datasource key', async () => {
     const registry = (
       globalThis as unknown as Record<
@@ -1742,7 +1791,7 @@ describe('protected datasource transport boundary', () => {
     expect(registry.resolve('enc.password', attributeEnvelope)).toBe('[encrypted: key unavailable]');
   });
 
-  it('rotates the browser key without changing datasource configuration', async () => {
+  it('retains imported key histories without changing datasource configuration', async () => {
     const ds = new TempoDatasource({ ...settings, uid: 'tempo-rotate' });
     const registry = (
       globalThis as unknown as Record<
@@ -1758,9 +1807,46 @@ describe('protected datasource transport boundary', () => {
     const otherKid = await ds.importProtectedKey(otherMaster);
     expect(otherKid).not.toBe(kid);
     expect(settings.jsonData).not.toHaveProperty('protectedKeyId');
+    expect(registry.resolve('enc.password', attributeEnvelope)).toBe('abc');
+    const rotated = ds.protectedKey!.encrypt('enc.password', 'rotated');
+    expect(registry.resolve('enc.password', rotated)).toBe('rotated');
+    ds.clearProtectedKey(kid);
     expect(registry.resolve('enc.password', attributeEnvelope)).toBe('[encrypted: key unavailable]');
-    expect(registry.resolve('enc.password', ds.protectedKey!.encrypt('enc.password', 'rotated'))).toBe('rotated');
-    ds.clearProtectedKey();
+    expect(registry.resolve('enc.password', rotated)).toBe('rotated');
+    expect(ds.protectedKey?.kid).toBe(otherKid);
+    ds.clearAllProtectedKeys();
+  });
+
+  it('opens saved queries by their own key, forgets one history, and sends raw ciphertext keyless', async () => {
+    const ds = new TempoDatasource({ ...settings, uid: 'tempo-history' });
+    const oldKeyId = await ds.importProtectedKey(master);
+    const oldKey = ds.protectedKey!;
+    const oldSaved = await prepareProtectedQueryModel(
+      { refId: 'A', queryType: 'traceql', query: '{span.enc.password="abc"}', filters: [] },
+      oldKey,
+      ds.uid
+    );
+    const newKeyId = await ds.importProtectedKey(Buffer.alloc(32, 7).toString('base64'));
+    const newKey = ds.protectedKey!;
+    const newEnvelope = newKey.encrypt('enc.password', 'abc');
+    expect(ds.protectedKeys.map((key) => key.kid)).toEqual([oldKeyId, newKeyId]);
+    await lastValueFrom(ds.query({ targets: [oldSaved], range } as DataQueryRequest<TempoQuery>));
+    const sent = fetchMock.mock.calls.at(-1)![0] as { data: { queries: TempoQuery[] } };
+    expect(sent.data.queries[0].query).toContain(
+      `span.enc.password="${attributeEnvelope}" || span.enc.password="${newEnvelope}"`
+    );
+    expect(JSON.stringify(sent)).not.toContain('"abc"');
+    ds.clearProtectedKey(oldKeyId);
+    expect(ds.protectedKeys.map((key) => key.kid)).toEqual([newKeyId]);
+    const calls = fetchMock.mock.calls.length;
+    await lastValueFrom(ds.query({ targets: [oldSaved], range } as DataQueryRequest<TempoQuery>));
+    expect(fetchMock).toHaveBeenCalledTimes(calls);
+
+    ds.clearAllProtectedKeys();
+    const direct = { refId: 'A', queryType: 'traceql', query: `{span.enc.password="${attributeEnvelope}"}` };
+    await lastValueFrom(ds.query({ targets: [direct], range } as DataQueryRequest<TempoQuery>));
+    const keyless = fetchMock.mock.calls.at(-1)![0] as { data: { queries: TempoQuery[] } };
+    expect(keyless.data.queries[0].query).toBe(`${direct.query} | select(span.enc.password)`);
   });
 
   it('sends only compiled raw and builder targets in the entire HTTP payload and omits query telemetry', async () => {
@@ -2080,6 +2166,8 @@ describe('protected datasource transport boundary', () => {
       ds.protectedKey!,
       ds.uid
     );
+    const secondKid = await ds.importProtectedKey(Buffer.alloc(32, 7).toString('base64'));
+    const secondEnvelope = ds.getProtectedKey(secondKid)!.encrypt('enc.password', 'abc');
     await lastValueFrom(
       ds.query({
         targets: [search, metrics],
@@ -2097,6 +2185,10 @@ describe('protected datasource transport boundary', () => {
     expect(searchCall.data.query).toContain('| select(span.enc.password)');
     expect(metricsCall.data.query).toContain(`"${attributeEnvelope}"`);
     expect(metricsCall.data.query).not.toContain('| select(');
+    expect(searchCall.data.query).toContain(`"${secondEnvelope}"`);
+    expect(metricsCall.data.query).toContain(`"${secondEnvelope}"`);
+    expect(searchCall.data.query).toContain(' || ');
+    expect(metricsCall.data.query).toContain(' || ');
     for (const call of [searchCall, metricsCall]) {
       expect(call.data).not.toHaveProperty('filters');
       expect(call.data).not.toHaveProperty('scopedVars');
@@ -2192,6 +2284,33 @@ describe('protected datasource transport boundary', () => {
       expect.anything()
     );
   });
+  it('uses all loaded keys for metadata but passes canonical ciphertext unchanged without any key', async () => {
+    const ds = new TempoDatasource(settings);
+    await ds.importProtectedKey(master);
+    const secondKid = await ds.importProtectedKey(Buffer.alloc(32, 7).toString('base64'));
+    const secondEnvelope = ds.getProtectedKey(secondKid)!.encrypt('enc.password', 'abc');
+    const resource = jest.spyOn(ds, 'getResource').mockResolvedValue({ data: { tagValues: [] } });
+    await ds.metadataRequest('tag-values', { q: '{span.enc.password="abc"}', tag: 'span.http.route' });
+    expect(resource).toHaveBeenCalledWith(
+      'tag-values',
+      expect.objectContaining({
+        q: `{(span.enc.password="${attributeEnvelope}" || span.enc.password="${secondEnvelope}")}`,
+      }),
+      expect.anything()
+    );
+    ds.clearAllProtectedKeys();
+    resource.mockClear();
+    await ds.metadataRequest('tag-values', {
+      q: `{span.enc.password="${attributeEnvelope}"}`,
+      tag: 'span.http.route',
+    });
+    expect(resource).toHaveBeenCalledWith(
+      'tag-values',
+      expect.objectContaining({ q: `{span.enc.password="${attributeEnvelope}"}` }),
+      expect.anything()
+    );
+  });
+
   it('rejects host-variable predicate erasure but confines ordinary builder values to one literal', async () => {
     const templateSrv = {
       replace: (value: string) => value.replace('$value', 'x" || span.enc.password="host-secret"} // '),

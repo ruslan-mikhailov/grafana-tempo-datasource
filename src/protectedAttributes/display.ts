@@ -84,11 +84,6 @@ export function setProtectedDisplayKey(owner: object, kid: string | undefined, k
   }
   registerProtectedDisplayMode();
   if (key) {
-    for (const [oldKid, current] of importedKeys) {
-      if (oldKid !== kid && current.owner === owner) {
-        importedKeys.delete(oldKid);
-      }
-    }
     importedKeys.set(kid, { owner, key });
     changed();
   } else if (importedKeys.get(kid)?.owner === owner) {

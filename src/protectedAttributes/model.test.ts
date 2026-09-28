@@ -100,6 +100,50 @@ test('a qenc-looking user literal is sealed as plaintext; only unchanged source 
   await expect(prepareProtectedQueryModel(wrongSlot, key, uid, wrongSlot)).rejects.toThrow();
 });
 
+test('saved envelopes open with their own key ID while new values seal under the active key', async () => {
+  const old = await importKey(master);
+  const active = await importKey(Buffer.alloc(32, 7).toString('base64'));
+  const saved = await prepareProtectedQueryModel(
+    query('{span.enc.password="old"}', [protectedFilter('old')]),
+    old,
+    uid
+  );
+  const lookup = (id: string) => (id === old.kid ? old : id === active.kid ? active : undefined);
+  const opened = await openProtectedQueryModel(saved, lookup, uid);
+  expect(opened.query).toBe('{span.enc.password="old"}');
+  expect(opened.filters[0].value).toBe('old');
+  const updated = await prepareProtectedQueryModel(
+    { ...saved, filters: [protectedFilter('new')] },
+    active,
+    uid,
+    saved,
+    lookup
+  );
+  expect(updated.query).toBe(saved.query);
+  expect(updated.filters[0].value).toMatch(new RegExp(`^qenc:v1:${active.kid}:`));
+  expect(() => assertProtectedQueryModelSafe(updated, [active.kid, old.kid])).not.toThrow();
+  await expect(
+    openProtectedQueryModel(updated, (id) => (id === active.kid ? active : undefined), uid)
+  ).rejects.toThrow();
+  expect((await openProtectedQueryModel(updated, lookup, uid)).filters[0].value).toBe('new');
+});
+
+test('canonical ciphertext may be persisted and opened without keys, but lookalikes cannot', async () => {
+  const ciphertext = 'enc:v1:630dcd2966c4336691125448bbb25b4f:7aUwjY5fPtHvu_dUnzcxBJc6XQ';
+  const direct = query(`{span.enc.password="${ciphertext}"}`, [protectedFilter(ciphertext)]);
+  expect(() => assertProtectedQueryModelSafe(direct)).not.toThrow();
+  expect(await openProtectedQueryModel(direct, undefined, uid)).toEqual(direct);
+  const active = await importKey(master);
+  const prepared = await prepareProtectedQueryModel(direct, active, uid);
+  expect(prepared.query).toBe(direct.query);
+  expect(prepared.filters[0].value).toBe(ciphertext);
+  expect(() => assertProtectedQueryModelSafe(query('{span.enc.password="enc:v1:bad"}'))).toThrow();
+  expect(() => assertProtectedQueryModelSafe(query('', [protectedFilter('enc:v1:bad')]))).toThrow();
+  const dynamic = query('', [{ ...protectedFilter(ciphertext), tag: '${attribute}' }]);
+  expect(() => assertProtectedQueryModelSafe(dynamic)).toThrow();
+  expect((await prepareProtectedQueryModel(dynamic, active, uid)).filters[0].value).toMatch(/^qenc:v1:/);
+});
+
 test('dynamic tag or scope keeps adjacent builder value sealed even if it currently resolves ordinary', async () => {
   const key = await importKey(master);
   const ordinaryInterior = query('', [

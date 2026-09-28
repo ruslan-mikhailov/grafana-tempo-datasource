@@ -109,6 +109,42 @@ test('keeps a sealed query locked without a key or with a different imported key
   expect(hostChange).not.toHaveBeenCalled();
 });
 
+test('opens a saved model with its own key while a different key remains active for new seals', async () => {
+  const saved = `qenc:v1:${kid}:${'A'.repeat(40)}`;
+  const old = { kid, openQueryModel: jest.fn().mockResolvedValue('{span.enc.password="old"}') };
+  const active = {
+    kid: '00000000000000000000000000000000',
+    sealQueryModel: jest.fn().mockResolvedValue(`qenc:v1:${'0'.repeat(32)}:${'B'.repeat(40)}`),
+  };
+  const datasource = {
+    uid: 'tempo-uid',
+    protectedKey: active,
+    protectedKeys: [old, active],
+    getProtectedKey: (id: string) => (id === kid ? old : active),
+    instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
+    languageProvider: { start: jest.fn().mockResolvedValue(undefined), shouldRefreshLabels: () => false },
+  } as unknown as TempoDatasource;
+  const hostChange = jest.fn();
+  render(
+    <TraceQLEditor
+      placeholder="TraceQL"
+      query={{ refId: 'A', queryType: 'traceql', query: saved, filters: [] }}
+      datasource={datasource}
+      onChange={hostChange}
+      onRunQuery={jest.fn()}
+    />
+  );
+  const editor = screen.getByRole('textbox', { name: 'raw traceql' });
+  await waitFor(() => expect(editor).toHaveValue('{span.enc.password="old"}'));
+  fireEvent.change(editor, { target: { value: '{span.enc.password="new"}' } });
+  await waitFor(() =>
+    expect(hostChange).toHaveBeenCalledWith(
+      expect.objectContaining({ query: expect.stringContaining(`qenc:v1:${active.kid}:`) })
+    )
+  );
+  expect(old.openQueryModel).toHaveBeenCalledWith(saved, JSON.stringify(['tempo-uid', 'query']));
+});
+
 test('allows ordinary raw edits without an imported key but rejects protected plaintext', async () => {
   const datasource = {
     uid: 'tempo-uid',
@@ -133,4 +169,29 @@ test('allows ordinary raw edits without an imported key but rejects protected pl
   hostChange.mockClear();
   fireEvent.change(editor, { target: { value: '{span.enc.password="secret"}' } });
   expect(hostChange).not.toHaveBeenCalled();
+});
+
+test('keyless raw ciphertext remains editable without persisting plaintext', async () => {
+  const ciphertext = 'enc:v1:630dcd2966c4336691125448bbb25b4f:7aUwjY5fPtHvu_dUnzcxBJc6XQ';
+  const raw = `{span.enc.password="${ciphertext}"}`;
+  const datasource = {
+    uid: 'tempo-uid',
+    instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
+    languageProvider: { start: jest.fn().mockResolvedValue(undefined), shouldRefreshLabels: () => false },
+  } as unknown as TempoDatasource;
+  const hostChange = jest.fn();
+  render(
+    <TraceQLEditor
+      placeholder="TraceQL"
+      query={{ refId: 'A', queryType: 'traceql', query: raw, filters: [] }}
+      datasource={datasource}
+      onChange={hostChange}
+      onRunQuery={jest.fn()}
+    />
+  );
+  const editor = screen.getByRole('textbox', { name: 'raw traceql' });
+  await waitFor(() => expect(editor).not.toHaveAttribute('readonly'));
+  expect(editor).toHaveValue(raw);
+  fireEvent.change(editor, { target: { value: raw.replace('=', '!=') } });
+  expect(hostChange).toHaveBeenCalledWith(expect.objectContaining({ query: raw.replace('=', '!=') }));
 });

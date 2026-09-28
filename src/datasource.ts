@@ -64,7 +64,12 @@ import {
   isVariableBearing,
   openProtectedQueryModel,
 } from './protectedAttributes/model';
-import { classifyProtectedTraceQL, isMetricsTraceQL, rewriteProtectedTraceQL } from './protectedAttributes/traceql';
+import {
+  classifyProtectedTraceQL,
+  isEncryptedAttributeEnvelope,
+  isMetricsTraceQL,
+  rewriteProtectedTraceQL,
+} from './protectedAttributes/traceql';
 import TempoLanguageProvider from './language_provider';
 import {
   enhanceTraceQlMetricsResponse,
@@ -152,9 +157,9 @@ function assertHostAdHocFilterSourcesSafe(filters: DataQueryRequest<TempoQuery>[
     }
   }
 }
-function assertLegacyProtectedSearchSafe(query: TempoQuery, kid?: string): void {
+function assertLegacyProtectedSearchSafe(query: TempoQuery, kids?: readonly string[]): void {
   const { search, spanName, serviceName, minDuration, maxDuration, ...current } = query;
-  assertProtectedQueryModelSafe(current as TempoQuery, kid);
+  assertProtectedQueryModelSafe(current as TempoQuery, kids);
   if ([spanName, serviceName, minDuration, maxDuration, search].some((value) => value && isVariableBearing(value))) {
     throw new Error('Legacy host-variable search values cannot be protected.');
   }
@@ -174,21 +179,21 @@ function assertLegacyProtectedSearchSafe(query: TempoQuery, kid?: string): void 
       }
     }
   }
-  assertProtectedQueryModelSafe(migrateFromSearchToTraceQLSearch(query), kid);
+  assertProtectedQueryModelSafe(migrateFromSearchToTraceQLSearch(query), kids);
 }
 
-function assertProtectedSavedModelSafe(query: TempoQuery, kid?: string): void {
+function assertProtectedSavedModelSafe(query: TempoQuery, kids?: readonly string[]): void {
   if (query.queryType === 'nativeSearch') {
-    assertLegacyProtectedSearchSafe(query, kid);
+    assertLegacyProtectedSearchSafe(query, kids);
   } else if (query.queryType === 'traceId' && query.query && !/^[0-9a-f]+$/i.test(query.query.trim())) {
     // A trace-ID template is safe to keep in a host model only as the entire ID.
     // Its result is hex-validated before it reaches the SDK or transport.
     if (!/^(?:\$\{[^}]+\}|\$[A-Za-z_]\w*|\[\[[^\]]+\]\])$/.test(query.query.trim())) {
       throw new Error('Invalid trace ID query.');
     }
-    assertProtectedQueryModelSafe({ ...query, query: '' }, kid);
+    assertProtectedQueryModelSafe({ ...query, query: '' }, kids);
   } else {
-    assertProtectedQueryModelSafe(query, kid);
+    assertProtectedQueryModelSafe(query, kids);
   }
 }
 
@@ -278,6 +283,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
   };
 
   timeRangeForTags?: number;
+  private readonly importedProtectedKeys = new Map<string, ProtectedAttributeKey>();
   private importedProtectedKey?: ProtectedAttributeKey;
   private keyEpoch = 0;
   private importGeneration = 0;
@@ -285,6 +291,14 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
 
   get protectedKey(): ProtectedAttributeKey | undefined {
     return this.importedProtectedKey;
+  }
+
+  get protectedKeys(): readonly ProtectedAttributeKey[] {
+    return [...this.importedProtectedKeys.values()];
+  }
+
+  getProtectedKey(kid: string): ProtectedAttributeKey | undefined {
+    return this.importedProtectedKeys.get(kid);
   }
 
   get protectedKeyEpoch(): number {
@@ -297,29 +311,80 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
   }
 
   async importProtectedKey(base64: string): Promise<string> {
-    if (!this.instanceSettings.jsonData.protectedAttributesEnabled) {
-      throw new Error('Protected attributes must be enabled before importing a key.');
-    }
-    const generation = ++this.importGeneration;
-    const next = await importKey(base64);
-    if (generation !== this.importGeneration || !this.instanceSettings.jsonData.protectedAttributesEnabled) {
-      next.clear();
-      throw new Error('Protected key import was superseded.');
-    }
-    const previous = this.importedProtectedKey;
-    this.importedProtectedKey = next;
-    setProtectedDisplayKey(this, next.kid, next);
-    previous?.clear();
-    this.notifyProtectedKeyChange();
-    return next.kid;
+    const [kid] = await this.importProtectedKeys([base64]);
+    return kid;
   }
 
-  clearProtectedKey(): void {
+  async importProtectedKeys(base64Keys: readonly string[], signal?: AbortSignal): Promise<readonly string[]> {
+    if (!this.instanceSettings.jsonData.protectedAttributesEnabled) {
+      throw new Error('Protected attributes must be enabled before importing keys.');
+    }
+    if (base64Keys.length === 0) {
+      throw new Error('Protected key batch is empty.');
+    }
+    const generation = ++this.importGeneration;
+    const staged = new Map<string, ProtectedAttributeKey>();
+    const kids: string[] = [];
+    try {
+      for (const base64 of base64Keys) {
+        const key = await importKey(base64);
+        kids.push(key.kid);
+        staged.get(key.kid)?.clear();
+        staged.delete(key.kid);
+        staged.set(key.kid, key);
+      }
+      if (
+        signal?.aborted ||
+        generation !== this.importGeneration ||
+        !this.instanceSettings.jsonData.protectedAttributesEnabled
+      ) {
+        throw new Error('Protected key import was superseded.');
+      }
+      for (const [kid, key] of staged) {
+        const previous = this.importedProtectedKeys.get(kid);
+        this.importedProtectedKeys.delete(kid);
+        this.importedProtectedKeys.set(kid, key);
+        setProtectedDisplayKey(this, kid, key);
+        previous?.clear();
+      }
+      this.importedProtectedKey = staged.get(kids[kids.length - 1]);
+      this.notifyProtectedKeyChange();
+      return kids;
+    } catch (error) {
+      for (const key of staged.values()) {
+        key.clear();
+      }
+      throw error;
+    }
+  }
+
+  clearProtectedKey(kid = this.importedProtectedKey?.kid): void {
     this.importGeneration++;
-    const currentKid = this.importedProtectedKey?.kid;
-    this.importedProtectedKey?.clear();
+    if (kid) {
+      const current = this.importedProtectedKeys.get(kid);
+      if (current) {
+        this.importedProtectedKeys.delete(kid);
+        setProtectedDisplayKey(this, kid);
+        current.clear();
+        if (this.importedProtectedKey === current) {
+          this.importedProtectedKey = undefined;
+          for (const remaining of this.importedProtectedKeys.values()) {
+            this.importedProtectedKey = remaining;
+          }
+        }
+      }
+    }
+    this.notifyProtectedKeyChange();
+  }
+
+  clearAllProtectedKeys(): void {
+    this.importGeneration++;
+    for (const [kid, key] of this.importedProtectedKeys) {
+      setProtectedDisplayKey(this, kid);
+      key.clear();
+    }
+    this.importedProtectedKeys.clear();
     this.importedProtectedKey = undefined;
-    setProtectedDisplayKey(this, currentKid);
     this.notifyProtectedKeyChange();
   }
 
@@ -607,12 +672,15 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
   private async prepareTargets(options: DataQueryRequest<TempoQuery>): Promise<DataQueryRequest<TempoQuery>> {
     const protectedEnabled = !!this.instanceSettings.jsonData.protectedAttributesEnabled;
     const originalTargets = options.targets.filter((target) => !target.hide);
-    const key = this.protectedKey;
+    const keys = this.protectedKeys;
     const keyEpoch = this.keyEpoch;
     if (protectedEnabled) {
       assertStaticProtectedFilterDefaultsSafe(this.search?.filters ?? []);
       for (const target of originalTargets) {
-        assertProtectedSavedModelSafe(target, key?.kid);
+        assertProtectedSavedModelSafe(
+          target,
+          keys.map((key) => key.kid)
+        );
       }
     }
 
@@ -633,7 +701,11 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
         const traceIdTemplate =
           protectedEnabled && migrated.queryType === 'traceId' && isVariableBearing(migrated.query ?? '');
         const opened = protectedEnabled
-          ? await openProtectedQueryModel(traceIdTemplate ? { ...migrated, query: '' } : migrated, key, this.uid)
+          ? await openProtectedQueryModel(
+              traceIdTemplate ? { ...migrated, query: '' } : migrated,
+              (kid) => this.getProtectedKey(kid),
+              this.uid
+            )
           : migrated;
         let query = traceIdTemplate ? (migrated.query ?? '') : (opened.query ?? '');
         let queryType = opened.queryType || 'traceql';
@@ -678,7 +750,11 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
                 const actualValues = Array.isArray(filter.value) ? filter.value : [filter.value];
                 const plainValues = Array.isArray(openedValue) ? openedValue : [openedValue];
                 if (
-                  savedValues.some((value) => typeof value !== 'string' || !value.startsWith('qenc:v1:')) ||
+                  savedValues.some(
+                    (value) =>
+                      typeof value !== 'string' ||
+                      (!value.startsWith('qenc:v1:') && !isEncryptedAttributeEnvelope(value))
+                  ) ||
                   plainValues.some(
                     (value, item) =>
                       typeof value !== 'string' || isVariableBearing(value) || value !== actualValues[item]
@@ -689,7 +765,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
               } else if (!effective.protectedReference) {
                 assertProtectedQueryModelSafe(
                   { refId: original.refId, queryType: 'traceqlSearch', filters: [filter] },
-                  key?.kid
+                  keys.map((key) => key.kid)
                 );
               }
             }
@@ -722,7 +798,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
           query &&
           !this.isTraceIdQuery(query)
         ) {
-          query = await rewriteProtectedTraceQL(query, key, this.isTraceQlMetricsQuery(query) ? 'metrics' : 'search');
+          query = await rewriteProtectedTraceQL(query, keys, this.isTraceQlMetricsQuery(query) ? 'metrics' : 'search');
         }
         // Only backend/Live protocol fields cross the boundary, never editor, legacy,
         // ad-hoc, qenc, or arbitrary host model properties.
@@ -746,7 +822,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
         } as TempoQuery;
       })
     );
-    if (protectedEnabled && (this.keyEpoch !== keyEpoch || this.protectedKey !== key)) {
+    if (protectedEnabled && this.keyEpoch !== keyEpoch) {
       throw new Error('Protected key changed during query preparation.');
     }
     for (const target of targets) {
@@ -929,7 +1005,10 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     }
     const protectedEnabled = !!this.instanceSettings.jsonData.protectedAttributesEnabled;
     if (protectedEnabled) {
-      assertProtectedSavedModelSafe(query, this.protectedKey?.kid);
+      assertProtectedSavedModelSafe(
+        query,
+        this.protectedKeys.map((key) => key.kid)
+      );
     }
     const expandedQuery = { ...query };
 
@@ -955,7 +1034,10 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
         : this.templateSrv.replace(query.serviceMapQuery ?? '', scopedVars),
     };
     if (protectedEnabled) {
-      assertProtectedSavedModelSafe(interpolated, this.protectedKey?.kid);
+      assertProtectedSavedModelSafe(
+        interpolated,
+        this.protectedKeys.map((key) => key.kid)
+      );
     }
     return interpolated;
   }
@@ -1267,7 +1349,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
             : this.templateSrv.replace(q, {}, VariableFormatID.Pipe)
           : undefined;
       if (protectedConfigured && finalQuery) {
-        finalQuery = await rewriteProtectedTraceQL(finalQuery, this.protectedKey, 'metadata');
+        finalQuery = await rewriteProtectedTraceQL(finalQuery, this.protectedKeys, 'metadata');
       }
       const safeParams = { limit, start, end, tag, ...(finalQuery !== undefined && { q: finalQuery }) };
       const res = await this.getResource(url, safeParams, { method: 'GET', hideFromInspector: true });

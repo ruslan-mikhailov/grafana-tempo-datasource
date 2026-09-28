@@ -78,7 +78,10 @@ export function TraceQLEditor(props: Props) {
       return;
     }
     try {
-      assertProtectedQueryModelSafe(query, key?.kid);
+      assertProtectedQueryModelSafe(
+        query,
+        (props.datasource.protectedKeys ?? (key ? [key] : [])).map((item) => item.kid)
+      );
     } catch {
       // Existing legacy plaintext remains in the host model. Only a key holder
       // may explicitly edit and migrate it; never forward it again unchanged.
@@ -96,10 +99,17 @@ export function TraceQLEditor(props: Props) {
     }
     setDraft('');
     setLocked(true);
-    if (!key) {
+    const envelopeKid = /^qenc:v1:([0-9a-f]{32}):/.exec(query.query ?? '')?.[1];
+    const openingKey =
+      envelopeKid && (props.datasource.getProtectedKey?.(envelopeKid) ?? (key?.kid === envelopeKid ? key : undefined));
+    if (!openingKey) {
       return;
     }
-    void openProtectedQueryModel(query, key, props.datasource.uid).then(
+    void openProtectedQueryModel(
+      query,
+      props.datasource.getProtectedKey?.bind(props.datasource) ?? openingKey,
+      props.datasource.uid
+    ).then(
       (opened) => {
         if (generation.current === current) {
           setDraft(opened.query || '');
@@ -157,7 +167,13 @@ export function TraceQLEditor(props: Props) {
         return;
       }
       setDraftPending(true);
-      void prepareProtectedQueryModel(candidate, key, props.datasource.uid, queryRef.current).then(
+      void prepareProtectedQueryModel(
+        candidate,
+        key,
+        props.datasource.uid,
+        queryRef.current,
+        props.datasource.getProtectedKey?.bind(props.datasource)
+      ).then(
         (sealed) => {
           if (generation.current !== current || props.datasource.protectedKey !== key) {
             return;
@@ -289,7 +305,13 @@ export function TraceQLEditor(props: Props) {
               return;
             }
             const current = ++generation.current;
-            void prepareProtectedQueryModel(queryRef.current, currentKey, props.datasource.uid, queryRef.current).then(
+            void prepareProtectedQueryModel(
+              queryRef.current,
+              currentKey,
+              props.datasource.uid,
+              queryRef.current,
+              props.datasource.getProtectedKey?.bind(props.datasource)
+            ).then(
               (sealed) => {
                 if (generation.current === current && props.datasource.protectedKey === currentKey) {
                   savedEnvelope.current = sealed.query;

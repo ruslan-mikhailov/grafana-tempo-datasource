@@ -1,5 +1,5 @@
 import { css } from '@emotion/css';
-import { createRef, PureComponent } from 'react';
+import { createRef, PureComponent, type ClipboardEvent } from 'react';
 
 import { QueryWithAssistantButton } from '@grafana/assistant';
 import { CoreApp, type QueryEditorProps, type SelectableValue } from '@grafana/data';
@@ -33,7 +33,8 @@ interface Props extends QueryEditorProps<TempoDatasource, TempoQuery>, Themeable
 interface State {
   uploadModalOpen: boolean;
   keyModalOpen: boolean;
-  keyFile?: File;
+  keyFiles?: File[];
+  keyInputCount: number;
   keyBusy: boolean;
   keyError?: string;
   queryError?: string;
@@ -54,8 +55,10 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
   private editorCommitType?: TempoQueryType;
   private editorCommit?: (next: TempoQuery) => void;
   private editorPending?: (pending: boolean) => void;
-  private readonly keyTextInput = createRef<HTMLInputElement>();
+  private readonly keyTextInputs: Array<HTMLInputElement | null> = [];
   private readonly keyFileInput = createRef<HTMLInputElement>();
+  private keyImportSequence = 0;
+  private keyImportController?: AbortController;
 
   constructor(props: Props) {
     super(props);
@@ -63,6 +66,7 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
       uploadModalOpen: false,
       keyBusy: false,
       keyModalOpen: false,
+      keyInputCount: 1,
       keyEpoch: props.datasource.protectedKeyEpoch,
     };
   }
@@ -71,18 +75,20 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
     this.unsubscribeKey?.();
     this.unsubscribeKey = datasource.subscribeProtectedKey((keyEpoch) => {
       if (this.props.datasource === datasource) {
+        this.keyImportController?.abort();
+        this.keyImportSequence++;
         this.sealPending = false;
         this.awaitingHostCommit = undefined;
-        if (this.keyTextInput.current) {
-          this.keyTextInput.current.value = '';
-        }
+        this.clearKeyInputs();
         if (this.keyFileInput.current) {
           this.keyFileInput.current.value = '';
         }
         this.setState({
           keyEpoch,
           keyModalOpen: false,
-          keyFile: undefined,
+          keyInputCount: 1,
+          keyFiles: undefined,
+          keyBusy: false,
           keyError: undefined,
         });
       }
@@ -90,7 +96,9 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
     this.setState({
       keyEpoch: datasource.protectedKeyEpoch,
       keyModalOpen: false,
-      keyFile: undefined,
+      keyInputCount: 1,
+      keyFiles: undefined,
+      keyBusy: false,
       keyError: undefined,
       queryError: undefined,
     });
@@ -98,15 +106,15 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
 
   componentDidUpdate(previous: Props) {
     if (previous.datasource !== this.props.datasource) {
+      this.keyImportController?.abort();
+      this.keyImportSequence++;
       this.sealPending = false;
       this.awaitingHostCommit = undefined;
-      this.subscribeDatasource(this.props.datasource);
-      if (this.keyTextInput.current) {
-        this.keyTextInput.current.value = '';
-      }
+      this.clearKeyInputs();
       if (this.keyFileInput.current) {
         this.keyFileInput.current.value = '';
       }
+      this.subscribeDatasource(this.props.datasource);
     }
     if (
       this.awaitingHostCommit &&
@@ -139,10 +147,13 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
       return false;
     }
     const protectedMode = this.props.datasource.instanceSettings.jsonData.protectedAttributesEnabled;
-    const kid = this.props.datasource.protectedKey?.kid;
+    const keys =
+      this.props.datasource.protectedKeys ??
+      (this.props.datasource.protectedKey ? [this.props.datasource.protectedKey] : []);
+    const kids = keys.map((key) => key.kid);
     try {
       if (protectedMode) {
-        assertProtectedQueryModelSafe(next, kid);
+        assertProtectedQueryModelSafe(next, kids);
       }
     } catch {
       this.setState({ queryError: 'Protected query cannot be saved until it is sealed or corrected.' });
@@ -166,16 +177,23 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
     }
     const datasource = this.props.datasource;
     const protectedMode = datasource.instanceSettings.jsonData.protectedAttributesEnabled;
-    const kid = datasource.protectedKey?.kid;
+    const keys = datasource.protectedKeys ?? (datasource.protectedKey ? [datasource.protectedKey] : []);
     try {
       if (protectedMode) {
-        assertProtectedQueryModelSafe(target, kid);
-        const sealed =
-          target.query?.startsWith('qenc:') ||
-          target.filters?.some((filter) =>
-            (Array.isArray(filter.value) ? filter.value : [filter.value]).some((value) => value?.startsWith('qenc:'))
-          );
-        if (sealed && (target.queryType === 'traceql' || target.queryType === 'traceqlSearch') && !kid) {
+        assertProtectedQueryModelSafe(
+          target,
+          keys.map((key) => key.kid)
+        );
+        const sealedValues = [
+          target.query,
+          ...(target.filters ?? []).flatMap((filter) => (Array.isArray(filter.value) ? filter.value : [filter.value])),
+        ];
+        if (
+          (target.queryType === 'traceql' || target.queryType === 'traceqlSearch') &&
+          sealedValues.some(
+            (value) => value?.startsWith('qenc:') && !keys.some((key) => value.startsWith(`qenc:v1:${key.kid}:`))
+          )
+        ) {
           throw new Error('Key unavailable');
         }
       }
@@ -186,50 +204,109 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
     this.props.onRunQuery();
   };
 
-  private closeKeyModal = () => {
-    if (this.state.keyBusy) {
+  private clearKeyInputs = () => {
+    for (const input of this.keyTextInputs) {
+      if (input) {
+        input.value = '';
+      }
+    }
+  };
+
+  private pasteKeys = (index: number, event: ClipboardEvent<HTMLInputElement>) => {
+    const pasted = event.clipboardData.getData('text');
+    if (!/[\r\n]/.test(pasted)) {
       return;
     }
-    if (this.keyTextInput.current) {
-      this.keyTextInput.current.value = '';
+    event.preventDefault();
+    const keys = pasted
+      .split(/\r\n|\r|\n/)
+      .map((key) => key.trim())
+      .filter(Boolean);
+    for (const input of this.keyTextInputs.slice(index)) {
+      if (input) {
+        input.value = '';
+      }
     }
     if (this.keyFileInput.current) {
       this.keyFileInput.current.value = '';
     }
-    this.setState({ keyModalOpen: false, keyFile: undefined, keyError: undefined });
+    this.setState({ keyInputCount: index + Math.max(keys.length, 1), keyFiles: undefined, keyError: undefined }, () =>
+      keys.forEach((key, offset) => {
+        const input = this.keyTextInputs[index + offset];
+        if (input) {
+          input.value = key;
+        }
+      })
+    );
+  };
+
+  private closeKeyModal = () => {
+    if (this.state.keyBusy) {
+      return;
+    }
+    this.keyImportSequence++;
+    this.clearKeyInputs();
+    if (this.keyFileInput.current) {
+      this.keyFileInput.current.value = '';
+    }
+    this.setState({ keyModalOpen: false, keyInputCount: 1, keyFiles: undefined, keyError: undefined });
   };
 
   private importKey = async () => {
     if (this.state.keyBusy) {
       return;
     }
-    const file = this.state.keyFile;
-    const text = this.keyTextInput.current?.value ?? '';
-    if (!file && !text.trim()) {
+    const files = this.state.keyFiles;
+    const keys = this.keyTextInputs.map((input) => input?.value.trim() ?? '').filter(Boolean);
+    if (!files?.length && keys.length === 0) {
       this.setState({ keyError: 'Paste a base64 key or choose a local key file.' });
       return;
     }
     const datasource = this.props.datasource;
     const epoch = datasource.protectedKeyEpoch;
+    const sequence = ++this.keyImportSequence;
+    const controller = new AbortController();
+    this.keyImportController = controller;
     this.setState({ keyBusy: true, keyError: undefined });
     try {
-      const base64 = file ? await file.text() : text;
-      if (this._isMounted && this.props.datasource === datasource && datasource.protectedKeyEpoch === epoch) {
-        await datasource.importProtectedKey(base64);
+      const base64Keys = files?.length
+        ? (await Promise.all(files.map((file) => file.text()))).flatMap((content) => {
+            const lines = content
+              .split(/\r\n|\r|\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+            return lines.length ? lines : [''];
+          })
+        : keys;
+      if (
+        this._isMounted &&
+        this.props.datasource === datasource &&
+        datasource.protectedKeyEpoch === epoch &&
+        this.keyImportSequence === sequence
+      ) {
+        await datasource.importProtectedKeys(base64Keys, controller.signal);
       }
     } catch {
-      if (this._isMounted && this.props.datasource === datasource && datasource.protectedKeyEpoch === epoch) {
-        this.setState({ keyError: 'Unable to import key. Check that it contains 32 valid base64-encoded bytes.' });
+      if (
+        this._isMounted &&
+        this.props.datasource === datasource &&
+        datasource.protectedKeyEpoch === epoch &&
+        this.keyImportSequence === sequence
+      ) {
+        this.setState({
+          keyError: 'Unable to import key. Check that every key contains 32 valid base64-encoded bytes.',
+        });
       }
     } finally {
-      if (this.keyTextInput.current) {
-        this.keyTextInput.current.value = '';
+      if (this.keyImportController === controller) {
+        this.keyImportController = undefined;
       }
-      if (this.keyFileInput.current) {
-        this.keyFileInput.current.value = '';
-      }
-      if (this._isMounted) {
-        this.setState({ keyBusy: false, keyFile: undefined });
+      if (this._isMounted && this.props.datasource === datasource && this.keyImportSequence === sequence) {
+        this.clearKeyInputs();
+        if (this.keyFileInput.current) {
+          this.keyFileInput.current.value = '';
+        }
+        this.setState({ keyBusy: false, keyInputCount: 1, keyFiles: undefined });
       }
     }
   };
@@ -284,6 +361,7 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
 
   componentWillUnmount() {
     this._isMounted = false;
+    this.keyImportController?.abort();
     this.unsubscribeKey?.();
   }
 
@@ -307,8 +385,9 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
     const { query, datasource, app } = this.props;
     const isAlerting = app === CoreApp.UnifiedAlerting;
     const protectedMode = datasource.instanceSettings.jsonData.protectedAttributesEnabled;
+    const keys = datasource.protectedKeys ?? (datasource.protectedKey ? [datasource.protectedKey] : []);
     const kid = datasource.protectedKey?.kid;
-    const keyLoaded = Boolean(kid);
+    const keyLoaded = keys.length > 0;
     const editorKey = `${datasource.uid}:${this.state.keyEpoch}`;
     if (
       this.editorCommitSource !== datasource ||
@@ -434,24 +513,37 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
               })}
             >
               <span>Protected attributes</span>
-              <span role="status">{kid ? `Key loaded · ${kid.slice(0, 8)}…${kid.slice(-5)}` : 'Key needed'}</span>
+              <span role="status">
+                {kid ? `Key loaded · ${kid.slice(0, 8)}…${kid.slice(-5)} (${keys.length} loaded)` : 'Key needed'}
+              </span>
               <Button
                 variant="secondary"
                 size="sm"
                 onClick={() => this.setState({ keyModalOpen: true, keyError: undefined })}
               >
-                {keyLoaded ? 'Replace key' : 'Load key'}
+                {keyLoaded ? 'Add key' : 'Load key'}
               </Button>
-              {keyLoaded && (
+              {keys.map((key) => (
                 <Button
+                  key={key.kid}
                   variant="secondary"
                   size="sm"
+                  aria-label={keys.length === 1 ? 'Forget key' : `Forget key ${key.kid}`}
                   onClick={() => {
-                    datasource.clearProtectedKey();
-                    this.setState({ keyModalOpen: true });
+                    datasource.clearProtectedKey(key.kid);
+                    if (keys.length === 1) {
+                      this.setState({ keyModalOpen: true });
+                    }
                   }}
                 >
-                  Forget key
+                  {keys.length === 1
+                    ? 'Forget key'
+                    : `Forget ${key.kid.slice(0, 8)}…${key.kid.slice(-5)}${kid === key.kid ? ' (active)' : ''}`}
+                </Button>
+              ))}
+              {keys.length > 1 && (
+                <Button variant="secondary" size="sm" onClick={() => datasource.clearAllProtectedKeys()}>
+                  Forget all keys
                 </Button>
               )}
             </div>
@@ -463,24 +555,42 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
                   padding: this.props.theme.spacing(2),
                 })}
               >
-                <label htmlFor={`protected-key-${datasource.uid}`}>Paste base64 key</label>
-                <Input
-                  id={`protected-key-${datasource.uid}`}
-                  aria-label="Paste base64 key"
-                  type="password"
-                  autoComplete="off"
-                  className={css({ display: 'block', width: '100%' })}
-                  ref={this.keyTextInput}
+                <span>Paste one key per field, or paste newline-separated keys to fill masked fields.</span>
+                {Array.from({ length: this.state.keyInputCount }, (_, index) => (
+                  <div key={index}>
+                    <label htmlFor={`protected-key-${datasource.uid}-${index}`}>
+                      {index === 0 ? 'Paste base64 key' : `Paste base64 key ${index + 1}`}
+                    </label>
+                    <Input
+                      id={`protected-key-${datasource.uid}-${index}`}
+                      aria-label={index === 0 ? 'Paste base64 key' : `Paste base64 key ${index + 1}`}
+                      type="password"
+                      autoComplete="off"
+                      className={css({ display: 'block', width: '100%' })}
+                      ref={(input) => {
+                        this.keyTextInputs[index] = input;
+                      }}
+                      disabled={this.state.keyBusy}
+                      onPaste={(event) => this.pasteKeys(index, event)}
+                      onChange={() => {
+                        if (this.state.keyFiles || this.state.keyError) {
+                          if (this.keyFileInput.current) {
+                            this.keyFileInput.current.value = '';
+                          }
+                          this.setState({ keyFiles: undefined, keyError: undefined });
+                        }
+                      }}
+                    />
+                  </div>
+                ))}
+                <Button
+                  variant="secondary"
+                  size="sm"
                   disabled={this.state.keyBusy}
-                  onChange={() => {
-                    if (this.state.keyFile || this.state.keyError) {
-                      if (this.keyFileInput.current) {
-                        this.keyFileInput.current.value = '';
-                      }
-                      this.setState({ keyFile: undefined, keyError: undefined });
-                    }
-                  }}
-                />
+                  onClick={() => this.setState({ keyInputCount: this.state.keyInputCount + 1, keyError: undefined })}
+                >
+                  Add another key
+                </Button>
 
                 <Stack gap={1} alignItems="center">
                   <span>or</span>
@@ -490,30 +600,32 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
                     disabled={this.state.keyBusy}
                     onClick={() => this.keyFileInput.current?.click()}
                   >
-                    Choose local key file
+                    Choose local key files
                   </Button>
-                  {this.state.keyFile && <span>{this.state.keyFile.name}</span>}
+                  {this.state.keyFiles?.length ? (
+                    <span>{this.state.keyFiles.map((file) => file.name).join(', ')}</span>
+                  ) : null}
                 </Stack>
                 <input
                   aria-label="Protected key file"
                   type="file"
+                  multiple
                   accept=".txt,.key,text/plain"
                   ref={this.keyFileInput}
                   disabled={this.state.keyBusy}
                   className={css({ display: 'none' })}
                   onChange={(event) => {
-                    const file = event.currentTarget.files?.[0];
-                    if (file) {
-                      if (this.keyTextInput.current) {
-                        this.keyTextInput.current.value = '';
-                      }
-                      this.setState({ keyFile: file, keyError: undefined });
+                    const files = Array.from(event.currentTarget.files ?? []);
+                    if (files.length) {
+                      this.clearKeyInputs();
+                      this.setState({ keyFiles: files, keyInputCount: 1, keyError: undefined });
                     }
                   }}
                 />
                 <p>
-                  The key stays in browser memory and is forgotten on reload. It is not saved or sent to Grafana or
-                  Tempo. Existing encrypted results become readable when the key loads.
+                  Keys stay in browser memory and are forgotten on reload. Loading another key retains existing keys.
+                  Keys are not saved or sent to Grafana or Tempo. Encrypted results become readable when the matching
+                  key loads.
                 </p>
                 <details>
                   <summary>About protected attributes</summary>

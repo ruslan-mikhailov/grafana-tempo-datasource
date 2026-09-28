@@ -68,19 +68,37 @@ export function QueryEditor(props: Props) {
       const protectedMode = props.datasource.instanceSettings?.jsonData?.protectedAttributesEnabled;
       const key = props.datasource.protectedKey;
       if (protectedMode) {
-        assertProtectedQueryModelSafe(query, key?.kid);
+        assertProtectedQueryModelSafe(
+          query,
+          (props.datasource.protectedKeys ?? (key ? [key] : [])).map((item) => item.kid)
+        );
       }
-      const opened = protectedMode && key ? await openProtectedQueryModel(query, key, props.datasource.uid) : query;
+      const opened = protectedMode
+        ? await openProtectedQueryModel(
+            query,
+            props.datasource.getProtectedKey?.bind(props.datasource) ?? key,
+            props.datasource.uid
+          )
+        : query;
       const raw = props.datasource.languageProvider.generateQueryFromFilters({
         traceqlFilters: opened.filters || [],
       });
       const candidate: TempoQuery = { ...query, query: raw, queryType: 'traceql' };
       const sealed =
         protectedMode && key
-          ? await prepareProtectedQueryModel(candidate, key, props.datasource.uid, query)
+          ? await prepareProtectedQueryModel(
+              candidate,
+              key,
+              props.datasource.uid,
+              query,
+              props.datasource.getProtectedKey?.bind(props.datasource)
+            )
           : candidate;
       if (protectedMode) {
-        assertProtectedQueryModelSafe(sealed, key?.kid);
+        assertProtectedQueryModelSafe(
+          sealed,
+          (props.datasource.protectedKeys ?? (key ? [key] : [])).map((item) => item.kid)
+        );
       }
       if (
         generation.current === current &&
