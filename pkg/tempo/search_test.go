@@ -528,3 +528,150 @@ func TestTransformSpanSearchResponse_NoSpanAttributes(t *testing.T) {
 	assert.Equal(t, 3000.0, frames[0].Fields[6].At(0))
 	assert.Equal(t, 4000.0, frames[0].Fields[6].At(1))
 }
+
+func TestTransformSearchResponse_OmitsBlindIndexesAndRendersArrays(t *testing.T) {
+	pCtx := backend.PluginContext{DataSourceInstanceSettings: &backend.DataSourceInstanceSettings{UID: "u", Name: "n"}}
+	stringAttribute := func(key, value string) *v1.KeyValue {
+		return &v1.KeyValue{Key: key, Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: value}}}
+	}
+	arrayAttribute := func(key string, values ...string) *v1.KeyValue {
+		items := make([]*v1.AnyValue, 0, len(values))
+		for _, value := range values {
+			items = append(items, &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: value}})
+		}
+		return &v1.KeyValue{Key: key, Value: &v1.AnyValue{Value: &v1.AnyValue_ArrayValue{
+			ArrayValue: &v1.ArrayValue{Values: items},
+		}}}
+	}
+	resp := &tempopb.SearchResponse{Traces: []*tempopb.TraceSearchMetadata{{
+		TraceID: "trace", SpanSets: []*tempopb.SpanSet{
+			{
+				Attributes: []*v1.KeyValue{arrayAttribute("bi.resource.secret", "bi:v1:k:a")},
+				Spans: []*tempopb.Span{{
+					SpanID: "first", Attributes: []*v1.KeyValue{
+						arrayAttribute("bi.api.token", "bi:v1:k:a", "bi:v1:k:b"),
+						stringAttribute("enc.api.token", "enc:v1:k:ciphertext"),
+						arrayAttribute("labels", "alpha", "beta"),
+						arrayAttribute("tags", "one", "two"),
+						{Key: "count", Value: &v1.AnyValue{Value: &v1.AnyValue_IntValue{IntValue: 5}}},
+					},
+				}},
+			},
+			{
+				Spans: []*tempopb.Span{{
+					SpanID: "second", Attributes: []*v1.KeyValue{
+						stringAttribute("labels", "standalone"),
+						{Key: "count", Value: &v1.AnyValue{Value: &v1.AnyValue_DoubleValue{DoubleValue: 2.5}}},
+					},
+				}},
+			},
+		},
+	}}}
+
+	assertFields := func(t *testing.T, names []string, values [][]any, firstRow bool) {
+		t.Helper()
+		require.NotContains(t, names, "bi.api.token")
+		require.NotContains(t, names, "bi.resource.secret")
+		require.Contains(t, names, "enc.api.token")
+		require.Contains(t, names, "labels")
+		require.Contains(t, names, "tags")
+		require.Contains(t, names, "count")
+		lookup := func(name string) any {
+			for i, field := range names {
+				if field == name {
+					return values[i][0]
+				}
+			}
+			t.Fatalf("missing field %q", name)
+			return nil
+		}
+		if firstRow {
+			assert.Equal(t, "enc:v1:k:ciphertext", lookup("enc.api.token"))
+			assert.Equal(t, `["alpha","beta"]`, lookup("labels"))
+			assert.Equal(t, `["one","two"]`, lookup("tags"))
+			assert.Equal(t, float64(5), lookup("count"))
+		} else {
+			assert.Nil(t, lookup("enc.api.token"))
+			assert.Equal(t, "standalone", lookup("labels"))
+			assert.Nil(t, lookup("tags"))
+			assert.Equal(t, float64(2.5), lookup("count"))
+		}
+	}
+
+	nested, err := transformTraceSearchResponse(pCtx, resp)
+	require.NoError(t, err)
+	require.Len(t, nested, 1)
+	require.Equal(t, 1, nested[0].Rows())
+	var nestedFrames []json.RawMessage
+	require.NoError(t, json.Unmarshal(nested[0].Fields[5].At(0).(json.RawMessage), &nestedFrames))
+	require.Len(t, nestedFrames, 2)
+	var firstSchema []string
+	for i, raw := range nestedFrames {
+		var frame struct {
+			Schema struct {
+				Fields []struct {
+					Name string `json:"name"`
+				} `json:"fields"`
+			} `json:"schema"`
+			Data struct {
+				Values [][]any `json:"values"`
+			} `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal(raw, &frame))
+		names := make([]string, 0, len(frame.Schema.Fields))
+		for _, field := range frame.Schema.Fields {
+			names = append(names, field.Name)
+		}
+		if i == 0 {
+			firstSchema = names
+		} else {
+			assert.Equal(t, firstSchema, names, "nested span sets need a unified schema")
+		}
+		assertFields(t, names, frame.Data.Values, i == 0)
+	}
+
+	flat, err := transformSpanSearchResponse(pCtx, resp)
+	require.NoError(t, err)
+	require.Len(t, flat, 1)
+	require.Equal(t, 2, flat[0].Rows())
+	flatNames := make([]string, 0, len(flat[0].Fields))
+	for _, field := range flat[0].Fields {
+		flatNames = append(flatNames, field.Name)
+	}
+	for row := range 2 {
+		values := make([][]any, len(flat[0].Fields))
+		for column, field := range flat[0].Fields {
+			value := field.At(row)
+			if field.NilAt(row) {
+				value = nil
+			} else {
+				switch typed := value.(type) {
+				case *string:
+					value = *typed
+				case *float64:
+					value = *typed
+				}
+			}
+			values[column] = []any{value}
+		}
+		assertFields(t, flatNames, values, row == 0)
+	}
+}
+
+func TestTransformRawSearchResponse_OmitsBlindIndexesWithoutChangingTempoResponse(t *testing.T) {
+	token := &v1.KeyValue{Key: "bi.api.token", Value: &v1.AnyValue{Value: &v1.AnyValue_ArrayValue{
+		ArrayValue: &v1.ArrayValue{Values: []*v1.AnyValue{{Value: &v1.AnyValue_StringValue{StringValue: "bi:v1:k:d"}}}},
+	}}}
+	ciphertext := &v1.KeyValue{Key: "enc.api.token", Value: &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "enc:v1:k:c"}}}
+	resp := &tempopb.SearchResponse{Traces: []*tempopb.TraceSearchMetadata{{
+		SpanSet: &tempopb.SpanSet{Attributes: []*v1.KeyValue{token, ciphertext}, Spans: []*tempopb.Span{{Attributes: []*v1.KeyValue{token, ciphertext}}}},
+		SpanSets: []*tempopb.SpanSet{{Attributes: []*v1.KeyValue{token, ciphertext}, Spans: []*tempopb.Span{{Attributes: []*v1.KeyValue{token, ciphertext}}}}},
+	}}}
+	frames, err := transformRawSearchResponse(resp)
+	require.NoError(t, err)
+	require.Len(t, frames, 1)
+	raw := frames[0].Fields[0].At(0).(string)
+	assert.NotContains(t, raw, `"bi.api.token"`)
+	assert.Contains(t, raw, `"enc.api.token"`)
+	assert.Equal(t, token, resp.Traces[0].SpanSets[0].Spans[0].Attributes[0], "Tempo response remains intact")
+}

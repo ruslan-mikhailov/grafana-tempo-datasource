@@ -13,7 +13,7 @@ const scopeVariable = /^(?:\$\{[^}\s]+\}|\$[A-Za-z_]\w*|\[\[[^\]\s]+\]\])$/;
 const builderTag = /^[\p{L}\p{N}_-]+(?:\.[\p{L}\p{N}_-]+)*$/u;
 const quotedTagPart = /"(?:\\["\\]|[^"\\\u0000-\u001f])*"/g;
 const variableTagPart = /\$\{[^}\s]+\}|\$[A-Za-z_]\w*|\[\[[^\]\s]+\]\]/g;
-const builderOperators = ['=', '!=', '>', '<', '>=', '<=', '=~', '!~', '@>'];
+const builderOperators = ['=', '!=', '>', '<', '>=', '<=', '=~', '!~', '@>', '!@>'];
 const unsafe = () => new Error('Protected query model cannot be saved or opened');
 
 export function isProtectedModelEnvelope(value: string): boolean {
@@ -99,12 +99,13 @@ function assertFilterShape(filter: TraceqlFilter, substringEnabled = false): voi
     throw unsafe();
   }
   const { requiresSealing, dynamicReference, protectedReference } = classifyProtectedFilter(filter);
-  if (filter.operator === '@>' &&
-    (!substringEnabled || !protectedReference || dynamicReference ||
-      filter.scope !== TraceqlSearchScope.Span || Array.isArray(filter.value))) {
+  if ((filter.operator === '@>' || filter.operator === '!@>') &&
+    (Array.isArray(filter.value) || dynamicReference ||
+      (filter.value !== undefined && !protectedReference && filter.valueType !== 'string') ||
+      (protectedReference && (!substringEnabled || filter.scope !== TraceqlSearchScope.Span)))) {
     throw unsafe();
   }
-  if (requiresSealing && filter.operator && !['=', '!=', ...(substringEnabled ? ['@>'] : [])].includes(filter.operator)) {
+  if (requiresSealing && filter.operator && !['=', '!=', ...(substringEnabled ? ['@>', '!@>'] : [])].includes(filter.operator)) {
     throw unsafe();
   }
   if (protectedReference && !dynamicReference && filter.scope !== TraceqlSearchScope.Span) {

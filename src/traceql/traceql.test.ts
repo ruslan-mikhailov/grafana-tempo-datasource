@@ -53,7 +53,7 @@ describe('TraceQL grammar', () => {
 
     it('should categorize operators correctly', () => {
       expect(keywordOperators).toEqual(['=', '!=']);
-      expect(stringOperators).toEqual(['=', '!=', '=~', '!~']);
+      expect(stringOperators).toEqual(['=', '!=', '=~', '!~', '@>', '!@>']);
       expect(numberOperators).toEqual(['=', '!=', '>', '<', '>=', '<=']);
     });
   });

@@ -26,9 +26,9 @@ export const languageConfiguration: languages.LanguageConfiguration = {
   folding: {},
 };
 
-export const operators = ['=', '!=', '>', '<', '>=', '<=', '=~', '!~'];
+export const operators = ['=', '!=', '>', '<', '>=', '<=', '=~', '!~', '@>', '!@>'];
 export const keywordOperators = ['=', '!='];
-export const stringOperators = ['=', '!=', '=~', '!~'];
+export const stringOperators = ['=', '!=', '=~', '!~', '@>', '!@>'];
 export const numberOperators = ['=', '!=', '>', '<', '>=', '<='];
 
 export const intrinsicsV1 = [
@@ -93,7 +93,7 @@ const language: languages.IMonarchLanguage = {
   tokenPostfix: '.traceql',
 
   keywords,
-  operators: [...operators, '@>'],
+  operators,
   statusValues,
   functions,
   withClauseKeywords,

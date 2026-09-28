@@ -226,7 +226,7 @@ function replaceSafeTraceQLTemplate(
     const end = start + match[0].length;
     const value = replace(match[0]);
     const namePosition =
-      !quoted && (source[start - 1] === '.' || source[end] === '.' || /^(?:\s*)(?:@>|=~|!~|!=|>=|<=|=|>|<)/.test(source.slice(end)));
+      !quoted && (source[start - 1] === '.' || source[end] === '.' || /^(?:\s*)(?:!@>|@>|=~|!~|!=|>=|<=|=|>|<)/.test(source.slice(end)));
     if (namePosition) {
       if (!attributeName.test(value) || (!allowProtectedName && /(?:^|\.)enc\./.test(value)) || /(?:^|\.)bi\./.test(value)) {
         throw new Error('A host variable cannot introduce a protected attribute name.');

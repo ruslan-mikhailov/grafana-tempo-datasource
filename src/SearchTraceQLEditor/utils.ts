@@ -110,10 +110,10 @@ const tagHelper = (f: TraceqlFilter, filters: TraceqlFilter[]) => {
 };
 
 export const filterToQuerySection = (f: TraceqlFilter, filters: TraceqlFilter[], lp: TempoLanguageProvider) => {
-  if (isProtectedBuilderValue(f, lp) && !['=', '!=', ...(lp.datasource.instanceSettings?.jsonData?.protectedAttributesSubstringEnabled ? ['@>'] : [])].includes(f.operator ?? '')) {
+  if (isProtectedBuilderValue(f, lp) && !['=', '!=', ...(lp.datasource.instanceSettings?.jsonData?.protectedAttributesSubstringEnabled ? ['@>', '!@>'] : [])].includes(f.operator ?? '')) {
     throw new Error('Protected filter operator is not enabled');
   }
-  if (f.operator === '@>' && Array.isArray(f.value)) {
+  if ((f.operator === '@>' || f.operator === '!@>') && Array.isArray(f.value)) {
     throw new Error('Substring search requires a single string value');
   }
   if (Array.isArray(f.value) && f.value.length > 1 && !isRegExpOperator(f.operator!)) {
@@ -122,7 +122,7 @@ export const filterToQuerySection = (f: TraceqlFilter, filters: TraceqlFilter[],
     return `(${f.value.map((v) => `${scopeHelper(f, lp)}${tagHelper(f, filters)}${f.operator}${valueHelper({ ...f, value: v }, lp)}`).join(joinOperator)})`;
   }
 
-  const operator = f.operator === '@>' ? ' @> ' : f.operator;
+  const operator = f.operator === '@>' || f.operator === '!@>' ? ` ${f.operator} ` : f.operator;
   return `${scopeHelper(f, lp)}${tagHelper(f, filters)}${operator}${valueHelper(f, lp)}`;
 };
 
@@ -220,6 +220,9 @@ export const operatorSelectableValue = (op: string) => {
       break;
     case '@>':
       result.description = 'Contains substring';
+      break;
+    case '!@>':
+      result.description = 'Does not contain substring';
       break;
   }
   return result;

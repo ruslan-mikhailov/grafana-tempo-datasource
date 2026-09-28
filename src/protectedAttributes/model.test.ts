@@ -268,3 +268,15 @@ test('substring raw query and scalar Builder value seal before host persistence;
   await expect(prepareProtectedQueryModel(query('', [{ ...builder.filters[0], tag: 'bi.password' }]), key, uid, undefined, undefined, true)).rejects.toThrow();
   await expect(prepareProtectedQueryModel(query('', [{ ...builder.filters[0], tag: '${attribute}' }]), key, uid, undefined, undefined, true)).rejects.toThrow();
 });
+
+test('negative substring preserves scalar protected Builder values and rejects untyped ordinary strings', async () => {
+  const key = await importKey(master);
+  const protectedNegative = query('', [{ ...protectedFilter('cool'), operator: '!@>', valueType: 'string' }]);
+  const sealed = await prepareProtectedQueryModel(protectedNegative, key, uid, undefined, undefined, true);
+  expect(sealed.filters[0].value).toMatch(/^qenc:v1:/);
+  expect((await openProtectedQueryModel(sealed, key, uid, true)).filters[0].value).toBe('cool');
+  const ordinary = { ...protectedNegative.filters[0], tag: 'http.route', operator: '!@>', valueType: 'string' };
+  expect(() => assertProtectedQueryModelSafe(query('', [ordinary]), kid, true)).not.toThrow();
+  await expect(prepareProtectedQueryModel(query('', [{ ...ordinary, valueType: 'int' }]), key, uid, undefined, undefined, true)).rejects.toThrow();
+  await expect(prepareProtectedQueryModel(query('', [{ ...ordinary, value: ['cool'] }]), key, uid, undefined, undefined, true)).rejects.toThrow();
+});

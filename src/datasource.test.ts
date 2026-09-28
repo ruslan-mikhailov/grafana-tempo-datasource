@@ -2640,7 +2640,7 @@ describe('protected datasource transport boundary', () => {
     );
     const builder = await prepareProtectedQueryModel(
       { refId: 'B', queryType: 'traceqlSearch', filters: [{
-        id: 'secret', tag: 'enc.secret', scope: TraceqlSearchScope.Span, operator: '@>', value: 'cool', valueType: 'string',
+        id: 'secret', tag: 'enc.secret', scope: TraceqlSearchScope.Span, operator: '!@>', value: 'cool', valueType: 'string',
       }] },
       ds.protectedKey!, ds.uid, undefined, undefined, true
     );
@@ -2650,7 +2650,8 @@ describe('protected datasource transport boundary', () => {
     const body = JSON.stringify(sent);
     expect(body).not.toContain('cool');
     expect(body).not.toContain('qenc:v1:');
-    expect(body).toContain('span.\\"bi.secret\\" @> [');
+    expect(body).toContain('span.\\"bi.secret\\" subarray_seq [');
+    expect(body).toContain('span.\\"bi.secret\\" !subarray_seq [');
     expect(body).toContain('E_S8rZC-kHLrifr_71XBBSP7w8jOWNCm2j6LHigypgM');
     expect(body).toContain('zQb64aCXnVL2KksfrDxrQwVtdw6Ljmwxv37So9E7ghc');
     expect(sent.flatMap((request) => request.data.queries).find((target) => target.refId === 'B')?.query).toContain('| select(span.enc.secret)');
@@ -2703,7 +2704,7 @@ describe('protected datasource transport boundary', () => {
     expect(ds.languageProvider.getTags(TraceqlSearchScope.Span)).toEqual(['enc.secret', 'http.route']);
     await ds.metadataRequest('tag-values', { tag: 'span.http.route', q: '{span.enc.secret @> "cool"}' });
     expect(resource).toHaveBeenCalledWith('tag-values', expect.objectContaining({
-      q: expect.stringContaining('span."bi.secret" @> ['),
+      q: expect.stringContaining('span."bi.secret" subarray_seq ['),
     }), expect.anything());
     expect(JSON.stringify(resource.mock.calls)).not.toContain('cool');
     resource.mockClear();
@@ -2736,7 +2737,7 @@ describe('protected datasource transport boundary', () => {
     for (const call of calls) {
       expect(JSON.stringify(call.data)).not.toContain('cool');
       expect(JSON.stringify(call.data)).not.toContain('qenc:v1:');
-      expect(call.data.query).toContain('span."bi.secret" @> [');
+      expect(call.data.query).toContain('span."bi.secret" subarray_seq [');
     }
     expect(calls.find((call) => call.path.startsWith('search/'))?.data.query).toContain('| select(span.enc.secret)');
     expect(calls.find((call) => call.path.startsWith('metrics/'))?.data.query).not.toContain('| select(');

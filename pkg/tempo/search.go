@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"sort"
+	"strings"
 	"time"
 
 	//nolint:staticcheck // tempopb uses old protobuf API, jsonpb required for compatibility
@@ -288,26 +290,40 @@ func transformTraceSearchResponse(pCtx backend.PluginContext, response *tempopb.
 // order — required for the Table visualization's nestedFrames contract.
 func collectSpanSetsSchema(spanSets []*tempopb.SpanSet) (map[string]*DataFrameField, []string, bool) {
 	spanDynamicAttributes := make(map[string]*DataFrameField)
+	promotedToString := make(map[string]bool)
+	addAttribute := func(attribute *v1.KeyValue) {
+		if attribute == nil || strings.HasPrefix(attribute.Key, "bi.") {
+			return
+		}
+		fieldType := getTypeForAttribute(attribute)
+		if field, ok := spanDynamicAttributes[attribute.Key]; ok {
+			// Conflicting scalar/array types must share one vector across all span sets.
+			// Int and double already use the same float64 vector.
+			if !promotedToString[attribute.Key] && reflect.TypeOf(field.Type) != reflect.TypeOf(fieldType) {
+				field.Type = []*string{}
+				promotedToString[attribute.Key] = true
+			}
+			return
+		}
+		spanDynamicAttributes[attribute.Key] = &DataFrameField{
+			Name:   attribute.Key,
+			Type:   fieldType,
+			Config: data.FieldConfig{DisplayNameFromDS: attribute.Key},
+		}
+	}
+
 	hasNameAttribute := false
 
 	for _, spanSet := range spanSets {
 		for _, attribute := range spanSet.Attributes {
-			spanDynamicAttributes[attribute.Key] = &DataFrameField{
-				Name:   attribute.Key,
-				Type:   getTypeForAttribute(attribute),
-				Config: data.FieldConfig{DisplayNameFromDS: attribute.Key},
-			}
+			addAttribute(attribute)
 		}
 		for _, span := range spanSet.Spans {
 			if span.Name != "" {
 				hasNameAttribute = true
 			}
 			for _, attribute := range span.Attributes {
-				spanDynamicAttributes[attribute.Key] = &DataFrameField{
-					Name:   attribute.Key,
-					Type:   getTypeForAttribute(attribute),
-					Config: data.FieldConfig{DisplayNameFromDS: attribute.Key},
-				}
+				addAttribute(attribute)
 			}
 		}
 	}
@@ -377,7 +393,7 @@ func transformTraceSearchResponseSubFrame(
 	}
 
 	for _, span := range spanSet.Spans {
-		traceData := transformSpanToTraceData(span, spanSet, trace)
+		traceData := transformSpanToTraceData(span, spanSet, trace, spanDynamicAttributes)
 		frame.Fields[0].Append(traceData.traceIdHidden)
 		frame.Fields[1].Append(traceData.spanID)
 		frame.Fields[2].Append(traceData.time)
@@ -481,7 +497,7 @@ func transformSpanSearchResponse(pCtx backend.PluginContext, response *tempopb.S
 	for _, trace := range traces {
 		for _, spanSet := range trace.SpanSets {
 			for _, span := range spanSet.Spans {
-				traceData := transformSpanToTraceData(span, spanSet, trace)
+				traceData := transformSpanToTraceData(span, spanSet, trace, spanDynamicAttributes)
 				spansFrame.Fields[0].Append(traceData.traceIdHidden)
 				spansFrame.Fields[1].Append(trace.RootServiceName)
 				spansFrame.Fields[2].Append(trace.RootTraceName)
@@ -509,6 +525,25 @@ func transformRawSearchResponse(response *tempopb.SearchResponse) ([]*data.Frame
 	rawFrame := data.NewFrame("Raw response")
 	rawFrame.Fields = append(rawFrame.Fields, data.NewField("response", nil, []string{}))
 
+	// Raw is still a Grafana search frame, not a direct Tempo API response.
+	// Copy before filtering so the decoded Tempo response remains untouched.
+	if response != nil {
+		clean := *response
+		clean.Traces = make([]*tempopb.TraceSearchMetadata, len(response.Traces))
+		for i, trace := range response.Traces {
+			if trace == nil {
+				continue
+			}
+			traceCopy := *trace
+			traceCopy.SpanSet = visibleSpanSet(trace.SpanSet)
+			traceCopy.SpanSets = make([]*tempopb.SpanSet, len(trace.SpanSets))
+			for j, spanSet := range trace.SpanSets {
+				traceCopy.SpanSets[j] = visibleSpanSet(spanSet)
+			}
+			clean.Traces[i] = &traceCopy
+		}
+		response = &clean
+	}
 	raw, err := json.MarshalIndent(response, "", "  ")
 	if err != nil {
 		return nil, err
@@ -518,28 +553,57 @@ func transformRawSearchResponse(response *tempopb.SearchResponse) ([]*data.Frame
 	return []*data.Frame{rawFrame}, nil
 }
 
-func transformSpanToTraceData(span *tempopb.Span, spanSet *tempopb.SpanSet, trace *tempopb.TraceSearchMetadata) *TraceTableData {
+func visibleSpanSet(spanSet *tempopb.SpanSet) *tempopb.SpanSet {
+	if spanSet == nil {
+		return nil
+	}
+	copySet := *spanSet
+	copySet.Attributes = visibleSearchAttributes(spanSet.Attributes)
+	copySet.Spans = make([]*tempopb.Span, len(spanSet.Spans))
+	for i, span := range spanSet.Spans {
+		if span == nil {
+			continue
+		}
+		copySpan := *span
+		copySpan.Attributes = visibleSearchAttributes(span.Attributes)
+		copySet.Spans[i] = &copySpan
+	}
+	return &copySet
+}
+
+func visibleSearchAttributes(attributes []*v1.KeyValue) []*v1.KeyValue {
+	visible := make([]*v1.KeyValue, 0, len(attributes))
+	for _, attribute := range attributes {
+		if attribute != nil && !strings.HasPrefix(attribute.Key, "bi.") {
+			visible = append(visible, attribute)
+		}
+	}
+	return visible
+}
+
+func transformSpanToTraceData(span *tempopb.Span, spanSet *tempopb.SpanSet, trace *tempopb.TraceSearchMetadata, schema map[string]*DataFrameField) *TraceTableData {
 	attributes := make(map[string]interface{})
-	allAttributes := make([]*v1.KeyValue, 0, len(spanSet.Attributes)+len(span.Attributes))
-
-	if spanSet.Attributes != nil {
-		allAttributes = append(allAttributes, spanSet.Attributes...)
-	}
-
-	if span.Attributes != nil {
-		allAttributes = append(allAttributes, span.Attributes...)
-	}
-
-	for _, attribute := range allAttributes {
-		switch attribute.Value.GetValue().(type) {
-		case *v1.AnyValue_StringValue:
-			val := attribute.Value.GetStringValue()
+	addAttribute := func(attribute *v1.KeyValue) {
+		if attribute == nil || strings.HasPrefix(attribute.Key, "bi.") {
+			return
+		}
+		field, ok := schema[attribute.Key]
+		if !ok {
+			return
+		}
+		if attribute.Value == nil || attribute.Value.GetValue() == nil {
+			return
+		}
+		if _, isStringField := field.Type.([]*string); isStringField {
+			val := searchAttributeString(attribute.Value)
 			attributes[attribute.Key] = &val
+			return
+		}
+		switch attribute.Value.GetValue().(type) {
 		case *v1.AnyValue_IntValue:
-			// Use float64 for int tags so dynamic columns stay consistent when the same key
-			// appears as IntValue on some spans and DoubleValue on others (see getTypeForAttribute).
-			v := float64(attribute.Value.GetIntValue())
-			attributes[attribute.Key] = &v
+			// Int and double both use float64 vectors.
+			val := float64(attribute.Value.GetIntValue())
+			attributes[attribute.Key] = &val
 		case *v1.AnyValue_DoubleValue:
 			val := attribute.Value.GetDoubleValue()
 			attributes[attribute.Key] = &val
@@ -549,10 +613,13 @@ func transformSpanToTraceData(span *tempopb.Span, spanSet *tempopb.SpanSet, trac
 		case *v1.AnyValue_BytesValue:
 			val := attribute.Value.GetBytesValue()
 			attributes[attribute.Key] = &val
-		default:
-			val := attribute.Value.GetValue()
-			attributes[attribute.Key] = &val
 		}
+	}
+	for _, attribute := range spanSet.Attributes {
+		addAttribute(attribute)
+	}
+	for _, attribute := range span.Attributes {
+		addAttribute(attribute)
 	}
 
 	return &TraceTableData{
@@ -563,6 +630,32 @@ func transformSpanToTraceData(span *tempopb.Span, spanSet *tempopb.SpanSet, trac
 		duration:      float64(span.DurationNanos),
 		attributes:    attributes,
 	}
+}
+
+func searchAttributeString(value *v1.AnyValue) string {
+	switch value.GetValue().(type) {
+	case *v1.AnyValue_StringValue:
+		return value.GetStringValue()
+	case *v1.AnyValue_IntValue:
+		return fmt.Sprint(value.GetIntValue())
+	case *v1.AnyValue_DoubleValue:
+		return fmt.Sprint(value.GetDoubleValue())
+	case *v1.AnyValue_BoolValue:
+		return fmt.Sprint(value.GetBoolValue())
+	case *v1.AnyValue_BytesValue:
+		return fmt.Sprintf("%x", value.GetBytesValue())
+	case *v1.AnyValue_ArrayValue:
+		text, err := arrayAsString(value.GetArrayValue())
+		if err == nil {
+			return text
+		}
+	case *v1.AnyValue_KvlistValue:
+		text, err := kvListAsString(value.GetKvlistValue())
+		if err == nil {
+			return text
+		}
+	}
+	return fmt.Sprint(value.GetValue())
 }
 
 func getTypeForAttribute(attribute *v1.KeyValue) interface{} {

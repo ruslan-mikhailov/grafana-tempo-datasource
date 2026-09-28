@@ -43,7 +43,7 @@ export function isEncryptedAttributeEnvelope(value: string): boolean {
 }
 
 type Edit = { from: number; to: number; text: string };
-type Predicate = { field: string; lhs: SyntaxNode; rhs: SyntaxNode; comparison: SyntaxNode; op: '=' | '!=' | '@>' };
+type Predicate = { field: string; lhs: SyntaxNode; rhs: SyntaxNode; comparison: SyntaxNode; op: '=' | '!=' | '@>' | '!@>' };
 type Attribute = { field: string; protected: boolean; dynamic: boolean };
 
 export type ProtectedTraceQLClassification = {
@@ -195,7 +195,7 @@ function predicateFor(attributeNode: SyntaxNode, query: string): Predicate {
     return invalid();
   }
   const op = query.slice(nodes[1].from, nodes[1].to);
-  if (op !== '=' && op !== '!=' && op !== '@>') {
+  if (op !== '=' && op !== '!=' && op !== '@>' && op !== '!@>') {
     return invalid();
   }
   const right = children(nodes[2]);
@@ -232,6 +232,7 @@ function variableMayNameField(node: SyntaxNode, query: string): boolean {
       operator === '=' ||
       operator === '!=' ||
       operator === '@>' ||
+      operator === '!@>' ||
       operator === '>' ||
       operator === '<' ||
       operator === '>=' ||
@@ -295,14 +296,6 @@ function inspect(
       if (node.type.id === TemplateVariable && variableMayNameField(node.node, query)) {
         dynamicReferences = true;
       }
-      if (node.type.id === FieldOp && query.slice(node.from, node.to) === '@>') {
-        const comparison = node.node.parent;
-        const lhs = comparison && children(comparison)[0];
-        const field = lhs && children(lhs)[0];
-        if (field?.type.id !== AttributeField || !attribute(field, query).protected) {
-          invalid();
-        }
-      }
       if (node.type.id === SelectOperation) {
         selects.push(node.node);
       }
@@ -319,7 +312,7 @@ function inspect(
         return;
       }
       const predicate = predicateFor(node.node, query);
-      if (predicate.op === '@>' && !substringEnabled) {
+      if ((predicate.op === '@>' || predicate.op === '!@>') && !substringEnabled) {
         invalid();
       }
       predicate.field = parsed.field;
@@ -336,7 +329,7 @@ function inspect(
       requiresSealing:
         dynamicReferences ||
         (protectedReferences &&
-          (!predicates.length || predicates.some(({ rhs, op }) => op === '@>' || !isEncryptedAttributeEnvelope(literal(rhs, query))))),
+          (!predicates.length || predicates.some(({ rhs, op }) => op === '@>' || op === '!@>' || !isEncryptedAttributeEnvelope(literal(rhs, query))))),
       protectedRhsRanges: predicates.map(({ rhs }) => ({ from: rhs.from, to: rhs.to })),
     },
   };
@@ -461,14 +454,15 @@ export async function rewriteProtectedTraceQL(
     if (!fields.has(predicate.field)) {
       fields.set(predicate.field, query.slice(predicate.lhs.from, predicate.lhs.to));
     }
-    if (predicate.op === '@>') {
+    if (predicate.op === '@>' || predicate.op === '!@>') {
       if (!protectedKeys.length) {
         invalid();
       }
       const value = literal(predicate.rhs, query);
+      const operator = predicate.op === '@>' ? 'subarray_seq' : '!subarray_seq';
       const comparisons = await Promise.all(protectedKeys.map(async (key) => {
         const tokens = await key.substringTokens(predicate.field, value);
-        return `span.${JSON.stringify(`bi.${predicate.field.slice(4)}`)} @> ${JSON.stringify(tokens)}`;
+        return `span.${JSON.stringify(`bi.${predicate.field.slice(4)}`)} ${operator} ${JSON.stringify(tokens)}`;
       }));
       edits.push({
         from: predicate.comparison.from,

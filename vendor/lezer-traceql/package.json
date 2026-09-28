@@ -1,7 +1,7 @@
 {
   "name": "@grafana/lezer-traceql",
-  "version": "0.0.25-substring.1",
-  "description": "Grafana Tempo TraceQL Lezer grammar with @> field operator",
+  "version": "0.0.25-substring.2",
+  "description": "Grafana Tempo TraceQL Lezer grammar with substring and internal array-sequence operators",
   "type": "module",
   "main": "./index.cjs",
   "module": "./index.es.js",

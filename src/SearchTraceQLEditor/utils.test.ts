@@ -294,6 +294,17 @@ describe('filterToQuerySection returns the correct query section for a filter', 
     expect(classifyProtectedTraceQL(q).requiresSealing).toBe(false);
   });
 
+  it('generates literal substring predicates for ordinary string attributes', () => {
+    const filter: TraceqlFilter = {
+      id: 'route', scope: TraceqlSearchScope.Span, tag: 'http.route',
+      operator: '@>', value: 'say "hello"\\again', valueType: 'string',
+    };
+    expect(filterToQuerySection(filter, [], lp)).toBe(`span.http.route @> ${JSON.stringify(filter.value)}`);
+    expect(filterToQuerySection({ ...filter, operator: '!@>' }, [], lp)).toBe(
+      `span.http.route !@> ${JSON.stringify(filter.value)}`
+    );
+  });
+
 });
 
 describe('filterTitle returns the correct title for a filter', () => {

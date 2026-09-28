@@ -588,7 +588,10 @@ export class CompletionProvider implements monacoTypes.languages.CompletionItemP
         !/(?:^|[({&|])\s*span\.(?:enc\.[\p{L}\p{N}_.-]+|"enc\.[^"\\\u0000-\u001f]+")\s*$/u.test(query.slice(0, offset))) {
       return [];
     }
-    return [{ label: '@>', insertText: '@>', detail: 'Protected substring search' }];
+    return [
+      { label: '@>', insertText: '@>', detail: 'Protected substring contains' },
+      { label: '!@>', insertText: '!@>', detail: 'Protected substring does not contain' },
+    ];
   }
 
   private getTagsCompletions(prepend?: string, scope?: string): CompletionItem[] {

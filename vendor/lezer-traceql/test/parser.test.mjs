@@ -34,3 +34,13 @@ test('@> does not accept an incomplete string literal', () => {
   const nodes = parsedNodes('{span.enc.secret @> "unterminated}');
   assert.equal(nodes.some((node) => node.error), true);
 });
+
+test('ordinary negative substring and protected internal sequence predicates parse as complete field operators', () => {
+  const query = '{span.http.route !@> "users" && span."bi.secret" !subarray_seq ["bi:v1:k:abc","bi:v1:k:bcd"]}';
+  const nodes = parsedNodes(query);
+  assert.equal(nodes.some((node) => node.error), false);
+  assert.deepEqual(nodes.filter((node) => node.name === 'FieldOp').map((node) => node.text), ['!@>', '!subarray_seq']);
+  const positive = parsedNodes('{span."bi.secret" subarray_seq ["bi:v1:k:abc"]}');
+  assert.equal(positive.some((node) => node.error), false);
+  assert.deepEqual(positive.filter((node) => node.name === 'FieldOp').map((node) => node.text), ['subarray_seq']);
+});

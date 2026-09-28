@@ -633,8 +633,9 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
                   <p>
                     Only stored enc.* span attributes are protected; query them as span.enc.*. Equal values in the same
                     field remain recognizable in ciphertext. Unprefixed attributes and searches are not protected.
-                    When enabled, indexed span.enc.* attributes also support keyed substring search with {'@>'} and at least
-                    three normalized characters. Older traces without an index do not match.
+                    String attributes support substring search with {'@>'} and {'!@>'}. Indexed span.enc.* attributes
+                    use keyed substring search with at least three normalized characters; older traces without an
+                    index cannot answer those searches.
                   </p>
                 </details>
                 {this.state.keyError && <div role="alert">{this.state.keyError}</div>}

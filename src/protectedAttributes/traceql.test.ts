@@ -214,20 +214,38 @@ describe('protected substring compiler', () => {
     const raw = '{span."enc.secret" @> "cool" && span.http.route="users"} with (most_recent=true)';
     expect(classifyProtectedTraceQL(raw, true).requiresSealing).toBe(true);
     expect(await rewriteProtectedTraceQL(raw, [first, second], 'search', true)).toBe(
-      '{(span."bi.secret" @> ["bi:v1:first:coo","bi:v1:first:ool"] || span."bi.secret" @> ["bi:v1:second:coo","bi:v1:second:ool"]) && span.http.route="users"} | select(span."enc.secret") with (most_recent=true)'
+      '{(span."bi.secret" subarray_seq ["bi:v1:first:coo","bi:v1:first:ool"] || span."bi.secret" subarray_seq ["bi:v1:second:coo","bi:v1:second:ool"]) && span.http.route="users"} | select(span."enc.secret") with (most_recent=true)'
     );
     expect(first.substringTokens).toHaveBeenCalledWith('enc.secret', 'cool');
     expect(second.substringTokens).toHaveBeenCalledWith('enc.secret', 'cool');
     expect(await rewriteProtectedTraceQL('{span.enc.secret @> "cool"} | rate()', first, 'metrics', true)).toBe(
-      '{span."bi.secret" @> ["bi:v1:first:coo","bi:v1:first:ool"]} | rate()'
+      '{span."bi.secret" subarray_seq ["bi:v1:first:coo","bi:v1:first:ool"]} | rate()'
     );
     expect(await rewriteProtectedTraceQL('{span.enc.secret @> "cool"}', first, 'metadata', true)).toBe(
-      '{span."bi.secret" @> ["bi:v1:first:coo","bi:v1:first:ool"]}'
+      '{span."bi.secret" subarray_seq ["bi:v1:first:coo","bi:v1:first:ool"]}'
     );
     const envelopeLiteral = `enc:v1:630dcd2966c4336691125448bbb25b4f:7aUwjY5fPtHvu_dUnzcxBJc6XQ`;
     expect(classifyProtectedTraceQL(`{span.enc.secret @> "${envelopeLiteral}"}`, true).requiresSealing).toBe(true);
     await rewriteProtectedTraceQL(`{span.enc.secret @> "${envelopeLiteral}"}`, first, 'search', true);
     expect(first.substringTokens).toHaveBeenCalledWith('enc.secret', envelopeLiteral);
+  });
+
+  it('rewrites protected negative substring using key-matched index predicates and preserves ordinary text search', async () => {
+    const query = '{span.enc.secret !@> "cool" && span.http.route !@> "users"}';
+    expect(await rewriteProtectedTraceQL(query, [first, second], 'search', true)).toBe(
+      '{(span."bi.secret" !subarray_seq ["bi:v1:first:coo","bi:v1:first:ool"] || span."bi.secret" !subarray_seq ["bi:v1:second:coo","bi:v1:second:ool"]) && span.http.route !@> "users"} | select(span.enc.secret)'
+    );
+    expect(first.substringTokens).toHaveBeenCalledWith('enc.secret', 'cool');
+    expect(second.substringTokens).toHaveBeenCalledWith('enc.secret', 'cool');
+    expect(classifyProtectedTraceQL('{span.http.route !@> "users"}').requiresSealing).toBe(false);
+    expect(await rewriteProtectedTraceQL('{span.http.route @> "users"}', first, 'search')).toBe('{span.http.route @> "users"}');
+  });
+
+  it('rejects negative protected substring when not opted in, keyless, or using unsupported RHS', async () => {
+    expect(() => classifyProtectedTraceQL('{span.enc.secret !@> "cool"}')).toThrow();
+    await expect(rewriteProtectedTraceQL('{span.enc.secret !@> "cool"}', undefined, 'search', true)).rejects.toThrow();
+    await expect(rewriteProtectedTraceQL('{span.enc.secret !@> $value}', first, 'search', true)).rejects.toThrow();
+    expect(first.substringTokens).not.toHaveBeenCalled();
   });
 
   it('rejects disabled, keyless, invalid scopes, sidecar injection and nonliteral RHS before rewrite', async () => {

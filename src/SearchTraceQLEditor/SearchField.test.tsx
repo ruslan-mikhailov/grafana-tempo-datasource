@@ -500,6 +500,7 @@ describe('SearchField', () => {
     const operator = container.querySelector('input[aria-label="select secret operator"]')!;
     await user.click(operator);
     expect(screen.getByText('Contains substring')).toBeInTheDocument();
+    expect(screen.getByText('Does not contain substring')).toBeInTheDocument();
     const value = container.querySelector('input[aria-label="select secret value"]')!;
     await user.type(value, 'cool');
     await user.keyboard('{Enter}');
