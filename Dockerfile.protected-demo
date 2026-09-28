@@ -14,7 +14,26 @@ RUN go mod download
 COPY pkg ./pkg
 RUN mkdir -p /out && arch=${TARGETARCH:-$(go env GOARCH)} && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "/out/gpx_grafana-tempo-datasource_linux_${arch}" ./pkg
 
+# Both external datasource plugins run in the same Grafana base image.
+FROM node:24-bookworm AS loki-frontend
+WORKDIR /app
+RUN npm install --global npm@11.16.0
+COPY --from=loki-plugin package.json package-lock.json .npmrc ./
+RUN npm ci
+COPY --from=loki-plugin . .
+RUN npm run build
+
+FROM golang:1.26.7-bookworm AS loki-backend
+WORKDIR /app
+ARG TARGETARCH
+COPY --from=loki-plugin go.mod go.sum ./
+RUN go mod download
+COPY --from=loki-plugin pkg ./pkg
+RUN mkdir -p /out && arch=${TARGETARCH:-$(go env GOARCH)} && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "/out/gpx_grafana-loki-datasource_linux_${arch}" ./pkg
+
 FROM grafana-base
 COPY --from=frontend --chown=472:0 /app/dist/ /var/lib/grafana/plugins/grafana-tempo-datasource/
 COPY --from=backend --chown=472:0 /out/ /var/lib/grafana/plugins/grafana-tempo-datasource/
+COPY --from=loki-frontend --chown=472:0 /app/dist/ /var/lib/grafana/plugins/grafana-loki-datasource/
+COPY --from=loki-backend --chown=472:0 /out/ /var/lib/grafana/plugins/grafana-loki-datasource/
 COPY --chown=472:0 custom.ini /etc/grafana/grafana.ini
