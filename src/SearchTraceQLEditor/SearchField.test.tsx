@@ -507,6 +507,35 @@ describe('SearchField', () => {
     expect(updateFilter).toHaveBeenCalledWith(expect.objectContaining({ value: 'cool', valueType: 'string' }));
     expect(datasource.languageProvider.getOptionsV2).not.toHaveBeenCalled();
   });
+  it('chooses a protected Builder predicate key only when multiple keys are loaded', async () => {
+    const firstKid = '630dcd2966c4336691125448bbb25b4f';
+    const secondKid = 'a'.repeat(32);
+    const datasource = {
+      instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
+      protectedKeys: [{ kid: firstKid }],
+      languageProvider: {
+        getOptionsV2: jest.fn().mockResolvedValue([]),
+        getIntrinsics: jest.fn().mockReturnValue([]),
+        getTags: jest.fn().mockReturnValue([]),
+      },
+    } as unknown as TempoDatasource;
+    datasource.languageProvider.datasource = datasource;
+    const filter: TraceqlFilter = {
+      id: 'password', tag: 'enc.password', scope: TraceqlSearchScope.Span, operator: '=', value: 'private',
+    };
+    const updateFilter = jest.fn();
+    const props = { datasource, filter, updateFilter, setError: jest.fn(), tags: [], query: '',
+      protectedKeyLabel: (id: string) => id === secondKid ? 'Old key · aaaaaaaa…aaaaaa' : 'New key' };
+    const view = render(<SearchField {...props} />);
+    expect(screen.queryByLabelText('select password protected key')).not.toBeInTheDocument();
+    Object.defineProperty(datasource, 'protectedKeys', { value: [{ kid: firstKid }, { kid: secondKid }], configurable: true });
+    view.rerender(<SearchField {...props} />);
+    await user.click(screen.getByLabelText('select password protected key'));
+    await user.click(screen.getByText('Old key · aaaaaaaa…aaaaaa'));
+    expect(updateFilter).toHaveBeenCalledWith(expect.objectContaining({ id: 'password', protectedKeyId: secondKid }));
+    expect(datasource.languageProvider.getOptionsV2).not.toHaveBeenCalled();
+  });
+
 });
 
 const renderSearchField = (

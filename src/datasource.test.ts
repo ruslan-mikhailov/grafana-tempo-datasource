@@ -40,6 +40,7 @@ import { createFetchResponse } from './_importedDependencies/test/helpers/create
 import { TraceqlSearchScope } from './dataquery';
 import { importKey } from './protectedAttributes/crypto';
 import { prepareProtectedQueryModel } from './protectedAttributes/model';
+import { protectedTraceQLPredicates } from './protectedAttributes/traceql';
 import {
   TempoDatasource,
   buildExpr,
@@ -1831,16 +1832,22 @@ describe('protected datasource transport boundary', () => {
     const newKey = ds.protectedKey!;
     const newEnvelope = newKey.encrypt('enc.password', 'abc');
     expect(ds.protectedKeys.map((key) => key.kid)).toEqual([oldKeyId, newKeyId]);
+    const callsBeforeChoice = fetchMock.mock.calls.length;
     await lastValueFrom(ds.query({ targets: [oldSaved], range } as DataQueryRequest<TempoQuery>));
+    expect(fetchMock).toHaveBeenCalledTimes(callsBeforeChoice);
+    const openedRaw = '{span.enc.password="abc"}';
+    const selected = { ...oldSaved, protectedQueryKeys: [
+      { predicate: protectedTraceQLPredicates(openedRaw)[0].predicate, kid: oldKeyId },
+    ] };
+    await lastValueFrom(ds.query({ targets: [selected], range } as DataQueryRequest<TempoQuery>));
     const sent = fetchMock.mock.calls.at(-1)![0] as { data: { queries: TempoQuery[] } };
-    expect(sent.data.queries[0].query).toContain(
-      `span.enc.password="${attributeEnvelope}" || span.enc.password="${newEnvelope}"`
-    );
+    expect(sent.data.queries[0].query).toContain(`span.enc.password="${attributeEnvelope}"`);
+    expect(sent.data.queries[0].query).not.toContain(newEnvelope);
     expect(JSON.stringify(sent)).not.toContain('"abc"');
     ds.clearProtectedKey(oldKeyId);
     expect(ds.protectedKeys.map((key) => key.kid)).toEqual([newKeyId]);
     const calls = fetchMock.mock.calls.length;
-    await lastValueFrom(ds.query({ targets: [oldSaved], range } as DataQueryRequest<TempoQuery>));
+    await lastValueFrom(ds.query({ targets: [selected], range } as DataQueryRequest<TempoQuery>));
     expect(fetchMock).toHaveBeenCalledTimes(calls);
 
     ds.clearAllProtectedKeys();
@@ -1848,6 +1855,54 @@ describe('protected datasource transport boundary', () => {
     await lastValueFrom(ds.query({ targets: [direct], range } as DataQueryRequest<TempoQuery>));
     const keyless = fetchMock.mock.calls.at(-1)![0] as { data: { queries: TempoQuery[] } };
     expect(keyless.data.queries[0].query).toBe(`${direct.query} | select(span.enc.password)`);
+  });
+
+  it('compiles raw and builder predicates with independent selected keys before dispatching any target', async () => {
+    const ds = new TempoDatasource(settings);
+    const oldKid = await ds.importProtectedKey(master);
+    const old = ds.protectedKey!;
+    const nextKid = await ds.importProtectedKey(Buffer.alloc(32, 7).toString('base64'));
+    const next = ds.protectedKey!;
+    const rawText = '{span.enc.password="abc" && span.enc.token="other" && span.http.route="public"}';
+    const [password, token] = protectedTraceQLPredicates(rawText);
+    const raw = await prepareProtectedQueryModel({
+      refId: 'A', queryType: 'traceql', query: rawText, filters: [],
+      protectedQueryKeys: [
+        { predicate: password.predicate, kid: oldKid },
+        { predicate: token.predicate, kid: nextKid },
+      ],
+    }, next, ds.uid);
+    const builder = await prepareProtectedQueryModel({
+      refId: 'B', queryType: 'traceqlSearch',
+      filters: [
+        { id: 'one', scope: TraceqlSearchScope.Span, tag: 'enc.password', operator: '=',
+          value: 'abc', protectedKeyId: oldKid },
+        { id: 'two', scope: TraceqlSearchScope.Span, tag: 'enc.token', operator: '=',
+          value: 'other', protectedKeyId: nextKid },
+        { id: 'public', scope: TraceqlSearchScope.Span, tag: 'http.route', operator: '=',
+          value: 'public', valueType: 'string' },
+      ],
+    }, next, ds.uid);
+    const oldPassword = old.encrypt('enc.password', 'abc');
+    const newToken = next.encrypt('enc.token', 'other');
+    await lastValueFrom(ds.query({ targets: [raw, builder], range } as DataQueryRequest<TempoQuery>));
+    const sent = fetchMock.mock.calls.at(-1)![0] as { data: { queries: TempoQuery[] } };
+    for (const target of sent.data.queries) {
+      expect(target.query).toContain(oldPassword);
+      expect(target.query).toContain(newToken);
+      expect(target.query).toContain('span.http.route="public"');
+    }
+    expect(JSON.stringify(sent)).not.toContain('"other"');
+    expect(JSON.stringify(sent)).not.toContain('"abc"');
+    expect(JSON.stringify(sent)).not.toContain('protectedKeyId');
+    expect(JSON.stringify(sent)).not.toContain('protectedQueryKeys');
+    const before = fetchMock.mock.calls.length;
+    await lastValueFrom(ds.query({ targets: [raw, { ...builder, filters: builder.filters.map((f) =>
+      f.id === 'two' ? { ...f, protectedKeyId: undefined } : f) }], range } as DataQueryRequest<TempoQuery>));
+    expect(fetchMock).toHaveBeenCalledTimes(before);
+    ds.clearProtectedKey(oldKid);
+    await lastValueFrom(ds.query({ targets: [raw, builder], range } as DataQueryRequest<TempoQuery>));
+    expect(fetchMock).toHaveBeenCalledTimes(before);
   });
 
   it('sends only compiled raw and builder targets in the entire HTTP payload and omits query telemetry', async () => {
@@ -2156,7 +2211,7 @@ describe('protected datasource transport boundary', () => {
     config.liveEnabled = true;
     const ds = new TempoDatasource(settings);
     ds.streamingEnabled = { search: true, metrics: true };
-    await ds.importProtectedKey(master);
+    const firstKid = await ds.importProtectedKey(master);
     const search = await prepareProtectedQueryModel(
       { refId: 'A', queryType: 'traceql', query: '{span.enc.password="abc"}', filters: [] },
       ds.protectedKey!,
@@ -2171,7 +2226,14 @@ describe('protected datasource transport boundary', () => {
     const secondEnvelope = ds.getProtectedKey(secondKid)!.encrypt('enc.password', 'abc');
     await lastValueFrom(
       ds.query({
-        targets: [search, metrics],
+        targets: [
+          { ...search, protectedQueryKeys: [
+            { predicate: protectedTraceQLPredicates('{span.enc.password="abc"}')[0].predicate, kid: firstKid },
+          ] },
+          { ...metrics, protectedQueryKeys: [
+            { predicate: protectedTraceQLPredicates('{span.enc.password="abc"} | rate()')[0].predicate, kid: secondKid },
+          ] },
+        ],
         scopedVars: { secret: { text: 'never-send-live', value: 'never-send-live' } },
         range,
         app: CoreApp.Explore,
@@ -2184,12 +2246,10 @@ describe('protected datasource transport boundary', () => {
     expect(calls.map((call) => call.path.split('/')[0]).sort()).toEqual(['metrics', 'search']);
     expect(searchCall.data.query).toContain(`"${attributeEnvelope}"`);
     expect(searchCall.data.query).toContain('| select(span.enc.password)');
-    expect(metricsCall.data.query).toContain(`"${attributeEnvelope}"`);
-    expect(metricsCall.data.query).not.toContain('| select(');
-    expect(searchCall.data.query).toContain(`"${secondEnvelope}"`);
     expect(metricsCall.data.query).toContain(`"${secondEnvelope}"`);
-    expect(searchCall.data.query).toContain(' || ');
-    expect(metricsCall.data.query).toContain(' || ');
+    expect(metricsCall.data.query).not.toContain('| select(');
+    expect(searchCall.data.query).not.toContain(`"${secondEnvelope}"`);
+    expect(metricsCall.data.query).not.toContain(`"${attributeEnvelope}"`);
     for (const call of [searchCall, metricsCall]) {
       expect(call.data).not.toHaveProperty('filters');
       expect(call.data).not.toHaveProperty('scopedVars');
@@ -2285,20 +2345,23 @@ describe('protected datasource transport boundary', () => {
       expect.anything()
     );
   });
-  it('uses all loaded keys for metadata but passes canonical ciphertext unchanged without any key', async () => {
+  it('requires an explicit contextual choice with multiple keys and sends no choice metadata to resources', async () => {
     const ds = new TempoDatasource(settings);
     await ds.importProtectedKey(master);
     const secondKid = await ds.importProtectedKey(Buffer.alloc(32, 7).toString('base64'));
     const secondEnvelope = ds.getProtectedKey(secondKid)!.encrypt('enc.password', 'abc');
     const resource = jest.spyOn(ds, 'getResource').mockResolvedValue({ data: { tagValues: [] } });
-    await ds.metadataRequest('tag-values', { q: '{span.enc.password="abc"}', tag: 'span.http.route' });
+    const q = '{span.enc.password="abc"}';
+    await expect(ds.metadataRequest('tag-values', { q, tag: 'span.http.route' })).rejects.toThrow();
+    expect(resource).not.toHaveBeenCalled();
+    const protectedQueryKeys = [{ predicate: protectedTraceQLPredicates(q)[0].predicate, kid: secondKid }];
+    await ds.metadataRequest('tag-values', { q, protectedQueryKeys, tag: 'span.http.route' });
     expect(resource).toHaveBeenCalledWith(
       'tag-values',
-      expect.objectContaining({
-        q: `{(span.enc.password="${attributeEnvelope}" || span.enc.password="${secondEnvelope}")}`,
-      }),
+      expect.objectContaining({ q: `{span.enc.password="${secondEnvelope}"}` }),
       expect.anything()
     );
+    expect(JSON.stringify(resource.mock.calls)).not.toContain('protectedQueryKeys');
     ds.clearAllProtectedKeys();
     resource.mockClear();
     await ds.metadataRequest('tag-values', {
@@ -2632,15 +2695,18 @@ describe('protected datasource transport boundary', () => {
       { ...settings, jsonData: { ...settings.jsonData, protectedAttributesSubstringEnabled: true } },
       identityTemplateSrv
     );
-    await ds.importProtectedKey(master);
-    await ds.importProtectedKey(Buffer.alloc(32, 7).toString('base64'));
+    const firstKid = await ds.importProtectedKey(master);
+    const secondKid = await ds.importProtectedKey(Buffer.alloc(32, 7).toString('base64'));
+    const rawText = '{span.enc.secret @> "cool"} | count_over_time()';
     const raw = await prepareProtectedQueryModel(
-      { refId: 'A', queryType: 'traceql', query: '{span.enc.secret @> "cool"} | count_over_time()', filters: [] },
+      { refId: 'A', queryType: 'traceql', query: rawText, filters: [],
+        protectedQueryKeys: [{ predicate: protectedTraceQLPredicates(rawText, true)[0].predicate, kid: firstKid }] },
       ds.protectedKey!, ds.uid, undefined, undefined, true
     );
     const builder = await prepareProtectedQueryModel(
       { refId: 'B', queryType: 'traceqlSearch', filters: [{
-        id: 'secret', tag: 'enc.secret', scope: TraceqlSearchScope.Span, operator: '!@>', value: 'cool', valueType: 'string',
+        id: 'secret', tag: 'enc.secret', scope: TraceqlSearchScope.Span, operator: '!@>', value: 'cool',
+        valueType: 'string', protectedKeyId: secondKid,
       }] },
       ds.protectedKey!, ds.uid, undefined, undefined, true
     );
@@ -2656,6 +2722,33 @@ describe('protected datasource transport boundary', () => {
     expect(body).toContain('zQb64aCXnVL2KksfrDxrQwVtdw6Ljmwxv37So9E7ghc');
     expect(sent.flatMap((request) => request.data.queries).find((target) => target.refId === 'B')?.query).toContain('| select(span.enc.secret)');
     expect(JSON.stringify(jest.mocked(reportInteraction).mock.calls)).not.toContain('cool');
+  });
+
+  it('cancels an in-flight selected-key substring compilation when the key epoch changes', async () => {
+    const ds = new TempoDatasource(
+      { ...settings, jsonData: { ...settings.jsonData, protectedAttributesSubstringEnabled: true } },
+      identityTemplateSrv
+    );
+    const selectedKid = await ds.importProtectedKey(master);
+    const key = ds.protectedKey!;
+    const text = '{span.enc.secret @> "cool"}';
+    const raw = await prepareProtectedQueryModel({
+      refId: 'A', queryType: 'traceql', query: text, filters: [],
+      protectedQueryKeys: [{ predicate: protectedTraceQLPredicates(text, true)[0].predicate, kid: selectedKid }],
+    }, key, ds.uid, undefined, undefined, true);
+    let release!: (value: string[]) => void;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    jest.spyOn(key, 'substringTokens').mockImplementation(() => {
+      entered();
+      return new Promise<string[]>((resolve) => { release = resolve; });
+    });
+    const pending = lastValueFrom(ds.query({ targets: [raw], range } as DataQueryRequest<TempoQuery>));
+    await started;
+    ds.clearProtectedKey(selectedKid);
+    release(['bi:v1:cancelled']);
+    await pending;
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('fails disabled, keyless, short, host-variable, and array substring requests before HTTP or Live', async () => {
@@ -2722,13 +2815,18 @@ describe('protected datasource transport boundary', () => {
       ...settings.jsonData, protectedAttributesSubstringEnabled: true, streamingEnabled: { search: true },
     } }, identityTemplateSrv);
     ds.streamingEnabled = { search: true, metrics: true };
-    await ds.importProtectedKey(master);
+    const firstKid = await ds.importProtectedKey(master);
+    const secondKid = await ds.importProtectedKey(Buffer.alloc(32, 7).toString('base64'));
+    const searchText = '{span.enc.secret @> "cool"}';
+    const metricsText = '{span.enc.secret @> "cool"} | count_over_time()';
     const search = await prepareProtectedQueryModel(
-      { refId: 'A', queryType: 'traceql', query: '{span.enc.secret @> "cool"}', filters: [] },
+      { refId: 'A', queryType: 'traceql', query: searchText, filters: [],
+        protectedQueryKeys: [{ predicate: protectedTraceQLPredicates(searchText, true)[0].predicate, kid: firstKid }] },
       ds.protectedKey!, ds.uid, undefined, undefined, true
     );
     const metrics = await prepareProtectedQueryModel(
-      { refId: 'B', queryType: 'traceql', query: '{span.enc.secret @> "cool"} | count_over_time()', filters: [] },
+      { refId: 'B', queryType: 'traceql', query: metricsText, filters: [],
+        protectedQueryKeys: [{ predicate: protectedTraceQLPredicates(metricsText, true)[0].predicate, kid: secondKid }] },
       ds.protectedKey!, ds.uid, undefined, undefined, true
     );
     await lastValueFrom(ds.query({ targets: [search, metrics], range, app: CoreApp.Explore } as DataQueryRequest<TempoQuery>));
@@ -2739,6 +2837,11 @@ describe('protected datasource transport boundary', () => {
       expect(JSON.stringify(call.data)).not.toContain('qenc:v1:');
       expect(call.data.query).toContain('span."bi.secret" subarray_seq [');
     }
+    const firstTokens = await ds.getProtectedKey(firstKid)!.substringTokens('enc.secret', 'cool');
+    const secondTokens = await ds.getProtectedKey(secondKid)!.substringTokens('enc.secret', 'cool');
+    expect(calls.find((call) => call.path.startsWith('search/'))?.data.query).toContain(JSON.stringify(firstTokens));
+    expect(calls.find((call) => call.path.startsWith('metrics/'))?.data.query).toContain(JSON.stringify(secondTokens));
+    expect(calls.find((call) => call.path.startsWith('search/'))?.data.query).not.toContain(JSON.stringify(secondTokens));
     expect(calls.find((call) => call.path.startsWith('search/'))?.data.query).toContain('| select(span.enc.secret)');
     expect(calls.find((call) => call.path.startsWith('metrics/'))?.data.query).not.toContain('| select(');
     expect(fetchMock).not.toHaveBeenCalled();

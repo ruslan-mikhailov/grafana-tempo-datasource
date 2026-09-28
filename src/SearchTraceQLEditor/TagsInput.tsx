@@ -32,6 +32,8 @@ interface Props {
   updateFilter: (f: TraceqlFilter) => void;
   deleteFilter: (f: TraceqlFilter) => void;
   generateQueryWithoutFilter: (f?: TraceqlFilter) => string;
+  getProtectedQueryKeys?: (f?: TraceqlFilter) => Array<{ predicate: string; kid: string }> | undefined;
+  protectedKeyLabel?: (kid: string) => string;
   filters: TraceqlFilter[];
   datasource: TempoDatasource;
   setError: (error: FetchError | null) => void;
@@ -56,6 +58,8 @@ const TagsInput = ({
   showLabels,
   requireTagAndValue,
   generateQueryWithoutFilter,
+  getProtectedQueryKeys,
+  protectedKeyLabel,
   addVariablesToOptions,
   range,
   timeRangeForTags,
@@ -96,6 +100,8 @@ const TagsInput = ({
             hideValue={hideValues}
             showLabel={showLabels}
             query={generateQueryWithoutFilter(f)}
+            protectedQueryKeys={getProtectedQueryKeys?.(f)}
+            protectedKeyLabel={protectedKeyLabel}
             addVariablesToOptions={addVariablesToOptions}
             range={range}
             timeRangeForTags={timeRangeForTags}

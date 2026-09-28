@@ -32,6 +32,7 @@ const adHocOperators = ['=', '!=', '>', '<', '>=', '<=', '=~', '!~'];
 interface GetOptionsV2 {
   tag: string;
   query?: string;
+  protectedQueryKeys?: Array<{ predicate: string; kid: string }>;
   timeRangeForTags?: number;
   range?: TimeRange;
 }
@@ -150,18 +151,21 @@ export default class TempoLanguageProvider extends LanguageProvider {
     return [];
   };
 
-  async getOptionsV2({ tag, query, timeRangeForTags, range }: GetOptionsV2): Promise<Array<SelectableValue<string>>> {
+  async getOptionsV2({ tag, query, protectedQueryKeys, timeRangeForTags, range }: GetOptionsV2): Promise<Array<SelectableValue<string>>> {
     if (this.datasource.instanceSettings.jsonData.protectedAttributesEnabled && isProtectedTagValueRequest(tag)) {
       // Do not request or cache frequency dictionaries containing ciphertext.
       return [];
     }
     const encodedTag = this.encodeTag(tag);
-    const params: { q?: string; limit: number; start?: number; end?: number; tag?: string } = {
+    const params: { q?: string; protectedQueryKeys?: Array<{ predicate: string; kid: string }>; limit: number; start?: number; end?: number; tag?: string } = {
       limit: this.getTagsLimit(),
     };
 
     if (query) {
       params.q = query;
+      if (protectedQueryKeys?.length) {
+        params.protectedQueryKeys = protectedQueryKeys;
+      }
     }
 
     if (timeRangeForTags && range && timeRangeForTags !== DEFAULT_TIME_RANGE_FOR_TAGS) {

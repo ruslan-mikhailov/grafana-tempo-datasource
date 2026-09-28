@@ -3,7 +3,7 @@ import { type TempoQuery } from '../types';
 import { intrinsics } from '../traceql/traceql';
 
 import { type ProtectedAttributeKey } from './crypto';
-import { classifyProtectedTraceQL, isEncryptedAttributeEnvelope } from './traceql';
+import { classifyProtectedTraceQL, isEncryptedAttributeEnvelope, protectedTraceQLPredicates } from './traceql';
 
 // The shortest envelope seals an empty value: 12-byte nonce and 16-byte tag.
 // The canonical base64url spelling is checked here; opening authenticates it.
@@ -98,6 +98,12 @@ function assertFilterShape(filter: TraceqlFilter, substringEnabled = false): voi
   if (filter.operator && !builderOperators.includes(filter.operator)) {
     throw unsafe();
   }
+  if (filter.protectedKeyId !== undefined &&
+    (!/^[0-9a-f]{32}$/.test(filter.protectedKeyId) ||
+      !classifyProtectedFilter(filter).protectedReference ||
+      !['=', '!=', '@>', '!@>'].includes(filter.operator ?? ''))) {
+    throw unsafe();
+  }
   const { requiresSealing, dynamicReference, protectedReference } = classifyProtectedFilter(filter);
   if ((filter.operator === '@>' || filter.operator === '!@>') &&
     (Array.isArray(filter.value) || dynamicReference ||
@@ -182,6 +188,28 @@ export function assertProtectedQueryModelSafe(model: TempoQuery, kids?: string |
     throw unsafe();
   }
   assertNoLegacyCarriers(model);
+  if (model.protectedQueryKeys !== undefined) {
+    if (!Array.isArray(model.protectedQueryKeys) || model.queryType !== 'traceql' ||
+      model.protectedQueryKeys.some((item) => {
+        if (!item || typeof item.predicate !== 'string' || !/^[0-9a-f]{32}$/.test(item.kid)) {
+          return true;
+        }
+        try {
+          const identity = JSON.parse(item.predicate);
+          return !Array.isArray(identity) || identity.length !== 4 ||
+            !Number.isSafeInteger(identity[0]) || identity[0] < 0 ||
+            !Number.isSafeInteger(identity[1]) || identity[1] <= identity[0] ||
+            typeof identity[2] !== 'string' || !identity[2].startsWith('enc.') ||
+            !['=', '!=', '@>', '!@>'].includes(identity[3]) ||
+            JSON.stringify(identity) !== item.predicate;
+        } catch {
+          return true;
+        }
+      }) ||
+      new Set(model.protectedQueryKeys.map((item) => item.predicate)).size !== model.protectedQueryKeys.length) {
+      throw unsafe();
+    }
+  }
   if (model.query) {
     if (model.query.startsWith('qenc:')) {
       if (!isProtectedModelEnvelope(model.query)) {
@@ -217,6 +245,32 @@ function isDirectEncryptedFilter(filter: TraceqlFilter, value: string): boolean 
     (filter.operator === '=' || filter.operator === '!=') &&
     isEncryptedAttributeEnvelope(value)
   );
+}
+
+/** The builder emits protected predicates in filter order, including each multi-value arm. */
+export function protectedFilterSelections(query: string, filters: TraceqlFilter[], substringEnabled = false): Array<{ predicate: string; kid: string }> {
+  const predicates = protectedTraceQLPredicates(query, substringEnabled);
+  const selections: Array<{ predicate: string; kid: string }> = [];
+  let cursor = 0;
+  for (const filter of filters) {
+    if (filter.value === undefined || !classifyProtectedFilter(filter).protectedReference) {
+      continue;
+    }
+    const count = Array.isArray(filter.value) ? filter.value.length : 1;
+    const assigned = predicates.slice(cursor, cursor + count);
+    if (assigned.length !== count || assigned.some((predicate) =>
+      predicate.field !== decodedBuilderTag(filter.tag ?? '') || predicate.operator !== filter.operator)) {
+      throw unsafe();
+    }
+    if (filter.protectedKeyId) {
+      selections.push(...assigned.map((predicate) => ({ predicate: predicate.predicate, kid: filter.protectedKeyId! })));
+    }
+    cursor += count;
+  }
+  if (cursor !== predicates.length) {
+    throw unsafe();
+  }
+  return selections;
 }
 
 type KeyLookup = ProtectedAttributeKey | ((kid: string) => ProtectedAttributeKey | undefined) | undefined;

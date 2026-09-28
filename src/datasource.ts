@@ -63,6 +63,7 @@ import {
   isProtectedTagValueRequest,
   isVariableBearing,
   openProtectedQueryModel,
+  protectedFilterSelections,
 } from './protectedAttributes/model';
 import {
   classifyProtectedTraceQL,
@@ -802,6 +803,10 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
           throw new Error('Invalid trace ID query.');
         }
 
+        let selections = opened.protectedQueryKeys ?? [];
+        if (protectedEnabled && queryType === 'traceqlSearch' && query) {
+          selections = protectedFilterSelections(query, opened.filters ?? [], !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
+        }
         const metrics = queryType === 'traceql' && query && !this.isTraceIdQuery(query)
           ? this.isTraceQlMetricsQuery(query)
           : false;
@@ -811,7 +816,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
           query &&
           !this.isTraceIdQuery(query)
         ) {
-          query = await rewriteProtectedTraceQL(query, keys, metrics ? 'metrics' : 'search', !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
+          query = await rewriteProtectedTraceQL(query, keys, metrics ? 'metrics' : 'search', !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled, selections);
         }
         // Only backend/Live protocol fields cross the boundary, never editor, legacy,
         // ad-hoc, qenc, or arbitrary host model properties.
@@ -1338,6 +1343,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
 
   async metadataRequest(url: string, params: Record<string, unknown> = {}) {
     const protectedConfigured = !!this.instanceSettings.jsonData.protectedAttributesEnabled;
+    const epoch = this.keyEpoch;
     try {
       if (url.startsWith('/') || (protectedConfigured && url.includes('?'))) {
         throw new Error('Invalid metadata request path.');
@@ -1357,6 +1363,10 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
           }
         }
       }
+      if (protectedConfigured && params.protectedQueryKeys !== undefined &&
+        (!Array.isArray(params.protectedQueryKeys) || typeof q !== 'string' || !q)) {
+        throw new Error('Invalid contextual key selection.');
+      }
       if (q !== undefined && typeof q !== 'string') {
         throw new Error('Invalid contextual query.');
       }
@@ -1370,7 +1380,11 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
             : this.templateSrv.replace(q, {}, VariableFormatID.Pipe)
           : undefined;
       if (protectedConfigured && finalQuery) {
-        finalQuery = await rewriteProtectedTraceQL(finalQuery, this.protectedKeys, 'metadata', !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
+        finalQuery = await rewriteProtectedTraceQL(finalQuery, this.protectedKeys, 'metadata', !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled,
+          Array.isArray(params.protectedQueryKeys) ? params.protectedQueryKeys : []);
+        if (this.keyEpoch !== epoch) {
+          throw new Error('Protected key changed during metadata preparation.');
+        }
       }
       const safeParams = { limit, start, end, tag, ...(finalQuery !== undefined && { q: finalQuery }) };
       const res = await this.getResource(url, safeParams, { method: 'GET', hideFromInspector: true });

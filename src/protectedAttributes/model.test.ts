@@ -9,8 +9,10 @@ import {
   assertStaticProtectedFilterDefaultsSafe,
   classifyProtectedFilter,
   openProtectedQueryModel,
+  protectedFilterSelections,
   prepareProtectedQueryModel,
 } from './model';
+import { protectedTraceQLPredicates } from './traceql';
 
 const uid = 'tempo-uid';
 const master = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
@@ -62,6 +64,28 @@ test('host raw query stays plain only for a fixed ordinary field; protected and 
   expect(dynamic.query).toMatch(/^qenc:v1:/);
   expect((await openProtectedQueryModel(dynamic, key, uid)).query).toBe(variableName.query);
   expect(() => assertProtectedQueryModelSafe(variableName, kid)).toThrow();
+});
+
+test('sealed raw and builder models carry only predicate-bound key IDs, not plaintext or master keys', async () => {
+  const old = await importKey(master);
+  const other = await importKey(Buffer.alloc(32, 7).toString('base64'));
+  const raw = '{span.enc.password="private"}';
+  const predicate = protectedTraceQLPredicates(raw)[0].predicate;
+  const saved = await prepareProtectedQueryModel({ ...query(raw), protectedQueryKeys: [{ predicate, kid: other.kid }] }, old, uid);
+  expect(saved.query).toMatch(/^qenc:v1:/);
+  expect(saved.protectedQueryKeys).toEqual([{ predicate, kid: other.kid }]);
+  expect(JSON.stringify(saved)).not.toContain('private');
+  expect((await openProtectedQueryModel(saved, old, uid)).protectedQueryKeys).toEqual(saved.protectedQueryKeys);
+  const filters = [protectedFilter('private'), { ...protectedFilter('other'), id: 'token', tag: 'enc.token', protectedKeyId: other.kid }];
+  const builderQuery = '{span.enc.password="private" && span.enc.token="other"}';
+  expect(protectedFilterSelections(builderQuery, filters)).toEqual([
+    { predicate: protectedTraceQLPredicates(builderQuery)[1].predicate, kid: other.kid },
+  ]);
+  expect(() => assertProtectedQueryModelSafe({ ...saved, protectedQueryKeys: [
+    { predicate, kid: 'invalid' },
+  ] })).toThrow();
+  const direct = old.encrypt('enc.password', 'private');
+  expect(() => assertProtectedQueryModelSafe(query('', [{ ...protectedFilter(direct), protectedKeyId: 'invalid' }]))).toThrow();
 });
 
 test('each protected filter array element authenticates against its filter ID and original index', async () => {

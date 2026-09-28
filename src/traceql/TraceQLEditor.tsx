@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { type GrafanaTheme2, type TimeRange } from '@grafana/data';
 import { TemporaryAlert } from '@grafana/o11y-ds-frontend';
 import { reportInteraction } from '@grafana/runtime';
-import { Button, CodeEditor, type Monaco, type monacoTypes, useTheme2 } from '@grafana/ui';
+import { Button, CodeEditor, Select, type Monaco, type monacoTypes, useTheme2 } from '@grafana/ui';
 
 import { DEFAULT_TIME_RANGE_FOR_TAGS } from '../configuration/TagsTimeRangeSettings';
 import { type TempoDatasource } from '../datasource';
@@ -13,6 +13,7 @@ import {
   openProtectedQueryModel,
   prepareProtectedQueryModel,
 } from '../protectedAttributes/model';
+import { assertProtectedTraceQLKeyChoices, protectedTraceQLPredicates, rebaseProtectedTraceQLKeys, type ProtectedTraceQLPredicate } from '../protectedAttributes/traceql';
 import { type TempoQuery } from '../types';
 
 import { CompletionProvider, type CompletionItemType } from './autocomplete';
@@ -25,6 +26,7 @@ interface Props {
   onChange: (val: TempoQuery) => void;
   onRunQuery: () => void;
   onPendingChange?: (pending: boolean) => void;
+  protectedKeyLabel?: (kid: string) => string;
   datasource: TempoDatasource;
   readOnly?: boolean;
   range?: TimeRange;
@@ -40,6 +42,7 @@ export function TraceQLEditor(props: Props) {
   );
   const [draftPending, setDraftPending] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const [choices, setChoices] = useState(() => props.query.protectedQueryKeys ?? []);
 
   const { query, onChange, onRunQuery, placeholder } = props;
   const setupAutocompleteFn = useAutocomplete(
@@ -59,18 +62,23 @@ export function TraceQLEditor(props: Props) {
   queryRef.current = query;
   const generation = useRef(0);
   const savedEnvelope = useRef<string | undefined>(undefined);
+  const savedChoices = useRef(JSON.stringify(query.protectedQueryKeys ?? []));
   const savedKey = useRef(props.datasource.protectedKey);
   const [legacy, setLegacy] = useState(false);
   const committed = useRef(true);
   const protectedMode = props.datasource.instanceSettings?.jsonData?.protectedAttributesEnabled;
   const key = props.datasource.protectedKey;
+  const queryChoices = JSON.stringify(query.protectedQueryKeys ?? []);
 
   useEffect(() => {
     // A host acknowledgement of our own seal must not replace a newer Monaco draft.
-    if (savedKey.current === key && savedEnvelope.current !== undefined && savedEnvelope.current === query.query) {
+    if (savedKey.current === key && savedEnvelope.current !== undefined &&
+      savedEnvelope.current === query.query && savedChoices.current === queryChoices) {
       return;
     }
     const current = ++generation.current;
+    setChoices(query.protectedQueryKeys ?? []);
+    savedChoices.current = queryChoices;
     if (!protectedMode) {
       setDraft(query.query || '');
       setLocked(false);
@@ -127,7 +135,7 @@ export function TraceQLEditor(props: Props) {
     );
     // A new model increments generation at the beginning of this effect;
     // an acknowledgement of our own seal must not invalidate a newer edit.
-  }, [query.query, protectedMode, key, props.datasource.uid]);
+  }, [query.query, queryChoices, protectedMode, key, props.datasource.uid]);
 
   useEffect(
     () => () => {
@@ -140,8 +148,8 @@ export function TraceQLEditor(props: Props) {
   }, [locked, dirty, props.onPendingChange]);
   useEffect(() => () => props.onPendingChange?.(false), [props.onPendingChange]);
 
-  const editorChangeRef = useRef<(value: string) => void>(() => {});
-  editorChangeRef.current = (value: string) => {
+  const editorChangeRef = useRef<(value: string, selected?: TempoQuery['protectedQueryKeys']) => void>(() => {});
+  editorChangeRef.current = (value: string, selected?: TempoQuery['protectedQueryKeys']) => {
     if (locked || props.readOnly) {
       return;
     }
@@ -150,8 +158,19 @@ export function TraceQLEditor(props: Props) {
     props.onPendingChange?.(true);
     committed.current = false;
     const current = ++generation.current;
+    const epoch = props.datasource.protectedKeyEpoch;
     setDraftPending(false);
-    const candidate = { ...queryRef.current, query: value };
+    let retained = selected ?? choices;
+    if (!selected && value !== draft) {
+      try {
+        retained = rebaseProtectedTraceQLKeys(draft, value, choices,
+          !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
+      } catch {
+        retained = [];
+      }
+    }
+    const candidate = { ...queryRef.current, query: value, protectedQueryKeys: retained };
+    setChoices(retained);
     if (!protectedMode) {
       onChange(candidate);
       committed.current = true;
@@ -160,6 +179,10 @@ export function TraceQLEditor(props: Props) {
       return;
     }
     try {
+      if (value && !/^[0-9A-Fa-f]*$/.test(value.trim())) {
+        assertProtectedTraceQLKeyChoices(value, props.datasource.protectedKeys ?? (key ? [key] : []), retained,
+          !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
+      }
       if (!key) {
         assertProtectedQueryModelSafe(candidate, undefined, !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
         onChange(candidate);
@@ -178,11 +201,12 @@ export function TraceQLEditor(props: Props) {
         !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
       ).then(
         (sealed) => {
-          if (generation.current !== current || props.datasource.protectedKey !== key) {
+          if (generation.current !== current || props.datasource.protectedKey !== key || props.datasource.protectedKeyEpoch !== epoch) {
             return;
           }
           savedEnvelope.current = sealed.query;
           savedKey.current = key;
+          savedChoices.current = JSON.stringify(sealed.protectedQueryKeys ?? []);
           onChange(sealed);
           committed.current = true;
           setDraftPending(false);
@@ -214,6 +238,15 @@ export function TraceQLEditor(props: Props) {
     }
   };
 
+  let predicates: ProtectedTraceQLPredicate[] = [];
+  if (protectedMode && !locked && !props.readOnly && (props.datasource.protectedKeys ?? (key ? [key] : [])).length > 1) {
+    try {
+      predicates = protectedTraceQLPredicates(draft,
+        !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled).filter((predicate) => predicate.keyRequired);
+    } catch {
+      // Partial editor drafts remain local until valid.
+    }
+  }
   const errorTimeoutId = useRef<number | undefined>(undefined);
 
   return (
@@ -298,6 +331,24 @@ export function TraceQLEditor(props: Props) {
           });
         }}
       />
+      {predicates.map((predicate) => (
+        <div key={predicate.predicate}>
+          <Select
+            aria-label={`Select protected key for ${predicate.field} at ${predicate.from}`}
+            placeholder="Choose key"
+            options={(props.datasource.protectedKeys ?? (key ? [key] : [])).map((item) => ({ label: props.protectedKeyLabel?.(item.kid) ?? `${item.kid.slice(0, 8)}…${item.kid.slice(-6)}`, value: item.kid }))}
+            value={choices.find((choice) => choice.predicate === predicate.predicate)?.kid}
+            isClearable
+            onChange={(choice) => {
+              const next = choices.filter((item) => item.predicate !== predicate.predicate);
+              if (choice?.value) {
+                next.push({ predicate: predicate.predicate, kid: choice.value });
+              }
+              editorChangeRef.current(draft, next);
+            }}
+          />
+        </div>
+      ))}
       {locked && <TemporaryAlert severity="info" text="Import the matching key to unlock this query" />}
       {legacy && key && (
         <Button
@@ -308,6 +359,7 @@ export function TraceQLEditor(props: Props) {
               return;
             }
             const current = ++generation.current;
+            const epoch = props.datasource.protectedKeyEpoch;
             void prepareProtectedQueryModel(
               queryRef.current,
               currentKey,
@@ -317,7 +369,8 @@ export function TraceQLEditor(props: Props) {
               !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
             ).then(
               (sealed) => {
-                if (generation.current === current && props.datasource.protectedKey === currentKey) {
+                if (generation.current === current && props.datasource.protectedKey === currentKey &&
+                  props.datasource.protectedKeyEpoch === epoch) {
                   savedEnvelope.current = sealed.query;
                   savedKey.current = currentKey;
                   onChange(sealed);

@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 
 import { TraceqlSearchScope, type TraceqlFilter } from '../dataquery';
 import { type TempoDatasource } from '../datasource';
+import TempoLanguageProvider from '../language_provider';
 import { initTemplateSrv } from '../test/test_utils';
 import { type TempoQuery } from '../types';
 
@@ -56,15 +57,14 @@ test('overlapping protected value edits never emit plaintext or let an earlier s
     protectedKey: key,
     instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
     search: { filters: [filter] },
-    languageProvider: {
-      start: jest.fn().mockResolvedValue(undefined),
-      getIntrinsics: jest.fn().mockReturnValue([]),
-      generateQueryFromFilters: jest.fn().mockReturnValue('{}'),
-    },
+    languageProvider: {} as TempoLanguageProvider,
     isStreamingSearchEnabled: () => false,
     isStreamingMetricsEnabled: () => false,
   } as unknown as TempoDatasource;
-  Object.assign(datasource.languageProvider, { datasource });
+  const provider = new TempoLanguageProvider(datasource);
+  provider.start = jest.fn().mockResolvedValue(undefined);
+  provider.getIntrinsics = jest.fn().mockReturnValue([]);
+  datasource.languageProvider = provider;
   const saved: TempoQuery = { refId: 'A', queryType: 'traceqlSearch', filters: [] };
   const hostChange = jest.fn();
   render(<TraceQLSearch datasource={datasource} query={saved} onChange={hostChange} onClearResults={() => {}} />);

@@ -11,7 +11,9 @@ import {
   assertProtectedQueryModelSafe,
   openProtectedQueryModel,
   prepareProtectedQueryModel,
+  protectedFilterSelections,
 } from '../protectedAttributes/model';
+import { assertProtectedTraceQLKeyChoices } from '../protectedAttributes/traceql';
 import { defaultQuery, type MyDataSourceOptions, type TempoQuery } from '../types';
 
 import { TempoQueryBuilderOptions } from './TempoQueryBuilderOptions';
@@ -20,6 +22,7 @@ import { TraceQLEditor } from './TraceQLEditor';
 type EditorProps = {
   onClearResults: () => boolean | void;
   onPendingChange?: (pending: boolean) => void;
+  protectedKeyLabel?: (kid: string) => string;
 };
 
 type Props = EditorProps & QueryEditorProps<TempoDatasource, TempoQuery, MyDataSourceOptions>;
@@ -61,6 +64,7 @@ export function QueryEditor(props: Props) {
   );
   const copyFromSearch = async () => {
     const current = ++generation.current;
+    const epoch = props.datasource.protectedKeyEpoch;
     const original = query;
     copyPending.current = true;
     props.onPendingChange?.(true);
@@ -85,7 +89,15 @@ export function QueryEditor(props: Props) {
       const raw = props.datasource.languageProvider.generateQueryFromFilters({
         traceqlFilters: opened.filters || [],
       });
-      const candidate: TempoQuery = { ...query, query: raw, queryType: 'traceql' };
+      const choices = protectedMode
+        ? protectedFilterSelections(raw, opened.filters ?? [],
+            !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled)
+        : [];
+      if (protectedMode) {
+        assertProtectedTraceQLKeyChoices(raw, props.datasource.protectedKeys ?? (key ? [key] : []), choices,
+          !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
+      }
+      const candidate: TempoQuery = { ...query, query: raw, queryType: 'traceql', protectedQueryKeys: choices };
       const sealed =
         protectedMode && key
           ? await prepareProtectedQueryModel(
@@ -108,7 +120,7 @@ export function QueryEditor(props: Props) {
         generation.current === current &&
         latestQuery.current === original &&
         !rawPending.current &&
-        (!protectedMode || props.datasource.protectedKey === key)
+        (!protectedMode || (props.datasource.protectedKey === key && props.datasource.protectedKeyEpoch === epoch))
       ) {
         copyPending.current = false;
         props.onPendingChange?.(false);
@@ -177,6 +189,7 @@ export function QueryEditor(props: Props) {
         onChange={props.onChange}
         onPendingChange={onRawPendingChange}
         datasource={props.datasource}
+        protectedKeyLabel={props.protectedKeyLabel}
         onRunQuery={props.onRunQuery}
         range={props.range}
       />

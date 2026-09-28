@@ -14,7 +14,9 @@ import {
   assertStaticProtectedFilterDefaultsSafe,
   openProtectedQueryModel,
   prepareProtectedQueryModel,
+  protectedFilterSelections,
 } from '../protectedAttributes/model';
+import { assertProtectedTraceQLKeyChoices } from '../protectedAttributes/traceql';
 import { TempoQueryBuilderOptions } from '../traceql/TempoQueryBuilderOptions';
 import { traceqlGrammar } from '../traceql/traceql';
 import { type TempoQuery } from '../types';
@@ -31,6 +33,7 @@ interface Props {
   query: TempoQuery;
   onChange: (value: TempoQuery) => void;
   onPendingChange?: (pending: boolean) => void;
+  protectedKeyLabel?: (kid: string) => string;
   onBlur?: () => void;
   onClearResults: () => boolean | void;
   app?: CoreApp;
@@ -45,6 +48,7 @@ const TraceQLSearch = ({
   query,
   onChange,
   onPendingChange,
+  protectedKeyLabel,
   onClearResults,
   app,
   addVariablesToOptions = true,
@@ -194,6 +198,7 @@ const TraceQLSearch = ({
       }
       onPendingChange?.(true);
       const current = ++generation.current;
+      const epoch = datasource.protectedKeyEpoch;
       if (!protectedMode) {
         savedModel.current = next;
         savedKey.current = key;
@@ -205,6 +210,12 @@ const TraceQLSearch = ({
       }
       setPending(true);
       try {
+        const generated = datasource.languageProvider.generateQueryFromFilters({ traceqlFilters: next.filters ?? [] });
+        if (generated) {
+          const substring = !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled;
+          assertProtectedTraceQLKeyChoices(generated, datasource.protectedKeys ?? (key ? [key] : []),
+            protectedFilterSelections(generated, next.filters ?? [], substring), substring);
+        }
         if (!key) {
           assertProtectedQueryModelSafe(next, undefined, !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
           savedKey.current = key;
@@ -225,7 +236,7 @@ const TraceQLSearch = ({
           !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
         ).then(
           (sealed) => {
-            if (generation.current !== current || datasource.protectedKey !== key) {
+            if (generation.current !== current || datasource.protectedKey !== key || datasource.protectedKeyEpoch !== epoch) {
               return;
             }
             savedKey.current = key;
@@ -361,6 +372,20 @@ const TraceQLSearch = ({
     }
   };
 
+  const contextualChoices = (filter?: TraceqlFilter) => {
+    const context = generateQueryWithoutFilter(filter);
+    if (!protectedMode || !context) {
+      return undefined;
+    }
+    try {
+      return protectedFilterSelections(context,
+        (draftModel.filters ?? []).filter((item) => item.id !== filter?.id),
+        !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
+    } catch {
+      return undefined;
+    }
+  };
+
   return (
     <>
       {locked ? (
@@ -378,6 +403,7 @@ const TraceQLSearch = ({
                   return;
                 }
                 const current = ++generation.current;
+                const epoch = datasource.protectedKeyEpoch;
                 void prepareProtectedQueryModel(
                   query,
                   currentKey,
@@ -387,7 +413,8 @@ const TraceQLSearch = ({
                   !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
                 ).then(
                   (sealed) => {
-                    if (generation.current === current && datasource.protectedKey === currentKey) {
+                    if (generation.current === current && datasource.protectedKey === currentKey &&
+                      datasource.protectedKeyEpoch === epoch) {
                       savedModel.current = undefined;
                       onChange(sealed);
                     }
@@ -423,6 +450,8 @@ const TraceQLSearch = ({
                       hideScope={true}
                       hideTag={true}
                       query={generateQueryWithoutFilter(findFilter(f.id))}
+                      protectedQueryKeys={contextualChoices(findFilter(f.id))}
+                      protectedKeyLabel={protectedKeyLabel}
                       addVariablesToOptions={addVariablesToOptions}
                       range={range}
                       timeRangeForTags={datasource.timeRangeForTags}
@@ -447,6 +476,8 @@ const TraceQLSearch = ({
                 hideScope={true}
                 hideTag={true}
                 query={generateQueryWithoutFilter(findFilter('status'))}
+                protectedQueryKeys={contextualChoices(findFilter('status'))}
+                protectedKeyLabel={protectedKeyLabel}
                 isMulti={false}
                 allowCustomValue={false}
                 addVariablesToOptions={addVariablesToOptions}
@@ -511,6 +542,8 @@ const TraceQLSearch = ({
                 staticTags={staticTags}
                 isTagsLoading={isTagsLoading}
                 generateQueryWithoutFilter={generateQueryWithoutFilter}
+                getProtectedQueryKeys={contextualChoices}
+                protectedKeyLabel={protectedKeyLabel}
                 requireTagAndValue={true}
                 addVariablesToOptions={addVariablesToOptions}
                 range={range}
@@ -548,11 +581,20 @@ const TraceQLSearch = ({
                 setCopyPending(true);
                 onPendingChange?.(true);
                 const current = ++generation.current;
+                const epoch = datasource.protectedKeyEpoch;
                 try {
                   const raw = datasource.languageProvider.generateQueryFromFilters({
                     traceqlFilters: draftRef.current.filters || [],
                   });
-                  const candidate: TempoQuery = { ...query, query: raw, queryType: 'traceql' };
+                  const chosen = protectedMode
+                    ? protectedFilterSelections(raw, draftRef.current.filters || [],
+                        !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled)
+                    : [];
+                  if (protectedMode) {
+                    assertProtectedTraceQLKeyChoices(raw, datasource.protectedKeys ?? (key ? [key] : []), chosen,
+                      !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
+                  }
+                  const candidate: TempoQuery = { ...query, query: raw, queryType: 'traceql', protectedQueryKeys: chosen };
                   const result =
                     protectedMode && key
                       ? prepareProtectedQueryModel(
@@ -569,7 +611,8 @@ const TraceQLSearch = ({
                       if (protectedMode) {
                         assertProtectedQueryModelSafe(sealed, key?.kid, !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
                       }
-                      if (generation.current === current && (!protectedMode || datasource.protectedKey === key)) {
+                      if (generation.current === current && (!protectedMode ||
+                        (datasource.protectedKey === key && datasource.protectedKeyEpoch === epoch))) {
                         copyPendingRef.current = false;
                         setCopyPending(false);
                         onPendingChange?.(false);

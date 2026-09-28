@@ -45,6 +45,78 @@ export function isEncryptedAttributeEnvelope(value: string): boolean {
 type Edit = { from: number; to: number; text: string };
 type Predicate = { field: string; lhs: SyntaxNode; rhs: SyntaxNode; comparison: SyntaxNode; op: '=' | '!=' | '@>' | '!@>' };
 type Attribute = { field: string; protected: boolean; dynamic: boolean };
+export interface ProtectedTraceQLPredicate {
+  predicate: string;
+  field: string;
+  operator: string;
+  from: number;
+  to: number;
+  keyRequired: boolean;
+}
+/** Positions plus field/operator prevent a moved predicate inheriting another predicate's choice. */
+export function protectedTraceQLPredicates(query: string, substringEnabled = false): ProtectedTraceQLPredicate[] {
+  return inspect(query, false, substringEnabled).predicates.map(({ field, op, rhs, comparison }) => ({
+    predicate: JSON.stringify([comparison.from, comparison.to, field, op]),
+    field,
+    operator: op,
+    keyRequired: op === '@>' || op === '!@>' || !isEncryptedAttributeEnvelope(literal(rhs, query)),
+    from: comparison.from,
+    to: comparison.to,
+  }));
+}
+/** Reject incomplete or forgotten choices before a plaintext draft can reach host onChange. */
+export function assertProtectedTraceQLKeyChoices(
+  query: string,
+  keys: readonly { kid: string }[],
+  choices: readonly { predicate: string; kid: string }[],
+  substringEnabled = false
+): void {
+  const predicates = protectedTraceQLPredicates(query, substringEnabled);
+  const chosen = new Map<string, string>();
+  for (const choice of choices) {
+    if (!/^[0-9a-f]{32}$/.test(choice.kid) || chosen.has(choice.predicate) ||
+      !predicates.some((item) => item.predicate === choice.predicate) ||
+      !keys.some((key) => key.kid === choice.kid)) {
+      invalid();
+    }
+    chosen.set(choice.predicate, choice.kid);
+  }
+  if (predicates.some((predicate) => predicate.keyRequired && !chosen.has(predicate.predicate) && keys.length !== 1)) {
+    invalid();
+  }
+}
+/** Rebind only unchanged, unambiguous predicate text after a local editor edit. */
+export function rebaseProtectedTraceQLKeys(
+  previous: string,
+  next: string,
+  choices: readonly { predicate: string; kid: string }[],
+  substringEnabled = false
+): Array<{ predicate: string; kid: string }> {
+  if (!choices.length || previous === next) {
+    return [...choices];
+  }
+  const prior = protectedTraceQLPredicates(previous, substringEnabled);
+  const current = protectedTraceQLPredicates(next, substringEnabled);
+  const result: Array<{ predicate: string; kid: string }> = [];
+  for (const choice of choices) {
+    const predicate = prior.find((item) => item.predicate === choice.predicate);
+    if (!predicate) {
+      continue;
+    }
+    const text = previous.slice(predicate.from, predicate.to);
+    const matches = current.filter((item) =>
+      item.field === predicate.field &&
+      item.operator === predicate.operator &&
+      next.slice(item.from, item.to) === text);
+    if (matches.length === 1 && prior.filter((item) =>
+      item.field === predicate.field &&
+      item.operator === predicate.operator &&
+      previous.slice(item.from, item.to) === text).length === 1) {
+      result.push({ predicate: matches[0].predicate, kid: choice.kid });
+    }
+  }
+  return result;
+}
 
 export type ProtectedTraceQLClassification = {
   requiresSealing: boolean;
@@ -438,61 +510,73 @@ export async function rewriteProtectedTraceQL(
   query: string,
   keys: readonly ProtectedAttributeKey[] | ProtectedAttributeKey | undefined,
   mode: 'search' | 'metrics' | 'metadata',
-  substringEnabled = false
+  substringEnabled = false,
+  selections: readonly { predicate: string; kid: string }[] = []
 ): Promise<string> {
   const { root, predicates, selects, classification } = inspect(query, false, substringEnabled);
   if (classification.dynamicReferences) {
     invalid();
   }
+  const protectedKeys = keys === undefined ? [] : Array.isArray(keys) ? keys : [keys as ProtectedAttributeKey];
+  const available = new Map(protectedKeys.map((key) => [key.kid, key]));
+  const selected = new Map<string, string>();
+  for (const choice of selections) {
+    if (!/^[0-9a-f]{32}$/.test(choice.kid) || selected.has(choice.predicate)) {
+      invalid();
+    }
+    selected.set(choice.predicate, choice.kid);
+  }
+  const validPredicates = new Set(predicates.map(({ comparison, field, op }) =>
+    JSON.stringify([comparison.from, comparison.to, field, op])));
+  if ([...selected.keys()].some((predicate) => !validPredicates.has(predicate))) {
+    invalid();
+  }
   if (!predicates.length) {
     return query;
   }
-  const protectedKeys = keys === undefined ? [] : Array.isArray(keys) ? keys : [keys as ProtectedAttributeKey];
   const edits: Edit[] = [];
   const fields = new Map<string, string>();
   for (const predicate of predicates) {
+    const choice = selected.get(JSON.stringify([predicate.comparison.from, predicate.comparison.to, predicate.field, predicate.op]));
+    const key = choice ? available.get(choice) : protectedKeys.length === 1 ? protectedKeys[0] : undefined;
+    if (choice && !key) {
+      invalid();
+    }
     if (!fields.has(predicate.field)) {
       fields.set(predicate.field, query.slice(predicate.lhs.from, predicate.lhs.to));
     }
     if (predicate.op === '@>' || predicate.op === '!@>') {
-      if (!protectedKeys.length) {
+      if (!key) {
         invalid();
       }
       const value = literal(predicate.rhs, query);
       const operator = predicate.op === '@>' ? 'subarray_seq' : '!subarray_seq';
-      const comparisons = await Promise.all(protectedKeys.map(async (key) => {
-        const tokens = await key.substringTokens(predicate.field, value);
-        return `span.${JSON.stringify(`bi.${predicate.field.slice(4)}`)} ${operator} ${JSON.stringify(tokens)}`;
-      }));
+      const tokens = await key.substringTokens(predicate.field, value);
       edits.push({
         from: predicate.comparison.from,
         to: predicate.comparison.to,
-        text: comparisons.length === 1 ? comparisons[0] : `(${comparisons.join(' || ')})`,
+        text: `span.${JSON.stringify(`bi.${predicate.field.slice(4)}`)} ${operator} ${JSON.stringify(tokens)}`,
       });
       continue;
     }
     const value = literal(predicate.rhs, query);
     const encrypted = isEncryptedAttributeEnvelope(value)
       ? JSON.stringify(value)
-      : protectedKeys.map((key) => JSON.stringify(key.encrypt(predicate.field, value)));
-    const ciphertexts = Array.isArray(encrypted) ? encrypted : [encrypted];
-    if (!ciphertexts.length) {
-      invalid();
-    }
+      : key ? JSON.stringify(key.encrypt(predicate.field, value)) : invalid();
     const lhs = query.slice(predicate.lhs.from, predicate.lhs.to);
     const between = query.slice(predicate.lhs.to, predicate.rhs.from);
-    const comparisons = ciphertexts.map((ciphertext) => `${lhs}${between}${ciphertext}`);
+    const comparison = `${lhs}${between}${encrypted}`;
     if (predicate.op === '=') {
       edits.push({
         from: predicate.comparison.from,
         to: predicate.comparison.to,
-        text: comparisons.length === 1 ? comparisons[0] : `(${comparisons.join(' || ')})`,
+        text: comparison,
       });
     } else {
       edits.push({
         from: predicate.comparison.from,
         to: predicate.comparison.to,
-        text: `(${comparisons.join(' && ')} && ${lhs} != nil)`,
+        text: `(${comparison} && ${lhs} != nil)`,
       });
     }
   }

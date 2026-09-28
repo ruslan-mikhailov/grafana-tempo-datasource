@@ -38,6 +38,8 @@ export interface TempoJsonData extends DataSourceJsonData {
 export interface TempoQuery extends TempoBase {
   queryType: TempoQueryType;
   serviceMapUseNativeHistograms?: boolean;
+  /** Non-secret key choices bound to protected predicates in the sealed raw TraceQL query. */
+  protectedQueryKeys?: Array<{ predicate: string; kid: string }>;
   overrideStreamingEnabled?: boolean;
 }
 

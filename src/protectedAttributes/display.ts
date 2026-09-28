@@ -8,11 +8,24 @@ const envelopeKidPattern = /^enc:[^:]*:([0-9a-f]{32}):/;
 interface DisplayRegistry {
   epoch: number;
   resolve(storedField: string, envelope: string): string | undefined;
+  requestKey?(kid: string): boolean;
 }
 
 let protectedModeRegistered = false;
 const importedKeys = new Map<string, { owner: object; key: ProtectedAttributeKey }>();
+const keyRequestHandlers: Array<(kid: string) => boolean> = [];
 
+function requestKey(kid: string): boolean {
+  if (!/^[0-9a-f]{32}$/.test(kid)) {
+    return false;
+  }
+  for (let index = keyRequestHandlers.length - 1; index >= 0; index--) {
+    if (keyRequestHandlers[index](kid)) {
+      return true;
+    }
+  }
+  return false;
+}
 function resolve(storedField: string, envelope: string): string | undefined {
   if (
     typeof storedField !== 'string' ||
@@ -58,7 +71,9 @@ function registry(): DisplayRegistry | undefined {
     return undefined;
   }
   const scope = globalThis as unknown as Record<symbol, DisplayRegistry | undefined>;
-  return (scope[displaySymbol] ??= { epoch: 0, resolve });
+  const display = (scope[displaySymbol] ??= { epoch: 0, resolve });
+  display.requestKey = requestKey;
+  return display;
 }
 
 function changed(): void {
@@ -75,6 +90,18 @@ export function registerProtectedDisplayMode(): void {
     protectedModeRegistered = true;
     changed();
   }
+}
+
+/** Register a mounted key UI. A request opens one eligible editor, never every query row. */
+export function registerProtectedKeyRequest(handler: (kid: string) => boolean): () => void {
+  keyRequestHandlers.push(handler);
+  registry();
+  return () => {
+    const index = keyRequestHandlers.indexOf(handler);
+    if (index !== -1) {
+      keyRequestHandlers.splice(index, 1);
+    }
+  };
 }
 
 /** A datasource owns its imported key; a stale datasource cannot revoke another one's key. */

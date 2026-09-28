@@ -117,6 +117,8 @@ export interface TraceqlFilter {
    * Uniquely identify the filter, will not be used in the query generation
    */
   id: string;
+  /** Session-local selection of the encryption key used for this predicate; not a master key. */
+  protectedKeyId?: string;
   /**
    * Whether the value is a custom value typed by the user
    */

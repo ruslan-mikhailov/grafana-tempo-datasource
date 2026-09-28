@@ -1,6 +1,7 @@
 import type * as GrafanaUI from '@grafana/ui';
 import type * as ReactType from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 
 import { type TempoDatasource } from '../datasource';
 import { type TempoQuery } from '../types';
@@ -137,12 +138,56 @@ test('opens a saved model with its own key while a different key remains active 
   const editor = screen.getByRole('textbox', { name: 'raw traceql' });
   await waitFor(() => expect(editor).toHaveValue('{span.enc.password="old"}'));
   fireEvent.change(editor, { target: { value: '{span.enc.password="new"}' } });
+  expect(hostChange).not.toHaveBeenCalled();
+  await userEvent.click(screen.getByLabelText(/Select protected key for enc.password/));
+  await userEvent.click(screen.getByText(`${kid.slice(0, 8)}…${kid.slice(-6)}`));
   await waitFor(() =>
     expect(hostChange).toHaveBeenCalledWith(
-      expect.objectContaining({ query: expect.stringContaining(`qenc:v1:${active.kid}:`) })
+      expect.objectContaining({
+        query: expect.stringContaining(`qenc:v1:${active.kid}:`),
+        protectedQueryKeys: [{ kid, predicate: expect.any(String) }],
+      })
     )
   );
   expect(old.openQueryModel).toHaveBeenCalledWith(saved, JSON.stringify(['tempo-uid', 'query']));
+});
+
+test('keeps a multi-key raw draft local until each predicate has a selected key', async () => {
+  const saved = `qenc:v1:${kid}:${'A'.repeat(40)}`;
+  const sealed = `qenc:v1:${kid}:${'B'.repeat(40)}`;
+  const old = {
+    kid,
+    openQueryModel: jest.fn().mockResolvedValue('{span.enc.password="old"}'),
+    sealQueryModel: jest.fn().mockResolvedValue(sealed),
+  };
+  const other = { kid: 'a'.repeat(32), sealQueryModel: jest.fn().mockResolvedValue(sealed) };
+  const datasource = {
+    uid: 'tempo-uid',
+    protectedKey: other,
+    protectedKeys: [old, other],
+    protectedKeyEpoch: 2,
+    getProtectedKey: (id: string) => id === kid ? old : other,
+    instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
+    languageProvider: { start: jest.fn().mockResolvedValue(undefined), shouldRefreshLabels: () => false },
+  } as unknown as TempoDatasource;
+  const hostChange = jest.fn();
+  render(<TraceQLEditor placeholder="TraceQL"
+    query={{ refId: 'A', queryType: 'traceql', query: saved, filters: [] }}
+    datasource={datasource} onChange={hostChange} onRunQuery={jest.fn()}
+    protectedKeyLabel={(id) => `Label ${id.slice(0, 8)}`} />);
+  const editor = screen.getByRole('textbox', { name: 'raw traceql' });
+  await waitFor(() => expect(editor).toHaveValue('{span.enc.password="old"}'));
+  fireEvent.change(editor, { target: { value: '{span.enc.password="new"}' } });
+  expect(hostChange).not.toHaveBeenCalled();
+  const selector = screen.getByLabelText(/Select protected key for enc.password/);
+  await userEvent.click(selector);
+  await userEvent.click(screen.getByText(`Label ${kid.slice(0, 8)}`));
+  await waitFor(() => expect(hostChange).toHaveBeenCalledTimes(1));
+  expect(hostChange.mock.calls[0][0]).toMatchObject({
+    query: sealed,
+    protectedQueryKeys: [{ kid, predicate: expect.any(String) }],
+  });
+  expect(JSON.stringify(hostChange.mock.calls)).not.toContain('"new"');
 });
 
 test('allows ordinary raw edits without an imported key but rejects protected plaintext', async () => {

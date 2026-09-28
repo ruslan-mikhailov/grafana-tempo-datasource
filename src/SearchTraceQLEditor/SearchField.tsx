@@ -29,6 +29,8 @@ interface Props {
   hideValue?: boolean;
   showLabel?: boolean;
   query: string;
+  protectedQueryKeys?: Array<{ predicate: string; kid: string }>;
+  protectedKeyLabel?: (kid: string) => string;
   isMulti?: boolean;
   allowCustomValue?: boolean;
   addVariablesToOptions?: boolean;
@@ -66,6 +68,8 @@ const SearchField = ({
   hideValue,
   showLabel,
   query,
+  protectedQueryKeys,
+  protectedKeyLabel,
   addVariablesToOptions,
   isMulti = true,
   allowCustomValue = true,
@@ -94,6 +98,7 @@ const SearchField = ({
           ? await datasource.languageProvider.getOptionsV2({
               tag: scopedTag,
               query,
+              protectedQueryKeys,
               timeRangeForTags,
               range,
             })
@@ -118,6 +123,7 @@ const SearchField = ({
     protection,
     setError,
     query,
+    JSON.stringify(protectedQueryKeys),
     range,
     timeRangeForTags,
   ]);
@@ -214,7 +220,7 @@ const SearchField = ({
             inputId={`${filter.id}-scope`}
             options={addVariablesToOptions ? withTemplateVariableOptions(scopeOptions) : scopeOptions}
             value={filter.scope}
-            onChange={(v) => updateFilter({ ...filter, scope: v?.value, tag: undefined, value: [] })}
+            onChange={(v) => updateFilter({ ...filter, scope: v?.value, tag: undefined, value: [], protectedKeyId: undefined })}
             placeholder="Select scope"
             aria-label={`select ${filter.id} scope`}
           />
@@ -233,7 +239,7 @@ const SearchField = ({
               }
             }}
             onCloseMenu={() => setTagQuery('')}
-            onChange={(v) => updateFilter({ ...filter, tag: v?.value, value: [] })}
+            onChange={(v) => updateFilter({ ...filter, tag: v?.value, value: [], protectedKeyId: undefined })}
             value={filter.tag}
             key={filter.tag}
             placeholder="Select tag"
@@ -248,12 +254,24 @@ const SearchField = ({
           inputId={`${filter.id}-operator`}
           options={addVariablesToOptions ? withTemplateVariableOptions(operatorOptions) : operatorOptions}
           value={filter.operator}
-          onChange={(v) => updateFilter({ ...filter, operator: v?.value })}
+          onChange={(v) => updateFilter({ ...filter, operator: v?.value, protectedKeyId: v?.value === filter.operator ? filter.protectedKeyId : undefined })}
           isClearable={false}
           aria-label={`select ${filter.id} operator`}
           allowCustomValue={true}
           width={8}
         />
+        {explicitProtection && datasource.protectedKeys?.length > 1 && (
+          <Select
+            className={styles.dropdown}
+            inputId={`${filter.id}-protected-key`}
+            options={datasource.protectedKeys.map((item) => ({ label: protectedKeyLabel?.(item.kid) ?? `${item.kid.slice(0, 8)}…${item.kid.slice(-6)}`, value: item.kid }))}
+            value={filter.protectedKeyId}
+            onChange={(choice) => updateFilter({ ...filter, protectedKeyId: choice?.value })}
+            isClearable
+            placeholder="Choose key"
+            aria-label={`select ${filter.id} protected key`}
+          />
+        )}
         {!hideValue && (
           <Select
             /**
