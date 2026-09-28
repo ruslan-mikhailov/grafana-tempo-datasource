@@ -1,0 +1,32 @@
+{
+  "name": "@grafana/lezer-traceql",
+  "version": "0.0.25-substring.1",
+  "description": "Grafana Tempo TraceQL Lezer grammar with @> field operator",
+  "type": "module",
+  "main": "./index.cjs",
+  "module": "./index.es.js",
+  "types": "./index.d.ts",
+  "exports": {
+    "types": "./index.d.ts",
+    "import": "./index.es.js",
+    "require": "./index.cjs"
+  },
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "lezer-generator --output src/parser.js src/traceql.grammar && rollup -c",
+    "test": "node --test test/parser.test.mjs"
+  },
+  "devDependencies": {
+    "@lezer/generator": "1.7.1",
+    "rollup": "2.79.2"
+  },
+  "peerDependencies": {
+    "@lezer/lr": "^1.4.2"
+  },
+  "files": [
+    "index.cjs",
+    "index.es.js",
+    "index.d.ts",
+    "LICENSE"
+  ]
+}

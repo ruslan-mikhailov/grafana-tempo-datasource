@@ -85,3 +85,23 @@ test('refuses to enable protection while a valued protected static default remai
   expect(screen.getByRole('alert')).toHaveTextContent('span.enc.password');
   expect(screen.getByRole('alert')).not.toHaveTextContent('sensitive');
 });
+
+test('substring opt-in requires protection and disabling protection clears the opt-in', async () => {
+  const user = userEvent.setup();
+  const onOptionsChange = jest.fn();
+  const options = {
+    jsonData: { protectedAttributesEnabled: true, protectedAttributesSubstringEnabled: false },
+  } as DataSourcePluginOptionsEditorProps<TempoJsonData>['options'];
+  const { rerender } = render(<ConfigEditor options={options} onOptionsChange={onOptionsChange} />);
+  await user.click(screen.getByLabelText('Enable protected substring search'));
+  expect(onOptionsChange).toHaveBeenCalledWith(expect.objectContaining({
+    jsonData: { protectedAttributesEnabled: true, protectedAttributesSubstringEnabled: true },
+  }));
+  rerender(<ConfigEditor options={{
+    ...options, jsonData: { protectedAttributesEnabled: true, protectedAttributesSubstringEnabled: true },
+  }} onOptionsChange={onOptionsChange} />);
+  await user.click(screen.getByLabelText('Enable protected attributes'));
+  expect(onOptionsChange).toHaveBeenLastCalledWith(expect.objectContaining({
+    jsonData: { protectedAttributesEnabled: false, protectedAttributesSubstringEnabled: false },
+  }));
+});

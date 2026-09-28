@@ -107,7 +107,10 @@ export default class TempoLanguageProvider extends LanguageProvider {
   }
 
   setV2Tags = (tags: Scope[]) => {
-    this.tagsV2 = tags;
+    this.tagsV2 = tags.map((scope) => ({
+      ...scope,
+      tags: scope.tags.filter((tag) => !tag.startsWith('bi.')),
+    }));
   };
 
   getIntrinsics = () => {
@@ -213,7 +216,7 @@ export default class TempoLanguageProvider extends LanguageProvider {
     adhocFilters?: AdHocVariableFilter[];
   }) {
     if (this.datasource.instanceSettings?.jsonData?.protectedAttributesEnabled) {
-      assertStaticProtectedFilterDefaultsSafe(this.datasource.search?.filters);
+      assertStaticProtectedFilterDefaultsSafe(this.datasource.search?.filters, !!this.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
     }
     if (!traceqlFilters && !adhocFilters) {
       return '';

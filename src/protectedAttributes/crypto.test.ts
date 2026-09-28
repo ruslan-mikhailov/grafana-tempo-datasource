@@ -113,3 +113,33 @@ test('clear invalidates synchronous operations and asynchronous model operations
   expect(() => key.encrypt('enc.password', 'secret')).toThrow('cleared');
   expect(() => key.decrypt('enc.password', vectors[0][2])).toThrow('cleared');
 });
+
+test('ordered-trigram HMAC uses NFC scalar windows, field binding, and frozen cross-language vectors', async () => {
+  const key = await importKey(master);
+  const coo = `bi:v1:${kid}:E_S8rZC-kHLrifr_71XBBSP7w8jOWNCm2j6LHigypgM`;
+  const ool = `bi:v1:${kid}:zQb64aCXnVL2KksfrDxrQwVtdw6Ljmwxv37So9E7ghc`;
+  expect(await key.substringTokens('enc.secret', 'cool')).toEqual([coo, ool]);
+  expect((await key.substringTokens('enc.secret', 'some cool value')).slice(5, 7)).toEqual([coo, ool]);
+  expect(await key.substringTokens('enc.secret', 'e\u0301🙂a')).toEqual(await key.substringTokens('enc.secret', 'é🙂a'));
+  const repeated = await key.substringTokens('enc.secret', 'aaaabca');
+  expect(repeated).toHaveLength(5);
+  expect(repeated[0]).toBe(repeated[1]);
+  expect(repeated[1]).not.toBe(repeated[2]);
+  expect(await key.substringTokens('enc.other', 'cool')).not.toEqual([coo, ool]);
+  expect(await (await importKey(Buffer.alloc(32, 7).toString('base64'))).substringTokens('enc.secret', 'cool')).not.toEqual([coo, ool]);
+  expect(coo).toMatch(/^bi:v1:[0-9a-f]{32}:[A-Za-z0-9_-]{43}$/);
+});
+
+test('substring input bounds and invalid scalar sequences fail without tokens', async () => {
+  const key = await importKey(master);
+  expect(await key.substringTokens('enc.secret', '🙂'.repeat(512))).toHaveLength(510);
+  for (const value of ['', 'a', 'é\u0301', 'a'.repeat(513), '🙂'.repeat(513), '\ud800xy', 'xy\udc00']) {
+    await expect(key.substringTokens('enc.secret', value)).rejects.toMatchObject({ code: 'invalid-substring' });
+  }
+  await expect(key.substringTokens('enc.secret', '🙂'.repeat(512) + 'a')).rejects.toMatchObject({ code: 'invalid-substring' });
+  await expect(key.substringTokens('bi.secret', 'cool')).rejects.toMatchObject({ code: 'invalid-field' });
+  const pending = key.substringTokens('enc.secret', 'some cool value');
+  key.clear();
+  await expect(pending).rejects.toMatchObject({ code: 'cleared' });
+  await expect(key.substringTokens('enc.secret', 'cool')).rejects.toMatchObject({ code: 'cleared' });
+});

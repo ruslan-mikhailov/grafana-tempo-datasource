@@ -479,6 +479,33 @@ describe('SearchField', () => {
       )
     );
   });
+  it('offers substring only for opted-in fixed span attributes and keeps the value scalar', async () => {
+    const updateFilter = jest.fn();
+    const datasource = {
+      instanceSettings: { jsonData: { protectedAttributesEnabled: true, protectedAttributesSubstringEnabled: true } },
+      languageProvider: {
+        getOptionsV2: jest.fn().mockResolvedValue([]),
+        getIntrinsics: jest.fn().mockReturnValue([]),
+        getTags: jest.fn().mockReturnValue([]),
+      },
+    } as unknown as TempoDatasource;
+    datasource.languageProvider.datasource = datasource;
+    const filter: TraceqlFilter = {
+      id: 'secret', tag: 'enc.secret', scope: TraceqlSearchScope.Span, operator: '@>', valueType: 'string',
+    };
+    const { container } = render(<SearchField
+      datasource={datasource} filter={filter} updateFilter={updateFilter}
+      setError={jest.fn()} tags={[]} query=""
+    />);
+    const operator = container.querySelector('input[aria-label="select secret operator"]')!;
+    await user.click(operator);
+    expect(screen.getByText('Contains substring')).toBeInTheDocument();
+    const value = container.querySelector('input[aria-label="select secret value"]')!;
+    await user.type(value, 'cool');
+    await user.keyboard('{Enter}');
+    expect(updateFilter).toHaveBeenCalledWith(expect.objectContaining({ value: 'cool', valueType: 'string' }));
+    expect(datasource.languageProvider.getOptionsV2).not.toHaveBeenCalled();
+  });
 });
 
 const renderSearchField = (

@@ -13,7 +13,7 @@ const scopeVariable = /^(?:\$\{[^}\s]+\}|\$[A-Za-z_]\w*|\[\[[^\]\s]+\]\])$/;
 const builderTag = /^[\p{L}\p{N}_-]+(?:\.[\p{L}\p{N}_-]+)*$/u;
 const quotedTagPart = /"(?:\\["\\]|[^"\\\u0000-\u001f])*"/g;
 const variableTagPart = /\$\{[^}\s]+\}|\$[A-Za-z_]\w*|\[\[[^\]\s]+\]\]/g;
-const builderOperators = ['=', '!=', '>', '<', '>=', '<=', '=~', '!~'];
+const builderOperators = ['=', '!=', '>', '<', '>=', '<=', '=~', '!~', '@>'];
 const unsafe = () => new Error('Protected query model cannot be saved or opened');
 
 export function isProtectedModelEnvelope(value: string): boolean {
@@ -43,6 +43,9 @@ export function classifyProtectedFilter(filter: TraceqlFilter): {
   const scope = filter.scope ?? TraceqlSearchScope.Unscoped;
   const tag = filter.tag ?? '';
   const dynamicReference = isVariableBearing(String(scope)) || isVariableBearing(tag);
+  if (decodedBuilderTag(tag).startsWith('bi.')) {
+    throw unsafe();
+  }
   const protectedReference =
     decodedBuilderTag(tag).startsWith('enc.') || (tag.startsWith('\"enc.') && tag.includes('enc.'));
   return { requiresSealing: protectedReference || dynamicReference, protectedReference, dynamicReference };
@@ -50,7 +53,9 @@ export function classifyProtectedFilter(filter: TraceqlFilter): {
 
 export function isProtectedTagValueRequest(tag: string): boolean {
   const decoded = decodedBuilderTag(tag);
-  return decoded.startsWith('span.enc.') || decoded.startsWith('enc.') || decoded.startsWith('.enc.');
+  return decoded.startsWith('enc.') || decoded.startsWith('.enc.') || decoded.startsWith('span.enc.') ||
+    decoded.startsWith('bi.') || decoded.startsWith('.bi.') ||
+    /^(?:span|resource|event|link|instrumentation)\.bi\./.test(decoded);
 }
 
 function filterContext(uid: string, filter: TraceqlFilter, index?: number): string {
@@ -69,7 +74,7 @@ function queryContext(uid: string): string {
   return JSON.stringify([uid, 'query']);
 }
 
-function assertFilterShape(filter: TraceqlFilter): void {
+function assertFilterShape(filter: TraceqlFilter, substringEnabled = false): void {
   if (
     filter.scope &&
     !Object.values(TraceqlSearchScope).includes(filter.scope) &&
@@ -94,7 +99,12 @@ function assertFilterShape(filter: TraceqlFilter): void {
     throw unsafe();
   }
   const { requiresSealing, dynamicReference, protectedReference } = classifyProtectedFilter(filter);
-  if (requiresSealing && filter.operator && !['=', '!='].includes(filter.operator)) {
+  if (filter.operator === '@>' &&
+    (!substringEnabled || !protectedReference || dynamicReference ||
+      filter.scope !== TraceqlSearchScope.Span || Array.isArray(filter.value))) {
+    throw unsafe();
+  }
+  if (requiresSealing && filter.operator && !['=', '!=', ...(substringEnabled ? ['@>'] : [])].includes(filter.operator)) {
     throw unsafe();
   }
   if (protectedReference && !dynamicReference && filter.scope !== TraceqlSearchScope.Span) {
@@ -134,9 +144,9 @@ function assertFilterIds(filters: TraceqlFilter[]): void {
   }
 }
 
-export function assertStaticProtectedFilterDefaultsSafe(filters: TraceqlFilter[] | undefined): void {
+export function assertStaticProtectedFilterDefaultsSafe(filters: TraceqlFilter[] | undefined, substringEnabled = false): void {
   for (const filter of filters ?? []) {
-    assertFilterShape(filter);
+    assertFilterShape(filter, substringEnabled);
     if (
       filter.value !== undefined &&
       (!Array.isArray(filter.value) || filter.value.length > 0) &&
@@ -147,11 +157,11 @@ export function assertStaticProtectedFilterDefaultsSafe(filters: TraceqlFilter[]
   }
 }
 
-function classifyRaw(value: string): boolean {
+function classifyRaw(value: string, substringEnabled = false): boolean {
   if (!value || /^[0-9A-Fa-f]*$/.test(value.trim())) {
     return false;
   }
-  return classifyProtectedTraceQL(value).requiresSealing;
+  return classifyProtectedTraceQL(value, substringEnabled).requiresSealing;
 }
 
 function assertNoLegacyCarriers(model: TempoQuery): void {
@@ -166,7 +176,7 @@ function assertNoLegacyCarriers(model: TempoQuery): void {
   }
 }
 
-export function assertProtectedQueryModelSafe(model: TempoQuery, kids?: string | readonly string[]): void {
+export function assertProtectedQueryModelSafe(model: TempoQuery, kids?: string | readonly string[], substringEnabled = false): void {
   if ((typeof kids === 'string' ? [kids] : (kids ?? [])).some((kid) => !/^[0-9a-f]{32}$/.test(kid))) {
     throw unsafe();
   }
@@ -176,13 +186,13 @@ export function assertProtectedQueryModelSafe(model: TempoQuery, kids?: string |
       if (!isProtectedModelEnvelope(model.query)) {
         throw unsafe();
       }
-    } else if (classifyRaw(model.query)) {
+    } else if (classifyRaw(model.query, substringEnabled)) {
       throw unsafe();
     }
   }
   assertFilterIds(model.filters ?? []);
   for (const filter of model.filters ?? []) {
-    assertFilterShape(filter);
+    assertFilterShape(filter, substringEnabled);
     const { requiresSealing } = classifyProtectedFilter(filter);
     const values = Array.isArray(filter.value) ? filter.value : filter.value === undefined ? [] : [filter.value];
     for (const value of values) {
@@ -224,7 +234,8 @@ export async function prepareProtectedQueryModel(
   key: ProtectedAttributeKey,
   uid: string,
   source?: TempoQuery,
-  lookup?: (kid: string) => ProtectedAttributeKey | undefined
+  lookup?: (kid: string) => ProtectedAttributeKey | undefined,
+  substringEnabled = false
 ): Promise<TempoQuery> {
   if (!key || !uid) {
     throw unsafe();
@@ -233,14 +244,14 @@ export async function prepareProtectedQueryModel(
   let query = draft.query;
   if (query && source?.query === query && isProtectedModelEnvelope(query)) {
     await keyForEnvelope(query, lookup ?? key).openQueryModel(query, queryContext(uid));
-  } else if (query && classifyRaw(query)) {
+  } else if (query && classifyRaw(query, substringEnabled)) {
     query = await key.sealQueryModel(query, queryContext(uid));
   }
   const filters = draft.filters ?? [];
   assertFilterIds(filters);
   const sealedFilters = await Promise.all(
     filters.map(async (filter) => {
-      assertFilterShape(filter);
+      assertFilterShape(filter, substringEnabled);
       if (!classifyProtectedFilter(filter).requiresSealing || filter.value === undefined) {
         return filter;
       }
@@ -265,15 +276,15 @@ export async function prepareProtectedQueryModel(
     })
   );
   const prepared = { ...draft, query, filters: sealedFilters };
-  assertProtectedQueryModelSafe(prepared, key.kid);
+  assertProtectedQueryModelSafe(prepared, key.kid, substringEnabled);
   return prepared;
 }
 
-export async function openProtectedQueryModel(model: TempoQuery, keys: KeyLookup, uid: string): Promise<TempoQuery> {
+export async function openProtectedQueryModel(model: TempoQuery, keys: KeyLookup, uid: string, substringEnabled = false): Promise<TempoQuery> {
   if (!uid) {
     throw unsafe();
   }
-  assertProtectedQueryModelSafe(model);
+  assertProtectedQueryModelSafe(model, undefined, substringEnabled);
   const query = model.query?.startsWith('qenc:')
     ? await keyForEnvelope(model.query, keys).openQueryModel(model.query, queryContext(uid))
     : model.query;

@@ -70,14 +70,16 @@ export function QueryEditor(props: Props) {
       if (protectedMode) {
         assertProtectedQueryModelSafe(
           query,
-          (props.datasource.protectedKeys ?? (key ? [key] : [])).map((item) => item.kid)
+          (props.datasource.protectedKeys ?? (key ? [key] : [])).map((item) => item.kid),
+          !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
         );
       }
       const opened = protectedMode
         ? await openProtectedQueryModel(
             query,
             props.datasource.getProtectedKey?.bind(props.datasource) ?? key,
-            props.datasource.uid
+            props.datasource.uid,
+            !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
           )
         : query;
       const raw = props.datasource.languageProvider.generateQueryFromFilters({
@@ -91,13 +93,15 @@ export function QueryEditor(props: Props) {
               key,
               props.datasource.uid,
               query,
-              props.datasource.getProtectedKey?.bind(props.datasource)
+              props.datasource.getProtectedKey?.bind(props.datasource),
+              !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
             )
           : candidate;
       if (protectedMode) {
         assertProtectedQueryModelSafe(
           sealed,
-          (props.datasource.protectedKeys ?? (key ? [key] : [])).map((item) => item.kid)
+          (props.datasource.protectedKeys ?? (key ? [key] : [])).map((item) => item.kid),
+          !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
         );
       }
       if (

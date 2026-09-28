@@ -42,8 +42,12 @@ const ConfigEditor = ({ options, onOptionsChange }: ConfigEditorProps) => {
       setProtectionError('Enable protected attributes before saving this legacy datasource.');
       return;
     }
+    if (next.jsonData.protectedAttributesSubstringEnabled && !next.jsonData.protectedAttributesEnabled) {
+      setProtectionError('Enable protected attributes before enabling protected substring search.');
+      return;
+    }
     const unsafeFilter = next.jsonData.protectedAttributesEnabled
-      ? protectedStaticFilterError(next.jsonData.search?.filters)
+      ? protectedStaticFilterError(next.jsonData.search?.filters, !!next.jsonData.protectedAttributesSubstringEnabled)
       : undefined;
     if (unsafeFilter) {
       setProtectionError(unsafeFilter);
@@ -110,7 +114,25 @@ const ConfigEditor = ({ options, onOptionsChange }: ConfigEditorProps) => {
                 onChange={(event) =>
                   guardedOptionsChange({
                     ...options,
-                    jsonData: { ...options.jsonData, protectedAttributesEnabled: event.currentTarget.checked },
+                    jsonData: {
+                      ...options.jsonData,
+                      protectedAttributesEnabled: event.currentTarget.checked,
+                      ...(!event.currentTarget.checked && { protectedAttributesSubstringEnabled: false }),
+                    },
+                  })
+                }
+              />
+            </InlineField>
+            <InlineField label="Enable protected substring search" labelWidth={26}>
+              <InlineSwitch
+                id="protectedAttributesSubstringEnabled"
+                aria-label="Enable protected substring search"
+                value={options.jsonData.protectedAttributesSubstringEnabled ?? false}
+                disabled={!options.jsonData.protectedAttributesEnabled}
+                onChange={(event) =>
+                  guardedOptionsChange({
+                    ...options,
+                    jsonData: { ...options.jsonData, protectedAttributesSubstringEnabled: event.currentTarget.checked },
                   })
                 }
               />

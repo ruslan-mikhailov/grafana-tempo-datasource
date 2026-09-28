@@ -150,7 +150,8 @@ const SearchField = ({
       operatorList = numberOperators;
   }
   if (protection) {
-    operatorList = ['=', '!='];
+    operatorList = ['=', '!=', ...(explicitProtection && filter.scope === TraceqlSearchScope.Span &&
+      datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled ? ['@>'] : [])];
   }
   const operatorOptions = operatorList.map(operatorSelectableValue);
 
@@ -297,7 +298,7 @@ const SearchField = ({
             onCreateOption={(val) => {
               updateFilter({
                 ...filter,
-                value: Array.isArray(filter.value) ? filter.value?.concat(val) : val,
+                value: filter.operator === '@>' ? val : Array.isArray(filter.value) ? filter.value?.concat(val) : val,
                 valueType: protection ? 'string' : (uniqueOptionType ?? inferCustomValueType(val)),
                 isCustomValue: true,
               });
@@ -306,7 +307,7 @@ const SearchField = ({
             isClearable={true}
             aria-label={`select ${filter.id} value`}
             allowCustomValue={allowCustomValue}
-            isMulti={isMulti}
+            isMulti={filter.operator === '@>' ? false : isMulti}
             allowCreateWhileLoading
           />
         )}

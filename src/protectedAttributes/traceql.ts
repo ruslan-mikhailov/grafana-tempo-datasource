@@ -43,7 +43,7 @@ export function isEncryptedAttributeEnvelope(value: string): boolean {
 }
 
 type Edit = { from: number; to: number; text: string };
-type Predicate = { field: string; lhs: SyntaxNode; rhs: SyntaxNode; comparison: SyntaxNode; op: '=' | '!=' };
+type Predicate = { field: string; lhs: SyntaxNode; rhs: SyntaxNode; comparison: SyntaxNode; op: '=' | '!=' | '@>' };
 type Attribute = { field: string; protected: boolean; dynamic: boolean };
 
 export type ProtectedTraceQLClassification = {
@@ -118,6 +118,9 @@ function attribute(node: SyntaxNode, query: string): Attribute {
     return { field: '', protected: false, dynamic: true };
   }
   const field = decodedIdentifier(raw);
+  if (field.startsWith('bi.')) {
+    invalid(); // The sidecar is an internal transport field, never a user query.
+  }
   const protectedField = field.startsWith('enc.');
   if (protectedField && (scope !== Span || parts[0]?.from !== node.from || name.from <= parts[0].to)) {
     invalid();
@@ -192,7 +195,7 @@ function predicateFor(attributeNode: SyntaxNode, query: string): Predicate {
     return invalid();
   }
   const op = query.slice(nodes[1].from, nodes[1].to);
-  if (op !== '=' && op !== '!=') {
+  if (op !== '=' && op !== '!=' && op !== '@>') {
     return invalid();
   }
   const right = children(nodes[2]);
@@ -228,6 +231,7 @@ function variableMayNameField(node: SyntaxNode, query: string): boolean {
     if (
       operator === '=' ||
       operator === '!=' ||
+      operator === '@>' ||
       operator === '>' ||
       operator === '<' ||
       operator === '>=' ||
@@ -243,7 +247,8 @@ function variableMayNameField(node: SyntaxNode, query: string): boolean {
 
 function inspect(
   query: string,
-  allowVariableRecovery = false
+  allowVariableRecovery = false,
+  substringEnabled = false
 ): {
   classification: ProtectedTraceQLClassification;
   predicates: Predicate[];
@@ -290,6 +295,14 @@ function inspect(
       if (node.type.id === TemplateVariable && variableMayNameField(node.node, query)) {
         dynamicReferences = true;
       }
+      if (node.type.id === FieldOp && query.slice(node.from, node.to) === '@>') {
+        const comparison = node.node.parent;
+        const lhs = comparison && children(comparison)[0];
+        const field = lhs && children(lhs)[0];
+        if (field?.type.id !== AttributeField || !attribute(field, query).protected) {
+          invalid();
+        }
+      }
       if (node.type.id === SelectOperation) {
         selects.push(node.node);
       }
@@ -306,6 +319,9 @@ function inspect(
         return;
       }
       const predicate = predicateFor(node.node, query);
+      if (predicate.op === '@>' && !substringEnabled) {
+        invalid();
+      }
       predicate.field = parsed.field;
       predicates.push(predicate);
     },
@@ -320,15 +336,15 @@ function inspect(
       requiresSealing:
         dynamicReferences ||
         (protectedReferences &&
-          (!predicates.length || predicates.some(({ rhs }) => !isEncryptedAttributeEnvelope(literal(rhs, query))))),
+          (!predicates.length || predicates.some(({ rhs, op }) => op === '@>' || !isEncryptedAttributeEnvelope(literal(rhs, query))))),
       protectedRhsRanges: predicates.map(({ rhs }) => ({ from: rhs.from, to: rhs.to })),
     },
   };
 }
 
 /** Classify an original editor query before it can enter a Grafana host model. */
-export function classifyProtectedTraceQL(query: string): ProtectedTraceQLClassification {
-  return inspect(query, true).classification;
+export function classifyProtectedTraceQL(query: string, substringEnabled = false): ProtectedTraceQLClassification {
+  return inspect(query, true, substringEnabled).classification;
 }
 
 /** Inspect pipeline syntax only: compiled inequality guards contain protected != nil. */
@@ -428,9 +444,10 @@ function selectedFields(select: SyntaxNode, query: string): Set<string> {
 export async function rewriteProtectedTraceQL(
   query: string,
   keys: readonly ProtectedAttributeKey[] | ProtectedAttributeKey | undefined,
-  mode: 'search' | 'metrics' | 'metadata'
+  mode: 'search' | 'metrics' | 'metadata',
+  substringEnabled = false
 ): Promise<string> {
-  const { root, predicates, selects, classification } = inspect(query);
+  const { root, predicates, selects, classification } = inspect(query, false, substringEnabled);
   if (classification.dynamicReferences) {
     invalid();
   }
@@ -443,6 +460,22 @@ export async function rewriteProtectedTraceQL(
   for (const predicate of predicates) {
     if (!fields.has(predicate.field)) {
       fields.set(predicate.field, query.slice(predicate.lhs.from, predicate.lhs.to));
+    }
+    if (predicate.op === '@>') {
+      if (!protectedKeys.length) {
+        invalid();
+      }
+      const value = literal(predicate.rhs, query);
+      const comparisons = await Promise.all(protectedKeys.map(async (key) => {
+        const tokens = await key.substringTokens(predicate.field, value);
+        return `span.${JSON.stringify(`bi.${predicate.field.slice(4)}`)} @> ${JSON.stringify(tokens)}`;
+      }));
+      edits.push({
+        from: predicate.comparison.from,
+        to: predicate.comparison.to,
+        text: comparisons.length === 1 ? comparisons[0] : `(${comparisons.join(' || ')})`,
+      });
+      continue;
     }
     const value = literal(predicate.rhs, query);
     const encrypted = isEncryptedAttributeEnvelope(value)

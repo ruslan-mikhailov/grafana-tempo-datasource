@@ -17,15 +17,15 @@ interface Props extends DataSourcePluginOptionsEditorProps<TempoJsonData> {
 }
 
 /** Keep the rejected value (including text embedded in a malformed tag) out of errors. */
-export function protectedStaticFilterError(filters: TraceqlFilter[] | undefined): string | undefined {
+export function protectedStaticFilterError(filters: TraceqlFilter[] | undefined, substringEnabled = false): string | undefined {
   try {
-    assertStaticProtectedFilterDefaultsSafe(filters);
+    assertStaticProtectedFilterDefaultsSafe(filters, substringEnabled);
     return undefined;
   } catch {
     const index =
       filters?.findIndex((filter) => {
         try {
-          assertStaticProtectedFilterDefaultsSafe([filter]);
+          assertStaticProtectedFilterDefaultsSafe([filter], substringEnabled);
           return false;
         } catch {
           return true;
@@ -45,7 +45,7 @@ export function TraceQLSearchTags({ options, onOptionsChange, datasource }: Prop
   const [protectionError, setProtectionError] = useState<string>();
   const saveFilters = useCallback(
     (filters: TraceqlFilter[]) => {
-      const message = options.jsonData.protectedAttributesEnabled ? protectedStaticFilterError(filters) : undefined;
+      const message = options.jsonData.protectedAttributesEnabled ? protectedStaticFilterError(filters, !!options.jsonData.protectedAttributesSubstringEnabled) : undefined;
       setProtectionError(message);
       if (message) {
         return;

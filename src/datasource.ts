@@ -140,6 +140,9 @@ function isSafeEnumRhs(source: string, start: number, value: string): boolean {
 // SDK re-applies template variables to every target passed to super.query.
 // Identity, rather than an on-wire marker, distinguishes already compiled targets.
 const preparedTargets = new WeakSet<TempoQuery>();
+// The browser parser accepts a plaintext string RHS, not the compiled backend
+// token-array RHS. Keep the parsed editor query's metrics route across compilation.
+const preparedMetricsTargets = new WeakSet<TempoQuery>();
 
 function assertHostAdHocFilterSourcesSafe(filters: DataQueryRequest<TempoQuery>['filters']): void {
   for (const filter of filters ?? []) {
@@ -157,9 +160,9 @@ function assertHostAdHocFilterSourcesSafe(filters: DataQueryRequest<TempoQuery>[
     }
   }
 }
-function assertLegacyProtectedSearchSafe(query: TempoQuery, kids?: readonly string[]): void {
+function assertLegacyProtectedSearchSafe(query: TempoQuery, kids?: readonly string[], substringEnabled = false): void {
   const { search, spanName, serviceName, minDuration, maxDuration, ...current } = query;
-  assertProtectedQueryModelSafe(current as TempoQuery, kids);
+  assertProtectedQueryModelSafe(current as TempoQuery, kids, substringEnabled);
   if ([spanName, serviceName, minDuration, maxDuration, search].some((value) => value && isVariableBearing(value))) {
     throw new Error('Legacy host-variable search values cannot be protected.');
   }
@@ -179,30 +182,31 @@ function assertLegacyProtectedSearchSafe(query: TempoQuery, kids?: readonly stri
       }
     }
   }
-  assertProtectedQueryModelSafe(migrateFromSearchToTraceQLSearch(query), kids);
+  assertProtectedQueryModelSafe(migrateFromSearchToTraceQLSearch(query), kids, substringEnabled);
 }
 
-function assertProtectedSavedModelSafe(query: TempoQuery, kids?: readonly string[]): void {
+function assertProtectedSavedModelSafe(query: TempoQuery, kids?: readonly string[], substringEnabled = false): void {
   if (query.queryType === 'nativeSearch') {
-    assertLegacyProtectedSearchSafe(query, kids);
+    assertLegacyProtectedSearchSafe(query, kids, substringEnabled);
   } else if (query.queryType === 'traceId' && query.query && !/^[0-9a-f]+$/i.test(query.query.trim())) {
     // A trace-ID template is safe to keep in a host model only as the entire ID.
     // Its result is hex-validated before it reaches the SDK or transport.
     if (!/^(?:\$\{[^}]+\}|\$[A-Za-z_]\w*|\[\[[^\]]+\]\])$/.test(query.query.trim())) {
       throw new Error('Invalid trace ID query.');
     }
-    assertProtectedQueryModelSafe({ ...query, query: '' }, kids);
+    assertProtectedQueryModelSafe({ ...query, query: '' }, kids, substringEnabled);
   } else {
-    assertProtectedQueryModelSafe(query, kids);
+    assertProtectedQueryModelSafe(query, kids, substringEnabled);
   }
 }
 
 function replaceSafeTraceQLTemplate(
   source: string,
   replace: (value: string) => string,
-  allowProtectedName = false
+  allowProtectedName = false,
+  substringEnabled = false
 ): string {
-  const original = classifyProtectedTraceQL(source);
+  const original = classifyProtectedTraceQL(source, substringEnabled);
   let quoted = false;
   let escaped = false;
   let scanned = 0;
@@ -222,10 +226,9 @@ function replaceSafeTraceQLTemplate(
     const end = start + match[0].length;
     const value = replace(match[0]);
     const namePosition =
-      !quoted &&
-      (source[start - 1] === '.' || source[end] === '.' || /^(?:\s*)(?:=~|!~|!=|>=|<=|=|>|<)/.test(source.slice(end)));
+      !quoted && (source[start - 1] === '.' || source[end] === '.' || /^(?:\s*)(?:@>|=~|!~|!=|>=|<=|=|>|<)/.test(source.slice(end)));
     if (namePosition) {
-      if (!attributeName.test(value) || (!allowProtectedName && /(?:^|\.)enc\./.test(value))) {
+      if (!attributeName.test(value) || (!allowProtectedName && /(?:^|\.)enc\./.test(value)) || /(?:^|\.)bi\./.test(value)) {
         throw new Error('A host variable cannot introduce a protected attribute name.');
       }
     } else if (
@@ -250,7 +253,7 @@ function replaceSafeTraceQLTemplate(
   if (final !== reconstructed) {
     throw new Error('A host variable cannot introduce a protected query expression.');
   }
-  const expanded = classifyProtectedTraceQL(final);
+  const expanded = classifyProtectedTraceQL(final, substringEnabled);
   if (hostValues.some(({ from, to }) => expanded.protectedRhsRanges.some((rhs) => from >= rhs.from && to <= rhs.to))) {
     throw new Error('A protected query value cannot come from a host variable.');
   }
@@ -403,6 +406,9 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     if ('protectedKeyId' in instanceSettings.jsonData && !instanceSettings.jsonData.protectedAttributesEnabled) {
       throw new Error('Legacy protected key configuration requires enabling protected attributes before use.');
     }
+    if (instanceSettings.jsonData.protectedAttributesSubstringEnabled && !instanceSettings.jsonData.protectedAttributesEnabled) {
+      throw new Error('Protected substring search requires protected attributes.');
+    }
     if (instanceSettings.jsonData.protectedAttributesEnabled) {
       registerProtectedDisplayMode();
     }
@@ -542,7 +548,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
         return [];
       }
       try {
-        const classification = classifyProtectedTraceQL(query);
+        const classification = classifyProtectedTraceQL(query, !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
         if (classification.protectedReferences || classification.dynamicReferences || isVariableBearing(query)) {
           return [];
         }
@@ -675,11 +681,12 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     const keys = this.protectedKeys;
     const keyEpoch = this.keyEpoch;
     if (protectedEnabled) {
-      assertStaticProtectedFilterDefaultsSafe(this.search?.filters ?? []);
+      assertStaticProtectedFilterDefaultsSafe(this.search?.filters ?? [], !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
       for (const target of originalTargets) {
         assertProtectedSavedModelSafe(
           target,
-          keys.map((key) => key.kid)
+          keys.map((key) => key.kid),
+          !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled
         );
       }
     }
@@ -689,7 +696,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     if (protectedEnabled && options.filters?.length) {
       assertHostAdHocFilterSourcesSafe(options.filters);
       const adHoc = this.languageProvider.generateQueryFromFilters({ adhocFilters: options.filters });
-      const classification = classifyProtectedTraceQL(adHoc);
+      const classification = classifyProtectedTraceQL(adHoc, !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
       if (classification.protectedReferences || classification.dynamicReferences || isVariableBearing(adHoc)) {
         throw new Error('Protected ad-hoc filters are not supported.');
       }
@@ -704,7 +711,8 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
           ? await openProtectedQueryModel(
               traceIdTemplate ? { ...migrated, query: '' } : migrated,
               (kid) => this.getProtectedKey(kid),
-              this.uid
+              this.uid,
+              !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled
             )
           : migrated;
         let query = traceIdTemplate ? (migrated.query ?? '') : (opened.query ?? '');
@@ -765,7 +773,8 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
               } else if (!effective.protectedReference) {
                 assertProtectedQueryModelSafe(
                   { refId: original.refId, queryType: 'traceqlSearch', filters: [filter] },
-                  keys.map((key) => key.kid)
+                  keys.map((key) => key.kid),
+                  !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled
                 );
               }
             }
@@ -782,7 +791,8 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
               ? replaceSafeTraceQLTemplate(
                   source,
                   (value) => this.templateSrv.replace(value, options.scopedVars ?? {}, VariableFormatID.Pipe),
-                  migrated.query?.startsWith('qenc:v1:') ?? false
+                  migrated.query?.startsWith('qenc:v1:') ?? false,
+                  !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled
                 )
               : this.templateSrv.replace(source, options.scopedVars ?? {}, VariableFormatID.Pipe);
         } else if (queryType === 'traceId' && query) {
@@ -792,17 +802,20 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
           throw new Error('Invalid trace ID query.');
         }
 
+        const metrics = queryType === 'traceql' && query && !this.isTraceIdQuery(query)
+          ? this.isTraceQlMetricsQuery(query)
+          : false;
         if (
           protectedEnabled &&
           (queryType === 'traceql' || queryType === 'traceqlSearch') &&
           query &&
           !this.isTraceIdQuery(query)
         ) {
-          query = await rewriteProtectedTraceQL(query, keys, this.isTraceQlMetricsQuery(query) ? 'metrics' : 'search');
+          query = await rewriteProtectedTraceQL(query, keys, metrics ? 'metrics' : 'search', !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
         }
         // Only backend/Live protocol fields cross the boundary, never editor, legacy,
         // ad-hoc, qenc, or arbitrary host model properties.
-        return {
+        const prepared = {
           refId: original.refId,
           datasource: this.getRef(),
           queryType,
@@ -820,6 +833,10 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
             serviceMapIncludeNamespace: opened.serviceMapIncludeNamespace,
           }),
         } as TempoQuery;
+        if (metrics) {
+          preparedMetricsTargets.add(prepared);
+        }
+        return prepared;
       })
     );
     if (protectedEnabled && this.keyEpoch !== keyEpoch) {
@@ -858,7 +875,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     for (const target of targets.traceql ?? []) {
       if (this.isTraceIdQuery(target.query ?? '')) {
         traceIdTargets.push(target);
-      } else if (this.isTraceQlMetricsQuery(target.query ?? '')) {
+      } else if (preparedTargets.has(target) ? preparedMetricsTargets.has(target) : this.isTraceQlMetricsQuery(target.query ?? '')) {
         metricsTargets.push(target);
       } else {
         searchTargets.push(target);
@@ -1007,7 +1024,8 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     if (protectedEnabled) {
       assertProtectedSavedModelSafe(
         query,
-        this.protectedKeys.map((key) => key.kid)
+        this.protectedKeys.map((key) => key.kid),
+        !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled
       );
     }
     const expandedQuery = { ...query };
@@ -1026,7 +1044,9 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
         !this.isTraceIdQuery(source) &&
         query.queryType !== 'traceId'
           ? replaceSafeTraceQLTemplate(source, (value) =>
-              this.templateSrv.replace(value, scopedVars, VariableFormatID.Pipe)
+              this.templateSrv.replace(value, scopedVars, VariableFormatID.Pipe),
+              false,
+              !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled
             )
           : this.templateSrv.replace(source, scopedVars, VariableFormatID.Pipe),
       serviceMapQuery: Array.isArray(query.serviceMapQuery)
@@ -1036,7 +1056,8 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     if (protectedEnabled) {
       assertProtectedSavedModelSafe(
         interpolated,
-        this.protectedKeys.map((key) => key.kid)
+        this.protectedKeys.map((key) => key.kid),
+        !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled
       );
     }
     return interpolated;
@@ -1345,11 +1366,11 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
       let finalQuery =
         typeof q === 'string'
           ? protectedConfigured && q
-            ? replaceSafeTraceQLTemplate(q, (value) => this.templateSrv.replace(value, {}, VariableFormatID.Pipe))
+            ? replaceSafeTraceQLTemplate(q, (value) => this.templateSrv.replace(value, {}, VariableFormatID.Pipe), false, !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled)
             : this.templateSrv.replace(q, {}, VariableFormatID.Pipe)
           : undefined;
       if (protectedConfigured && finalQuery) {
-        finalQuery = await rewriteProtectedTraceQL(finalQuery, this.protectedKeys, 'metadata');
+        finalQuery = await rewriteProtectedTraceQL(finalQuery, this.protectedKeys, 'metadata', !!this.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
       }
       const safeParams = { limit, start, end, tag, ...(finalQuery !== undefined && { q: finalQuery }) };
       const res = await this.getResource(url, safeParams, { method: 'GET', hideFromInspector: true });

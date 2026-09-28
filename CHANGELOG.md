@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add opt-in protected span substring search: browser-side NFC trigrams, pinned TraceQL `@>` parser, indexed `bi.*` query compilation, and guarded Builder/metadata/HTTP/Live paths. Requires a matching Alloy processor and Tempo build; terms shorter than three Unicode scalars are rejected.
 - Display protected Tempo span values in the stock Grafana Traces table and trace detail when the browser key is loaded; keep returned frames and host actions encrypted. Requires the accompanying `grafana-h` host build.
 - Open the protected key entry dialog after forgetting a key, with the old key and input cleared.
 - Remove the configured protected key ID: enable protection once and import or replace browser keys without changing Grafana datasource configuration.

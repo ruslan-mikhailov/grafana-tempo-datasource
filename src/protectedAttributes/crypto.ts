@@ -8,6 +8,9 @@ const attributeSalt = encoder.encode('tempo-attr-v1');
 const attributeInfo = encoder.encode('aes-256-siv');
 const modelSalt = encoder.encode('tempo-query-model-v1');
 const modelInfo = encoder.encode('aes-256-gcm');
+const substringPrefix = encoder.encode('tempo:substring:v1');
+const substringSalt = encoder.encode('tempo-substring-v1');
+const substringInfo = encoder.encode('hmac-sha256-trigram');
 const envelopePatterns = {
   enc: /^enc:v1:([0-9a-f]{32}):([A-Za-z0-9_-]+)$/,
   qenc: /^qenc:v1:([0-9a-f]{32}):([A-Za-z0-9_-]+)$/,
@@ -21,6 +24,7 @@ export type ProtectedAttributeCryptoErrorCode =
   | 'invalid-envelope'
   | 'key-mismatch'
   | 'authentication-failed'
+  | 'invalid-substring'
   | 'cleared';
 
 export class ProtectedAttributeCryptoError extends Error {
@@ -36,6 +40,7 @@ export interface ProtectedAttributeKey {
   decrypt(storedField: string, envelope: string): string;
   sealQueryModel(plaintext: string, context: string): Promise<string>;
   openQueryModel(envelope: string, context: string): Promise<string>;
+  substringTokens(storedField: string, plaintext: string): Promise<readonly string[]>;
   clear(): void;
 }
 
@@ -145,13 +150,36 @@ function parseEnvelope(envelope: string, kind: 'enc' | 'qenc', kid: string, minB
   return bytes;
 }
 
+function framed(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  if (bytes.length > 0xffffffff) {
+    throw error('invalid-substring');
+  }
+  const result = new Uint8Array(4 + bytes.length);
+  new DataView(result.buffer).setUint32(0, bytes.length, false);
+  result.set(bytes, 4);
+  return result;
+}
+
+function substringScalars(plaintext: string): string[] {
+  if (typeof plaintext !== 'string' || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(plaintext)) {
+    throw error('invalid-substring');
+  }
+  const normalized = plaintext.normalize('NFC');
+  const scalars = Array.from(normalized);
+  if (scalars.length < 3 || scalars.length > 512 || encoder.encode(normalized).length > 2048) {
+    throw error('invalid-substring');
+  }
+  return scalars;
+}
+
 class ImportedKey implements ProtectedAttributeKey {
   private cleared = false;
 
   constructor(
     readonly kid: string,
     private readonly attributeKey: Uint8Array,
-    private modelKey?: CryptoKey
+    private modelKey?: CryptoKey,
+    private substringKey?: CryptoKey
   ) {}
 
   private active(): CryptoKey {
@@ -243,10 +271,42 @@ class ImportedKey implements ProtectedAttributeKey {
     }
   }
 
+  async substringTokens(storedField: string, plaintext: string): Promise<readonly string[]> {
+    this.active();
+    if (typeof storedField !== 'string' || !storedField.startsWith('enc.') || storedField.length <= 4) {
+      throw error('invalid-field');
+    }
+    const scalars = substringScalars(plaintext);
+    const key = this.substringKey;
+    if (!key) {
+      throw error('cleared');
+    }
+    const prefix = framed(substringPrefix);
+    const field = framed(encoder.encode(storedField));
+    const result: string[] = [];
+    for (let i = 0; i <= scalars.length - 3; i++) {
+      const gram = framed(encoder.encode(scalars[i] + scalars[i + 1] + scalars[i + 2]));
+      const bytes = new Uint8Array(prefix.length + field.length + gram.length);
+      bytes.set(prefix);
+      bytes.set(field, prefix.length);
+      bytes.set(gram, prefix.length + field.length);
+      try {
+        const digest = new Uint8Array(await webCrypto().subtle.sign('HMAC', key, bytes));
+        this.active();
+        result.push(`bi:v1:${this.kid}:${encodeBase64url(digest)}`);
+        digest.fill(0);
+      } finally {
+        bytes.fill(0);
+      }
+    }
+    return result;
+  }
+
   clear(): void {
     this.cleared = true;
     this.attributeKey.fill(0);
     this.modelKey = undefined;
+    this.substringKey = undefined;
   }
 }
 
@@ -262,6 +322,7 @@ export async function importKey(base64: string): Promise<ProtectedAttributeKey> 
   }
   let attributeKey: Uint8Array | undefined;
   let modelBytes: Uint8Array<ArrayBuffer> | undefined;
+  let substringBytes: Uint8Array<ArrayBuffer> | undefined;
   try {
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', master));
     const kid = Array.from(digest.subarray(0, 16), (byte) => byte.toString(16).padStart(2, '0')).join('');
@@ -273,8 +334,12 @@ export async function importKey(base64: string): Promise<ProtectedAttributeKey> 
     modelBytes = new Uint8Array(await crypto.subtle.deriveBits(
       { name: 'HKDF', hash: 'SHA-256', salt: modelSalt, info: modelInfo }, hkdfKey, 256
     ));
+    substringBytes = new Uint8Array(await crypto.subtle.deriveBits(
+      { name: 'HKDF', hash: 'SHA-256', salt: substringSalt, info: substringInfo }, hkdfKey, 256
+    ));
+    const substringKey = await crypto.subtle.importKey('raw', substringBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
     const modelKey = await crypto.subtle.importKey('raw', modelBytes, 'AES-GCM', false, ['encrypt', 'decrypt']);
-    const handle = new ImportedKey(kid, attributeKey, modelKey);
+    const handle = new ImportedKey(kid, attributeKey, modelKey, substringKey);
     attributeKey = undefined;
     return handle;
   } catch {
@@ -283,5 +348,6 @@ export async function importKey(base64: string): Promise<ProtectedAttributeKey> 
     master.fill(0);
     attributeKey?.fill(0);
     modelBytes?.fill(0);
+    substringBytes?.fill(0);
   }
 }

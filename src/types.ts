@@ -6,6 +6,8 @@ import { type TempoQuery as TempoBase, type TempoQueryType, type TraceqlFilter }
 export interface TempoJsonData extends DataSourceJsonData {
   /** Enable browser-only protected attribute handling without configuring a key ID. */
   protectedAttributesEnabled?: boolean;
+  /** Opt in to ordered-trigram substring search on indexed protected span attributes. */
+  protectedAttributesSubstringEnabled?: boolean;
   tracesToLogs?: TraceToLogsOptions;
   serviceMap?: {
     datasourceUid?: string;

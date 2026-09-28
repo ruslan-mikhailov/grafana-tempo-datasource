@@ -1,0 +1,331 @@
+
+@top TraceQL {
+    SpansetPipelineExpression |
+    SpansetPipelineExpression WithHint
+}
+
+@precedence {
+    Gt @left
+    Lt @left
+    Desc @left
+    Anc @left
+    tilde @left
+    fieldOp @left
+    comparisonOp @left
+    scalarOp @left
+    And @left
+    Or @left
+    Pipe @left
+    ExperimentalOp @left
+    UnionStructuralOp @left
+    prefix
+    close_paren
+}
+
+SpansetPipelineExpression {
+    "(" SpansetPipelineExpression !close_paren ")" |
+    SpansetPipelineExpression !And And SpansetPipelineExpression |
+    SpansetPipelineExpression !Gt Gt SpansetPipelineExpression |
+    SpansetPipelineExpression !Desc Desc SpansetPipelineExpression |
+    SpansetPipelineExpression !Lt Lt SpansetPipelineExpression |
+    SpansetPipelineExpression !Anc Anc SpansetPipelineExpression |
+    SpansetPipelineExpression !Or Or SpansetPipelineExpression |
+    SpansetPipelineExpression !tilde tilde SpansetPipelineExpression |
+    SpansetPipelineExpression !Pipe Pipe SpansetPipelineExpression |
+    SpansetPipelineExpression !ExperimentalOp ExperimentalOp SpansetPipelineExpression |
+    SpansetPipelineExpression !UnionStructuralOp UnionStructuralOp SpansetPipelineExpression |
+    WrappedSpansetPipeline |
+    SpansetPipeline
+}
+
+WrappedSpansetPipeline {
+    "(" SpansetPipeline !close_paren ")"
+}
+
+SpansetPipeline {
+    SpansetExpression |
+    SpansetFilter |
+    ScalarFilter |
+    GroupOperation |
+    SelectOperation |
+    CoalesceOperation |
+    MetricsOperation |
+    MetricsAggregatorFunctions
+}
+
+GroupOperation {
+    "by" "(" FieldExpression ("," FieldExpression)* ")"
+}
+
+CoalesceOperation {
+    "coalesce" "()"
+}
+
+SelectOperation {
+    "select" "(" SelectArgs ")"
+}
+
+SelectArgs {
+    FieldExpression |
+    SelectArgs "," FieldExpression
+}
+
+SpansetExpression {
+    "(" SpansetExpression !close_paren ")" |
+    SpansetExpression !And And SpansetExpression |
+    SpansetExpression !Gt Gt SpansetExpression |
+    SpansetExpression !Lt Lt SpansetExpression |
+    SpansetExpression !Desc Desc SpansetExpression |
+    SpansetExpression !Anc Anc SpansetExpression |
+    SpansetExpression !Or Or SpansetExpression |
+    SpansetExpression !tilde tilde SpansetExpression
+}
+
+SpansetFilter {
+    "{" "}" |
+    "{" FieldExpression "}"
+}
+
+ScalarFilter {
+    ScalarExpression !comparisonOp ComparisonOp ScalarExpression
+}
+
+ScalarExpression {
+    "(" ScalarExpression !close_paren ")" |
+    ScalarExpression !scalarOp ScalarOp ScalarExpression |
+    Aggregate |
+    Integer |
+    Float |
+    Duration |
+    TemplateVariable |
+    !prefix "-" Integer |
+    !prefix "-" Float |
+    !prefix "-" Duration
+}
+
+Aggregate {
+    "count()" |
+    AggregateExpression "(" FieldExpression ")"
+}
+
+AggregateExpression { "max" | "min" | "avg" | "sum" }
+
+FieldExpression {
+    "(" FieldExpression ")" |
+    FieldExpression !fieldOp FieldOp FieldExpression |
+    FieldExpression !And And FieldExpression |
+    FieldExpression !Or Or FieldExpression |
+    !prefix "-" FieldExpression |
+    !prefix "!" FieldExpression |
+    Static |
+    IntrinsicField |
+    AttributeField
+}
+
+MetricsOperation {
+    MetricsOperationBasic |
+    MetricsOperationHistogram |
+    MetricsOperationQuantile |
+    MetricsOperationCompare |
+    MetricsOverTime
+}
+
+MetricsOperationBasic {
+    MetricsOperationBasicType "()" |
+    MetricsOperationBasicType "()" GroupOperation
+}
+
+MetricsOperationHistogram {
+    "histogram_over_time" "(" MetricsExpression ")" |
+    "histogram_over_time" "(" MetricsExpression ")" GroupOperation
+}
+
+MetricsOperationQuantile {
+    "quantile_over_time" "(" MetricsOperationQuantileArgs ")" |
+    "quantile_over_time" "(" MetricsOperationQuantileArgs ")" GroupOperation
+}
+
+MetricsOverTime {
+    MetricsOverTimeType "(" MetricsExpression ")" |
+    MetricsOverTimeType "(" MetricsExpression ")" GroupOperation
+}
+
+MetricsOverTimeType {"min_over_time" | "max_over_time" | "avg_over_time" | "sum_over_time" }
+
+MetricsOperationBasicType { "rate" | "count_over_time" }
+
+MetricsOperationQuantileArgs {
+    MetricsExpression "," MetricsOperationQuantileArgsType ("," MetricsOperationQuantileArgsType)*
+}
+
+MetricsOperationQuantileArgsType { Float | Integer }
+
+MetricsExpression {
+    IntrinsicField |
+    AttributeField
+}
+
+MetricsAggregatorFunctions {
+    MetricsAggregatorFunctionType "(" Integer ")"
+}
+
+MetricsAggregatorFunctionType { "topk" | "bottomk" }
+
+Static {
+    String |
+    Integer |
+    Float |
+    "true" |
+    "false" |
+    "nil" |
+    Duration |
+    TemplateVariable |
+    "ok" |
+    "error" |
+    "unset" |
+    "unspecified" |
+    "internal" |
+    "server" |
+    "client" |
+    "producer" |
+    "consumer"
+}
+
+IntrinsicField {
+    "duration" |
+    "event:name" |
+    "event:timeSinceStart" |
+    "instrumentation:name" |
+    "instrumentation:version" |
+    "kind" |
+    "link:spanID" |
+    "link:traceID" |
+    "name" |
+    "rootName" |
+    "rootServiceName" |
+    "span:duration" |
+    "span:kind" |
+    "span:id" |
+    "span:name" |
+    "span:parentID" |
+    "span:status" |
+    "span:statusMessage" |
+    "status" |
+    "statusMessage" |
+    "trace:duration" |
+    "trace:id" |
+    "trace:rootName" |
+    "trace:rootService" |
+    "traceDuration" |
+    Parent
+}
+
+AttributeField {
+    "." Identifier |
+    Event "." Identifier |
+    Instrumentation "." Identifier |
+    Link "." Identifier |
+    Resource "." Identifier |
+    Span "." Identifier |
+    Parent "." Identifier |
+    Parent "." Event "." Identifier
+    Parent "." Instrumentation "." Identifier |
+    Parent "." Link "." Identifier |
+    Parent "." Resource "." Identifier |
+    Parent "." Span "." Identifier
+}
+
+WithHint {
+    With "(" HintParameters ")"
+}
+
+HintParameters {
+    HintParameter
+}
+
+HintParameter {
+    HintIdentifier "=" HintValue
+}
+
+HintValue {
+    "true" |
+    "false"
+}
+
+@tokens {
+    // All caracters but whitespace and those listed at the following link are valid:
+    // https://github.com/grafana/tempo/blob/b29c9413358da6e1b66c2930991eca2f10d9ec88/pkg/traceql/lexer.go#L350
+    // Some valid queries are currently not handled by the parser, because there are some issues in writing the correct regex.
+    // We should handle this, and potentially also simplify the regex.
+    identifierExpression { (('"'  (![\\"] | "\\\\" | '\\"')* '"' ) | $[a-zA-Z_@#$%*-+?:;'`]) (('"'  (![\\"] | "\\\\" | '\\"')* '"' ) | ![^{}()=~!<>&|," ])* }
+    templateVariableWithBraces {
+        "{" identifierExpression "}" |
+        "{" identifierExpression ":" $[a-zA-Z0-9_.]+ "}"
+    }
+
+    whitespace { std.whitespace+ }
+    stringBacktick { "`" ![`]* "`" }
+    stringDouble { '"' (!["\\] | '\\"' | "\\\\")* '"' }  // single quote (') strings are currently not supported
+
+    String { (stringDouble) | (stringBacktick) }
+    Integer { @digit+ }
+    Float { @digit+ "." @digit+ }
+    Duration { (Integer | Float) ("us"|"µs"|"ns"|"ms"|"s"|"m"|"h") }
+
+    @precedence { Duration, Float, Integer }
+
+    Identifier { identifierExpression | "$" templateVariableWithBraces }
+    TemplateVariable { "$" identifierExpression | "$" templateVariableWithBraces }
+
+    And { "&&" }
+    Or { "||" }
+    Gt { ">" }
+    Lt { "<" }
+    Desc { ">>" }
+    Anc { "<<" }
+    tilde { "~" }
+    Pipe { "|" }
+    ComparisonOp { "=" | "!=" | "<" | "<=" | ">" | ">=" | "=~" | "!~" }
+    ExperimentalOp { "!>" | "!>>" | "!<" | "!<<" | "!~" }
+    UnionStructuralOp { "&>>" | "&<<" | "&>" | "&<" | "&~" }
+    ScalarOp {"+" | "-" | "*" | "/" | "%" | "^"  }
+    FieldOp { ComparisonOp | ScalarOp | tilde | "@>" }
+
+    Parent { "parent" }
+    Event { "event" }
+    Instrumentation { "instrumentation" }
+    Link { "link" }
+    Resource { "resource" }
+    Span { "span" }
+    With { "with" }
+
+    HintIdentifier { "most_recent" }
+
+    LineComment { "//" ![\n]* }
+
+    @precedence { Parent, Resource, Span, Event, Instrumentation, Link, With, TopK, BottomK, Identifier }
+
+    // Required to avoid ambiguity between "/" and "//"
+    @precedence { LineComment, ScalarOp, FieldOp }
+}
+
+@skip {
+    // `BlockComment` is needed also here
+    whitespace | LineComment | BlockComment
+}
+
+@skip {} {
+  BlockComment { "/*" (blockCommentContent | blockCommentNewline)* blockCommentEnd }
+}
+
+@local tokens {
+  blockCommentEnd { "*/" }
+  blockCommentNewline { "\n" }
+  @else blockCommentContent
+}
+
+MetricsOperationCompare {
+    "compare" "(" SpansetFilter ")" |
+    "compare" "(" SpansetFilter "," Integer ")" |
+    "compare" "(" SpansetFilter "," Integer "," Integer "," Integer ")"
+}

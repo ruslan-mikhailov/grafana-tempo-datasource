@@ -195,3 +195,53 @@ describe('protected TraceQL compiler', () => {
     ).rejects.toThrow();
   });
 });
+
+describe('protected substring compiler', () => {
+  const first = {
+    kid: '630dcd2966c4336691125448bbb25b4f',
+    substringTokens: jest.fn(async (_field: string, _value: string) => ['bi:v1:first:coo', 'bi:v1:first:ool']),
+  } as unknown as ProtectedAttributeKey;
+  const second = {
+    kid: 'a'.repeat(32),
+    substringTokens: jest.fn(async (_field: string, _value: string) => ['bi:v1:second:coo', 'bi:v1:second:ool']),
+  } as unknown as ProtectedAttributeKey;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('seals plaintext drafts and compiles whole per-key ordered sequences without exposing plaintext', async () => {
+    const raw = '{span."enc.secret" @> "cool" && span.http.route="users"} with (most_recent=true)';
+    expect(classifyProtectedTraceQL(raw, true).requiresSealing).toBe(true);
+    expect(await rewriteProtectedTraceQL(raw, [first, second], 'search', true)).toBe(
+      '{(span."bi.secret" @> ["bi:v1:first:coo","bi:v1:first:ool"] || span."bi.secret" @> ["bi:v1:second:coo","bi:v1:second:ool"]) && span.http.route="users"} | select(span."enc.secret") with (most_recent=true)'
+    );
+    expect(first.substringTokens).toHaveBeenCalledWith('enc.secret', 'cool');
+    expect(second.substringTokens).toHaveBeenCalledWith('enc.secret', 'cool');
+    expect(await rewriteProtectedTraceQL('{span.enc.secret @> "cool"} | rate()', first, 'metrics', true)).toBe(
+      '{span."bi.secret" @> ["bi:v1:first:coo","bi:v1:first:ool"]} | rate()'
+    );
+    expect(await rewriteProtectedTraceQL('{span.enc.secret @> "cool"}', first, 'metadata', true)).toBe(
+      '{span."bi.secret" @> ["bi:v1:first:coo","bi:v1:first:ool"]}'
+    );
+    const envelopeLiteral = `enc:v1:630dcd2966c4336691125448bbb25b4f:7aUwjY5fPtHvu_dUnzcxBJc6XQ`;
+    expect(classifyProtectedTraceQL(`{span.enc.secret @> "${envelopeLiteral}"}`, true).requiresSealing).toBe(true);
+    await rewriteProtectedTraceQL(`{span.enc.secret @> "${envelopeLiteral}"}`, first, 'search', true);
+    expect(first.substringTokens).toHaveBeenCalledWith('enc.secret', envelopeLiteral);
+  });
+
+  it('rejects disabled, keyless, invalid scopes, sidecar injection and nonliteral RHS before rewrite', async () => {
+    expect(() => classifyProtectedTraceQL('{span.enc.secret @> "cool"}')).toThrow();
+    await expect(rewriteProtectedTraceQL('{span.enc.secret @> "cool"}', undefined, 'search', true)).rejects.toThrow();
+    for (const query of [
+      '{resource.enc.secret @> "cool"}',
+      '{span.bi.secret @> "cool"}',
+      '{span.enc.secret @> nil}',
+      '{span.enc.secret @> "a\\n"}',
+      '{span.enc.secret @> $value}',
+    ]) {
+      await expect(rewriteProtectedTraceQL(query, first, 'search', true)).rejects.toThrow();
+    }
+    expect(first.substringTokens).not.toHaveBeenCalled();
+  });
+});

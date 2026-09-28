@@ -91,7 +91,7 @@ const TraceQLSearch = ({
       return;
     }
     try {
-      assertStaticProtectedFilterDefaultsSafe(datasource.search?.filters);
+      assertStaticProtectedFilterDefaultsSafe(datasource.search?.filters, !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
     } catch {
       setLocked(true);
       setLegacy(false);
@@ -101,7 +101,8 @@ const TraceQLSearch = ({
     try {
       assertProtectedQueryModelSafe(
         query,
-        (datasource.protectedKeys ?? (key ? [key] : [])).map((item) => item.kid)
+        (datasource.protectedKeys ?? (key ? [key] : [])).map((item) => item.kid),
+        !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
       );
     } catch {
       setLocked(true);
@@ -146,7 +147,8 @@ const TraceQLSearch = ({
     void openProtectedQueryModel(
       query,
       datasource.getProtectedKey?.bind(datasource) ?? ((kid) => keys.find((item) => item.kid === kid)),
-      datasource.uid
+      datasource.uid,
+      !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
     ).then(
       (opened) => {
         if (generation.current === current) {
@@ -204,7 +206,7 @@ const TraceQLSearch = ({
       setPending(true);
       try {
         if (!key) {
-          assertProtectedQueryModelSafe(next);
+          assertProtectedQueryModelSafe(next, undefined, !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
           savedKey.current = key;
           savedModel.current = next;
           onChange(next);
@@ -219,7 +221,8 @@ const TraceQLSearch = ({
           key,
           datasource.uid,
           query,
-          datasource.getProtectedKey?.bind(datasource)
+          datasource.getProtectedKey?.bind(datasource),
+          !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
         ).then(
           (sealed) => {
             if (generation.current !== current || datasource.protectedKey !== key) {
@@ -305,7 +308,7 @@ const TraceQLSearch = ({
     }
     try {
       if (protectedMode) {
-        assertStaticProtectedFilterDefaultsSafe(datasource.search.filters);
+        assertStaticProtectedFilterDefaultsSafe(datasource.search.filters, !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
       }
       for (const filter of datasource.search.filters ?? []) {
         if (filter.value && !findFilter(filter.id)) {
@@ -380,7 +383,8 @@ const TraceQLSearch = ({
                   currentKey,
                   datasource.uid,
                   query,
-                  datasource.getProtectedKey?.bind(datasource)
+                  datasource.getProtectedKey?.bind(datasource),
+                  !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
                 ).then(
                   (sealed) => {
                     if (generation.current === current && datasource.protectedKey === currentKey) {
@@ -556,13 +560,14 @@ const TraceQLSearch = ({
                           key,
                           datasource.uid,
                           query,
-                          datasource.getProtectedKey?.bind(datasource)
+                          datasource.getProtectedKey?.bind(datasource),
+                          !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
                         )
                       : Promise.resolve(candidate);
                   void result
                     .then((sealed) => {
                       if (protectedMode) {
-                        assertProtectedQueryModelSafe(sealed, key?.kid);
+                        assertProtectedQueryModelSafe(sealed, key?.kid, !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
                       }
                       if (generation.current === current && (!protectedMode || datasource.protectedKey === key)) {
                         copyPendingRef.current = false;

@@ -153,7 +153,7 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
     const kids = keys.map((key) => key.kid);
     try {
       if (protectedMode) {
-        assertProtectedQueryModelSafe(next, kids);
+        assertProtectedQueryModelSafe(next, kids, !!this.props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
       }
     } catch {
       this.setState({ queryError: 'Protected query cannot be saved until it is sealed or corrected.' });
@@ -182,7 +182,8 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
       if (protectedMode) {
         assertProtectedQueryModelSafe(
           target,
-          keys.map((key) => key.kid)
+          keys.map((key) => key.kid),
+          !!datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
         );
         const sealedValues = [
           target.query,
@@ -632,6 +633,8 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
                   <p>
                     Only stored enc.* span attributes are protected; query them as span.enc.*. Equal values in the same
                     field remain recognizable in ciphertext. Unprefixed attributes and searches are not protected.
+                    When enabled, indexed span.enc.* attributes also support keyed substring search with {'@>'} and at least
+                    three normalized characters. Older traces without an index do not match.
                   </p>
                 </details>
                 {this.state.keyError && <div role="alert">{this.state.keyError}</div>}

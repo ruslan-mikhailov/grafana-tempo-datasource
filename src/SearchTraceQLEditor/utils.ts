@@ -110,8 +110,11 @@ const tagHelper = (f: TraceqlFilter, filters: TraceqlFilter[]) => {
 };
 
 export const filterToQuerySection = (f: TraceqlFilter, filters: TraceqlFilter[], lp: TempoLanguageProvider) => {
-  if (isProtectedBuilderValue(f, lp) && !['=', '!='].includes(f.operator ?? '')) {
-    throw new Error('Protected filters support equality and inequality only');
+  if (isProtectedBuilderValue(f, lp) && !['=', '!=', ...(lp.datasource.instanceSettings?.jsonData?.protectedAttributesSubstringEnabled ? ['@>'] : [])].includes(f.operator ?? '')) {
+    throw new Error('Protected filter operator is not enabled');
+  }
+  if (f.operator === '@>' && Array.isArray(f.value)) {
+    throw new Error('Substring search requires a single string value');
   }
   if (Array.isArray(f.value) && f.value.length > 1 && !isRegExpOperator(f.operator!)) {
     // For negative operators (!=), use && instead of ||
@@ -119,7 +122,8 @@ export const filterToQuerySection = (f: TraceqlFilter, filters: TraceqlFilter[],
     return `(${f.value.map((v) => `${scopeHelper(f, lp)}${tagHelper(f, filters)}${f.operator}${valueHelper({ ...f, value: v }, lp)}`).join(joinOperator)})`;
   }
 
-  return `${scopeHelper(f, lp)}${tagHelper(f, filters)}${f.operator}${valueHelper(f, lp)}`;
+  const operator = f.operator === '@>' ? ' @> ' : f.operator;
+  return `${scopeHelper(f, lp)}${tagHelper(f, filters)}${operator}${valueHelper(f, lp)}`;
 };
 
 export const getTagWithoutScope = (tag: string) => {
@@ -213,6 +217,9 @@ export const operatorSelectableValue = (op: string) => {
       break;
     case '!~':
       result.description = 'Does not match regex';
+      break;
+    case '@>':
+      result.description = 'Contains substring';
       break;
   }
   return result;

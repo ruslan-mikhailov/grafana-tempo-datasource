@@ -80,7 +80,8 @@ export function TraceQLEditor(props: Props) {
     try {
       assertProtectedQueryModelSafe(
         query,
-        (props.datasource.protectedKeys ?? (key ? [key] : [])).map((item) => item.kid)
+        (props.datasource.protectedKeys ?? (key ? [key] : [])).map((item) => item.kid),
+        !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
       );
     } catch {
       // Existing legacy plaintext remains in the host model. Only a key holder
@@ -108,7 +109,8 @@ export function TraceQLEditor(props: Props) {
     void openProtectedQueryModel(
       query,
       props.datasource.getProtectedKey?.bind(props.datasource) ?? openingKey,
-      props.datasource.uid
+      props.datasource.uid,
+      !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
     ).then(
       (opened) => {
         if (generation.current === current) {
@@ -159,7 +161,7 @@ export function TraceQLEditor(props: Props) {
     }
     try {
       if (!key) {
-        assertProtectedQueryModelSafe(candidate);
+        assertProtectedQueryModelSafe(candidate, undefined, !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled);
         onChange(candidate);
         committed.current = true;
         setDirty(false);
@@ -172,7 +174,8 @@ export function TraceQLEditor(props: Props) {
         key,
         props.datasource.uid,
         queryRef.current,
-        props.datasource.getProtectedKey?.bind(props.datasource)
+        props.datasource.getProtectedKey?.bind(props.datasource),
+        !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
       ).then(
         (sealed) => {
           if (generation.current !== current || props.datasource.protectedKey !== key) {
@@ -310,7 +313,8 @@ export function TraceQLEditor(props: Props) {
               currentKey,
               props.datasource.uid,
               queryRef.current,
-              props.datasource.getProtectedKey?.bind(props.datasource)
+              props.datasource.getProtectedKey?.bind(props.datasource),
+              !!props.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled
             ).then(
               (sealed) => {
                 if (generation.current === current && props.datasource.protectedKey === currentKey) {

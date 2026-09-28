@@ -419,7 +419,7 @@ export class CompletionProvider implements monacoTypes.languages.CompletionItemP
     const { range, offset } = getRangeAndOffset(this.monaco, model, position);
 
     const situation = getSituation(model.getValue(), offset);
-    const completionItems = situation != null ? this.getCompletions(situation, this.setAlertText) : Promise.resolve([]);
+    const completionItems = situation != null ? this.getCompletions(situation, this.setAlertText, offset) : Promise.resolve([]);
 
     return completionItems.then((items) => {
       const suggestions = completionItemsToSuggestions(
@@ -468,7 +468,7 @@ export class CompletionProvider implements monacoTypes.languages.CompletionItemP
    * @param situation
    * @private
    */
-  private async getCompletions(situation: Situation, setAlertText: (text?: string) => void): Promise<CompletionItem[]> {
+  private async getCompletions(situation: Situation, setAlertText: (text?: string) => void, offset = situation.query.length): Promise<CompletionItem[]> {
     switch (situation.type) {
       // This should only happen for cases that we do not support yet
       case 'UNKNOWN': {
@@ -486,7 +486,7 @@ export class CompletionProvider implements monacoTypes.languages.CompletionItemP
       }
       case 'SPANSET_IN_THE_MIDDLE':
       case 'SPANSET_EXPRESSION_OPERATORS_WITH_MISSING_CLOSED_BRACE':
-        return this.getOperatorsCompletions([...CompletionProvider.comparisonOps, ...CompletionProvider.logicalOps]);
+        return this.getOperatorsCompletions([...CompletionProvider.comparisonOps, ...CompletionProvider.logicalOps, ...this.substringOperator(situation.query, offset)]);
       case 'SPANSET_IN_NAME':
         return this.getScopesCompletions().concat(this.getIntrinsicsCompletions()).concat(this.getTagsCompletions());
       case 'SPANSET_IN_NAME_SCOPE':
@@ -496,6 +496,7 @@ export class CompletionProvider implements monacoTypes.languages.CompletionItemP
           ...CompletionProvider.comparisonOps,
           ...CompletionProvider.logicalOps,
           ...CompletionProvider.arithmeticOps,
+          ...this.substringOperator(situation.query, offset),
         ]);
       case 'SPANFIELD_COMBINING_OPERATORS':
         return this.getOperatorsCompletions([
@@ -521,7 +522,7 @@ export class CompletionProvider implements monacoTypes.languages.CompletionItemP
           .concat(this.getTagsCompletions('.'));
         return [...functions, ...tags];
       case 'SPANSET_COMPARISON_OPERATORS':
-        return this.getOperatorsCompletions(CompletionProvider.comparisonOps);
+        return this.getOperatorsCompletions([...CompletionProvider.comparisonOps, ...this.substringOperator(situation.query, offset)]);
       case 'SPANSET_IN_VALUE':
         let tagValues;
         try {
@@ -579,6 +580,15 @@ export class CompletionProvider implements monacoTypes.languages.CompletionItemP
       default:
         throw new Error(`Unexpected situation ${situation}`);
     }
+  }
+
+  private substringOperator(query: string, offset: number): MinimalCompletionItem[] {
+    if (!this.languageProvider.datasource?.instanceSettings?.jsonData?.protectedAttributesEnabled ||
+        !this.languageProvider.datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled ||
+        !/(?:^|[({&|])\s*span\.(?:enc\.[\p{L}\p{N}_.-]+|"enc\.[^"\\\u0000-\u001f]+")\s*$/u.test(query.slice(0, offset))) {
+      return [];
+    }
+    return [{ label: '@>', insertText: '@>', detail: 'Protected substring search' }];
   }
 
   private getTagsCompletions(prepend?: string, scope?: string): CompletionItem[] {

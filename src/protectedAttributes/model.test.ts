@@ -249,3 +249,22 @@ test('known scoped intrinsics remain usable while malformed colon names and mism
     assertProtectedQueryModelSafe(query('', [{ ...safe.filters[1], scope: TraceqlSearchScope.Resource }]), kid)
   ).toThrow();
 });
+
+test('substring raw query and scalar Builder value seal before host persistence; arrays and disabled flag fail', async () => {
+  const key = await importKey(master);
+  const raw = query('{span."enc.password" @> "cool"}');
+  expect(() => assertProtectedQueryModelSafe(raw, kid, true)).toThrow();
+  const sealedRaw = await prepareProtectedQueryModel(raw, key, uid, undefined, undefined, true);
+  expect(sealedRaw.query).toMatch(/^qenc:v1:/);
+  expect(sealedRaw.query).not.toContain('cool');
+  expect((await openProtectedQueryModel(sealedRaw, key, uid, true)).query).toBe(raw.query);
+  const builder = query('', [{ ...protectedFilter('cool'), operator: '@>', valueType: 'string' }]);
+  await expect(prepareProtectedQueryModel(builder, key, uid)).rejects.toThrow();
+  const sealedBuilder = await prepareProtectedQueryModel(builder, key, uid, undefined, undefined, true);
+  expect(sealedBuilder.filters[0].value).toMatch(/^qenc:v1:/);
+  expect((await openProtectedQueryModel(sealedBuilder, key, uid, true)).filters[0].value).toBe('cool');
+  expect(() => assertProtectedQueryModelSafe(builder, kid, true)).toThrow();
+  await expect(prepareProtectedQueryModel(query('', [{ ...builder.filters[0], value: ['cool'] }]), key, uid, undefined, undefined, true)).rejects.toThrow();
+  await expect(prepareProtectedQueryModel(query('', [{ ...builder.filters[0], tag: 'bi.password' }]), key, uid, undefined, undefined, true)).rejects.toThrow();
+  await expect(prepareProtectedQueryModel(query('', [{ ...builder.filters[0], tag: '${attribute}' }]), key, uid, undefined, undefined, true)).rejects.toThrow();
+});
