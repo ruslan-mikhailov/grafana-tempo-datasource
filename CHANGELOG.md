@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Open the local file picker directly from the key-revocation form's **Choose local key file** action, including after switching from paste mode; remove the redundant file-mode button.
+- Pass protected query values starting with `enc:` unchanged in Raw and Builder `=`, `!=`, `=~`, `!~`, `@>`, and `!@>` predicates, without a key, envelope-format checks, or automatic projection. Encrypt non-prefixed regex literals with the selected key; keep non-prefixed substring predicates on indexed search. Ciphertext substring inspection requires the matching Tempo validation update, not a blind index. Omit incomplete autocomplete context from metadata requests while retaining ordinary value suggestions; keep unfinished drafts local and validate on explicit Run.
 - Fix the clipped key-revocation file picker by using a Grafana button to open the local file dialog; add spacing between key-loading controls.
 - Remove the protected substring-search settings switch while retaining provisioned query support. Make both demo Tempo datasources editable, and authorize key revocation by Grafana's trusted organization Admin role, including anonymous Admins.
 - Add administrator-only key revocation in Tempo datasource settings: load a base64 key locally, discover `enc` attributes, confirm irreversible replacement, and submit per-attribute scheduler jobs through an authorized backend bridge. Require a provisioned scheduler URL and tenant; show queued batches and partial failures without automatic retries. Protected substring search is not required.

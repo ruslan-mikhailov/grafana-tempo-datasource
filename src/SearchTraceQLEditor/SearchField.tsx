@@ -13,6 +13,7 @@ import { type TempoDatasource } from '../datasource';
 import { OPTIONS_LIMIT } from '../language_provider';
 import { operators as allOperators, stringOperators, numberOperators, keywordOperators } from '../traceql/traceql';
 import { classifyProtectedFilter } from '../protectedAttributes/model';
+import { isCiphertextQueryValue } from '../protectedAttributes/traceql';
 
 import { filterScopedTag, operatorSelectableValue } from './utils';
 
@@ -156,8 +157,10 @@ const SearchField = ({
       operatorList = numberOperators;
   }
   if (protection) {
-    operatorList = ['=', '!=', ...(explicitProtection && filter.scope === TraceqlSearchScope.Span &&
-      datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled ? ['@>', '!@>'] : [])];
+    const directSubstring = explicitProtection && typeof filter.value === 'string' &&
+      isCiphertextQueryValue(filter.value);
+    operatorList = ['=', '!=', '=~', '!~', ...(explicitProtection && filter.scope === TraceqlSearchScope.Span &&
+      (datasource.instanceSettings.jsonData.protectedAttributesSubstringEnabled || directSubstring) ? ['@>', '!@>'] : [])];
   }
   const operatorOptions = operatorList.map(operatorSelectableValue);
 

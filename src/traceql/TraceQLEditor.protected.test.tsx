@@ -8,6 +8,11 @@ import { type TempoQuery } from '../types';
 
 import { TraceQLEditor } from './TraceQLEditor';
 
+let mockMountEditorActions = false;
+afterEach(() => {
+  mockMountEditorActions = false;
+});
+
 // Monaco registers the first onChange closure when mounted. Preserve that
 // behavior so the test fails if unlocking merely replaces a React callback.
 jest.mock('@grafana/ui', () => {
@@ -19,18 +24,41 @@ jest.mock('@grafana/ui', () => {
       value,
       onChange,
       readOnly,
+      onEditorDidMount,
     }: {
       value: string;
       onChange: (value: string) => void;
       readOnly?: boolean;
+      onEditorDidMount?: (editor: never, monaco: never) => void;
     }) => {
       const firstChange = React.useRef(onChange);
-      return React.createElement('textarea', {
-        'aria-label': 'raw traceql',
-        value,
-        readOnly,
-        onChange: (event: ReactType.ChangeEvent<HTMLTextAreaElement>) => firstChange.current(event.target.value),
-      });
+      const runAction = React.useRef<() => void>(() => {});
+      React.useEffect(() => {
+        if (mockMountEditorActions) {
+          onEditorDidMount?.({
+            addAction: ({ run }: { run: () => void }) => { runAction.current = run; },
+            addCommand: () => null,
+            getModel: () => null,
+            onDidChangeModelContent: () => {},
+            onDidContentSizeChange: () => {},
+            getDomNode: () => null,
+          } as never, {
+            Range: class {},
+            KeyMod: { Shift: 1 },
+            KeyCode: { Enter: 2 },
+            languages: { registerCompletionItemProvider: () => ({ dispose: () => {} }) },
+          } as never);
+        }
+      }, []);
+      return React.createElement(React.Fragment, null,
+        React.createElement('textarea', {
+          'aria-label': 'raw traceql',
+          value,
+          readOnly,
+          onChange: (event: ReactType.ChangeEvent<HTMLTextAreaElement>) => firstChange.current(event.target.value),
+        }),
+        mockMountEditorActions && React.createElement('button', { onClick: () => runAction.current() }, 'Run editor action')
+      );
     },
   };
 });
@@ -217,7 +245,7 @@ test('allows ordinary raw edits without an imported key but rejects protected pl
 });
 
 test('keyless raw ciphertext remains editable without persisting plaintext', async () => {
-  const ciphertext = 'enc:v1:630dcd2966c4336691125448bbb25b4f:7aUwjY5fPtHvu_dUnzcxBJc6XQ';
+  const ciphertext = 'enc:custom';
   const raw = `{span.enc.password="${ciphertext}"}`;
   const datasource = {
     uid: 'tempo-uid',
@@ -239,4 +267,77 @@ test('keyless raw ciphertext remains editable without persisting plaintext', asy
   expect(editor).toHaveValue(raw);
   fireEvent.change(editor, { target: { value: raw.replace('=', '!=') } });
   expect(hostChange).toHaveBeenCalledWith(expect.objectContaining({ query: raw.replace('=', '!=') }));
+});
+
+test('incomplete ordinary typing stays local without a save error and an explicit run explains the block', async () => {
+  mockMountEditorActions = true;
+  const datasource = {
+    uid: 'tempo-uid',
+    instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
+    languageProvider: { start: jest.fn().mockResolvedValue(undefined), shouldRefreshLabels: () => false },
+  } as unknown as TempoDatasource;
+  const hostChange = jest.fn();
+  const hostRun = jest.fn();
+  const pending = jest.fn();
+  render(<TraceQLEditor placeholder="TraceQL" datasource={datasource}
+    query={{ refId: 'A', queryType: 'traceql', query: '{span.http.route="old"}', filters: [] }}
+    onChange={hostChange} onRunQuery={hostRun} onPendingChange={pending} />);
+  const editor = screen.getByRole('textbox', { name: 'raw traceql' });
+  await waitFor(() => expect(editor).not.toHaveAttribute('readonly'));
+  fireEvent.change(editor, { target: { value: '{r}' } });
+  expect(hostChange).not.toHaveBeenCalled();
+  expect(pending).toHaveBeenLastCalledWith(true);
+  expect(screen.queryByText('Complete or correct the protected query before saving')).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole('button', { name: 'Run editor action' }));
+  expect(hostRun).not.toHaveBeenCalled();
+  expect(screen.getByText(/Complete or correct the query before running it/)).toBeInTheDocument();
+
+  fireEvent.change(editor, { target: { value: '{span.http.route="new"}' } });
+  expect(hostChange).toHaveBeenCalledWith(expect.objectContaining({ query: '{span.http.route="new"}' }));
+  expect(pending).toHaveBeenLastCalledWith(false);
+  expect(screen.queryByText(/Complete or correct the query before running it/)).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole('button', { name: 'Run editor action' }));
+  expect(hostRun).toHaveBeenCalledTimes(1);
+});
+
+test('keyless prefixed regex and substring can commit and run, but incomplete and plaintext predicates cannot dispatch', async () => {
+  mockMountEditorActions = true;
+  const datasource = {
+    uid: 'tempo-uid',
+    instanceSettings: { jsonData: { protectedAttributesEnabled: true } },
+    languageProvider: { start: jest.fn().mockResolvedValue(undefined), shouldRefreshLabels: () => false },
+  } as unknown as TempoDatasource;
+  const hostChange = jest.fn();
+  const hostRun = jest.fn();
+  render(<TraceQLEditor placeholder="TraceQL" datasource={datasource}
+    query={{ refId: 'A', queryType: 'traceql', query: '{span.http.route="old"}', filters: [] }}
+    onChange={hostChange} onRunQuery={hostRun} />);
+  const editor = screen.getByRole('textbox', { name: 'raw traceql' });
+  await waitFor(() => expect(editor).not.toHaveAttribute('readonly'));
+  const raw = '{span.enc.api.token =~ "enc:v1|plain.*"}';
+  fireEvent.change(editor, { target: { value: raw } });
+  expect(hostChange).toHaveBeenCalledWith(expect.objectContaining({ query: raw }));
+  await userEvent.click(screen.getByRole('button', { name: 'Run editor action' }));
+  expect(hostRun).toHaveBeenCalledTimes(1);
+  const substring = '{span.enc.api.token !@> "enc:custom"}';
+  fireEvent.change(editor, { target: { value: substring } });
+  expect(hostChange).toHaveBeenCalledWith(expect.objectContaining({ query: substring }));
+  await userEvent.click(screen.getByRole('button', { name: 'Run editor action' }));
+  expect(hostRun).toHaveBeenCalledTimes(2);
+  hostChange.mockClear();
+  fireEvent.change(editor, { target: { value: '{span.enc.api.token =~ "enc:' } });
+  await userEvent.click(screen.getByRole('button', { name: 'Run editor action' }));
+  expect(hostRun).toHaveBeenCalledTimes(2);
+  expect(hostChange).not.toHaveBeenCalled();
+  for (const value of [
+    '{span.enc.api.token =~ "secret"}',
+    '{span.enc.api.token =~ ".*"}',
+    '{span.enc.api.token !~ "^enc:"}',
+    '{span.enc.api.token @> "plain"}',
+  ]) {
+    fireEvent.change(editor, { target: { value } });
+    await userEvent.click(screen.getByRole('button', { name: 'Run editor action' }));
+    expect(hostRun).toHaveBeenCalledTimes(2);
+    expect(hostChange).not.toHaveBeenCalled();
+  }
 });

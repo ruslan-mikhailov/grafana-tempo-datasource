@@ -507,6 +507,32 @@ describe('SearchField', () => {
     expect(updateFilter).toHaveBeenCalledWith(expect.objectContaining({ value: 'cool', valueType: 'string' }));
     expect(datasource.languageProvider.getOptionsV2).not.toHaveBeenCalled();
   });
+  it('offers regex for protected values and substring for prefixed values without an index', async () => {
+    const datasource = {
+      instanceSettings: { jsonData: { protectedAttributesEnabled: true, protectedAttributesSubstringEnabled: false } },
+      languageProvider: {
+        getOptionsV2: jest.fn().mockResolvedValue([]),
+        getIntrinsics: jest.fn().mockReturnValue([]),
+        getTags: jest.fn().mockReturnValue([]),
+      },
+    } as unknown as TempoDatasource;
+    datasource.languageProvider.datasource = datasource;
+    const filter: TraceqlFilter = {
+      id: 'secret', tag: 'enc.secret', scope: TraceqlSearchScope.Span, operator: '=~',
+      value: 'plain', valueType: 'string',
+    };
+    const props = { datasource, filter, updateFilter: jest.fn(), setError: jest.fn(), tags: [], query: '' };
+    const view = render(<SearchField {...props} />);
+    await user.click(screen.getByLabelText('select secret operator'));
+    expect(screen.getByText('Matches regex')).toBeInTheDocument();
+    expect(screen.getByText('Does not match regex')).toBeInTheDocument();
+    expect(screen.queryByText('Contains substring')).not.toBeInTheDocument();
+    await user.click(screen.getByLabelText('select secret operator'));
+    view.rerender(<SearchField {...props} filter={{ ...filter, value: 'enc:custom' }} />);
+    await user.click(screen.getByLabelText('select secret operator'));
+    expect(screen.getByText('Contains substring')).toBeInTheDocument();
+    expect(screen.getByText('Does not contain substring')).toBeInTheDocument();
+  });
   it('chooses a protected Builder predicate key only when multiple keys are loaded', async () => {
     const firstKid = '630dcd2966c4336691125448bbb25b4f';
     const secondKid = 'a'.repeat(32);

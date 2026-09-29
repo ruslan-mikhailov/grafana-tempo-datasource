@@ -1,5 +1,5 @@
 import type { ProtectedAttributeKey } from './crypto';
-import { assertProtectedTraceQLKeyChoices, classifyProtectedTraceQL, isMetricsTraceQL, protectedTraceQLPredicates, rebaseProtectedTraceQLKeys, rewriteProtectedTraceQL } from './traceql';
+import { assertProtectedTraceQLKeyChoices, classifyProtectedTraceQL, isCiphertextQueryValue, isMetricsTraceQL, protectedTraceQLPredicates, rebaseProtectedTraceQLKeys, rewriteProtectedTraceQL } from './traceql';
 
 const abc = 'enc:v1:630dcd2966c4336691125448bbb25b4f:7aUwjY5fPtHvu_dUnzcxBJc6XQ';
 const empty = 'enc:v1:630dcd2966c4336691125448bbb25b4f:l4ghA-S-aF9uZIBVXGBXsA';
@@ -135,7 +135,6 @@ describe('protected TraceQL compiler', () => {
     '{resource.enc.password="abc"}',
     '{.enc.password="abc"}',
     '{parent.span.enc.password="abc"}',
-    '{span.enc.password=~"abc"}',
     '{span.enc.password>"abc"}',
     '{span.enc.password=nil}',
     '{"abc"=span.enc.password}',
@@ -157,7 +156,7 @@ describe('protected TraceQL compiler', () => {
     await expect(rewriteProtectedTraceQL('${query}', key, 'search')).rejects.toThrow();
   });
 
-  it('uses one key automatically, requires explicit choices for multiple keys, and keeps canonical ciphertext keyless', async () => {
+  it('uses one key automatically, requires explicit choices for multiple keys, and leaves prefixed ciphertext unchanged', async () => {
     const secondEnvelope = `enc:v1:${'a'.repeat(32)}:${'A'.repeat(22)}`;
     const second = { kid: 'a'.repeat(32), encrypt: jest.fn(() => secondEnvelope) } as unknown as ProtectedAttributeKey;
     const raw = '{span.enc.password="abc"}';
@@ -172,11 +171,125 @@ describe('protected TraceQL compiler', () => {
       [{ predicate: selected, kid: 'b'.repeat(32) }])).rejects.toThrow();
     const direct = `{span.enc.password="${abc}"}`;
     expect(classifyProtectedTraceQL(direct).requiresSealing).toBe(false);
-    expect(await rewriteProtectedTraceQL(direct, undefined, 'search')).toBe(`${direct} | select(span.enc.password)`);
+    expect(await rewriteProtectedTraceQL(direct, undefined, 'search')).toBe(direct);
     expect(await rewriteProtectedTraceQL(direct, [key, second], 'metrics')).toBe(direct);
-    expect(classifyProtectedTraceQL('{span.enc.password="enc:v1:630dcd2966c4336691125448bbb25b4f:AAAAA"}').requiresSealing).toBe(true);
-    await expect(rewriteProtectedTraceQL('{span.enc.password="enc:v1:630dcd2966c4336691125448bbb25b4f:AAAAA"}',
-      undefined, 'search')).rejects.toThrow();
+    const partial = '{span.enc.password="enc:v1:630dcd2966c4336691125448bbb25b4f:AAAAA"}';
+    expect(classifyProtectedTraceQL(partial).requiresSealing).toBe(false);
+    expect(await rewriteProtectedTraceQL(partial, undefined, 'search')).toBe(partial);
+  });
+
+  it('ignores forgotten key selections for direct values but not plaintext', async () => {
+    const direct = '{span.enc.password!="enc:custom"}';
+    const staleKid = 'a'.repeat(32);
+    const choice = [{ predicate: protectedTraceQLPredicates(direct)[0].predicate, kid: staleKid }];
+    expect(() => assertProtectedTraceQLKeyChoices(direct, [], choice)).not.toThrow();
+    for (const mode of ['search', 'metrics', 'metadata'] as const) {
+      expect(await rewriteProtectedTraceQL(direct, undefined, mode, false, choice)).toBe(direct);
+    }
+    const plaintext = '{span.enc.password!="secret"}';
+    const plaintextChoice = [{ predicate: protectedTraceQLPredicates(plaintext)[0].predicate, kid: staleKid }];
+    expect(() => assertProtectedTraceQLKeyChoices(plaintext, [], plaintextChoice)).toThrow();
+    await expect(rewriteProtectedTraceQL(plaintext, undefined, 'search', false, plaintextChoice)).rejects.toThrow();
+    expect(() => assertProtectedTraceQLKeyChoices(direct, [], [{ predicate: choice[0].predicate, kid: 'invalid' }])).toThrow();
+    expect(() => assertProtectedTraceQLKeyChoices(direct, [], [...choice, ...choice])).toThrow();
+  });
+
+  it.each([
+    'enc:',
+    'enc:custom',
+    'enc:v2:anything',
+    'enc:v1|plain.*',
+    `enc:v1:${key.kid}:abc`,
+    'enc:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:.*|secret',
+  ])('passes prefixed literals through unchanged for every operator and compiler mode: %s', async (value) => {
+    expect(isCiphertextQueryValue(value)).toBe(true);
+    const directKey = {
+      kid: key.kid,
+      encrypt: jest.fn(),
+      substringTokens: jest.fn(),
+    } as unknown as ProtectedAttributeKey;
+    for (const op of ['=', '!=', '=~', '!~', '@>', '!@>']) {
+      const query = `{span.enc.api.token ${op} ${JSON.stringify(value)}}`;
+      for (const enabled of [false, true]) {
+        expect(classifyProtectedTraceQL(query, enabled)).toMatchObject({
+          requiresSealing: false, protectedReferences: true,
+        });
+        expect(protectedTraceQLPredicates(query, enabled)[0].keyRequired).toBe(false);
+        expect(() => assertProtectedTraceQLKeyChoices(query, [], [], enabled)).not.toThrow();
+        for (const mode of ['search', 'metrics', 'metadata'] as const) {
+          expect(await rewriteProtectedTraceQL(query, undefined, mode, enabled)).toBe(query);
+          expect(await rewriteProtectedTraceQL(query, directKey, mode, enabled)).toBe(query);
+        }
+      }
+    }
+    expect(directKey.encrypt).not.toHaveBeenCalled();
+    expect(directKey.substringTokens).not.toHaveBeenCalled();
+  });
+
+  it.each(['.*', '^enc:', 'Enc:custom', 'plain.*', 'secret', '.*enc:v1'])(
+    'seals non-prefixed regex RHS literally and requires its selected key: %s', async (pattern) => {
+      expect(isCiphertextQueryValue(pattern)).toBe(false);
+      const second = {
+        kid: 'a'.repeat(32),
+        encrypt: jest.fn((field: string, value: string) => `ciphertext:${field}:${value}`),
+      } as unknown as ProtectedAttributeKey;
+      for (const op of ['=~', '!~']) {
+        const query = `{span.enc.api.token ${op} ${JSON.stringify(pattern)}}`;
+        expect(classifyProtectedTraceQL(query).requiresSealing).toBe(true);
+        const [predicate] = protectedTraceQLPredicates(query);
+        expect(predicate.keyRequired).toBe(true);
+        expect(() => assertProtectedTraceQLKeyChoices(query, [], [])).toThrow();
+        expect(() => assertProtectedTraceQLKeyChoices(query, [key, second], [])).toThrow();
+        await expect(rewriteProtectedTraceQL(query, undefined, 'search')).rejects.toThrow();
+        await expect(rewriteProtectedTraceQL(query, [key, second], 'search')).rejects.toThrow();
+        const choice = [{ predicate: predicate.predicate, kid: second.kid }];
+        expect(await rewriteProtectedTraceQL(query, [key, second], 'search', false, choice)).toBe(
+          `{span.enc.api.token ${op} "ciphertext:enc.api.token:${pattern}"} | select(span.enc.api.token)`
+        );
+        expect(second.encrypt).toHaveBeenCalledWith('enc.api.token', pattern);
+      }
+      expect(encrypt).not.toHaveBeenCalled();
+    }
+  );
+
+  it('projects only keyed predicates when mixed with direct prefixed predicates', async () => {
+    const query = '{span.enc.api.token !~ "enc:v1|plain.*" && span.enc.password="abc"}';
+    expect(classifyProtectedTraceQL(query).requiresSealing).toBe(true);
+    expect(protectedTraceQLPredicates(query).map((predicate) => predicate.keyRequired)).toEqual([false, true]);
+    await expect(rewriteProtectedTraceQL(query, undefined, 'search')).rejects.toThrow();
+    expect(await rewriteProtectedTraceQL(query, key, 'search')).toBe(
+      `{span.enc.api.token !~ "enc:v1|plain.*" && span.enc.password="${abc}"} | select(span.enc.password)`
+    );
+    expect(encrypt).toHaveBeenCalledTimes(1);
+  });
+
+  it('selects a key only for plaintext regex beside a keyless prefixed equality', async () => {
+    const second = {
+      kid: 'a'.repeat(32),
+      encrypt: jest.fn((field: string, value: string) => `selected:${field}:${value}`),
+    } as unknown as ProtectedAttributeKey;
+    const query = '{span.enc.password="enc:custom" && span.enc.api.token !~ "^enc:"}';
+    const predicates = protectedTraceQLPredicates(query);
+    expect(predicates.map((predicate) => predicate.keyRequired)).toEqual([false, true]);
+    expect(() => assertProtectedTraceQLKeyChoices(query, [key, second], [])).toThrow();
+    const choice = [{ predicate: predicates[1].predicate, kid: second.kid }];
+    assertProtectedTraceQLKeyChoices(query, [key, second], choice);
+    expect(await rewriteProtectedTraceQL(query, [key, second], 'search', false, choice)).toBe(
+      '{span.enc.password="enc:custom" && span.enc.api.token !~ "selected:enc.api.token:^enc:"} | select(span.enc.api.token)'
+    );
+    expect(second.encrypt).toHaveBeenCalledTimes(1);
+    expect(second.encrypt).toHaveBeenCalledWith('enc.api.token', '^enc:');
+    expect(encrypt).not.toHaveBeenCalled();
+  });
+
+  it('encrypts wildcard regex in a mixed query instead of treating it as a direct predicate', async () => {
+    const query = '{span.enc.api.token =~ ".*" && span.enc.password="abc"}';
+    expect(protectedTraceQLPredicates(query).map((predicate) => predicate.keyRequired)).toEqual([true, true]);
+    await expect(rewriteProtectedTraceQL(query, undefined, 'search')).rejects.toThrow();
+    expect(await rewriteProtectedTraceQL(query, key, 'search')).toBe(
+      `{span.enc.api.token =~ "enc.api.token:.*" && span.enc.password="${abc}"} | select(span.enc.api.token, span.enc.password)`
+    );
+    expect(encrypt).toHaveBeenCalledWith('enc.api.token', '.*');
   });
 
   it('binds independent choices to protected predicates and rejects shifted or forgotten selections', async () => {
@@ -248,10 +361,31 @@ describe('protected substring compiler', () => {
     expect(await rewriteProtectedTraceQL('{span.enc.secret @> "cool"}', first, 'metadata', true)).toBe(
       '{span."bi.secret" subarray_seq ["bi:v1:first:coo","bi:v1:first:ool"]}'
     );
-    const envelopeLiteral = `enc:v1:630dcd2966c4336691125448bbb25b4f:7aUwjY5fPtHvu_dUnzcxBJc6XQ`;
-    expect(classifyProtectedTraceQL(`{span.enc.secret @> "${envelopeLiteral}"}`, true).requiresSealing).toBe(true);
-    await rewriteProtectedTraceQL(`{span.enc.secret @> "${envelopeLiteral}"}`, first, 'search', true);
-    expect(first.substringTokens).toHaveBeenCalledWith('enc.secret', envelopeLiteral);
+  });
+
+  it('seals only plaintext in mixed public substring and plaintext queries', async () => {
+    const query = '{span.enc.secret !@> "enc:v1:" && span.enc.password="abc"}';
+    expect(classifyProtectedTraceQL(query).requiresSealing).toBe(true);
+    expect(protectedTraceQLPredicates(query).map((predicate) => predicate.keyRequired)).toEqual([false, true]);
+    await expect(rewriteProtectedTraceQL(query, undefined, 'search')).rejects.toThrow();
+    expect(await rewriteProtectedTraceQL(query, key, 'search')).toBe(
+      `{span.enc.secret !@> "enc:v1:" && span.enc.password="${abc}"} | select(span.enc.password)`
+    );
+    expect(first.substringTokens).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    `prefix:${abc}`,
+    '^enc:',
+    'Enc:custom',
+    '.*',
+    '$term',
+  ])('requires substring capability and a key for non-prefixed substring text: %s', async (value) => {
+    const query = `{span.enc.secret @> ${JSON.stringify(value)}}`;
+    expect(() => classifyProtectedTraceQL(query)).toThrow();
+    expect(classifyProtectedTraceQL(query, true).requiresSealing).toBe(true);
+    expect(protectedTraceQLPredicates(query, true)[0].keyRequired).toBe(true);
+    await expect(rewriteProtectedTraceQL(query, undefined, 'search', true)).rejects.toThrow();
   });
 
   it('rewrites protected negative substring using key-matched index predicates and preserves ordinary text search', async () => {

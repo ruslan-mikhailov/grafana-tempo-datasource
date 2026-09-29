@@ -28,22 +28,17 @@ const invalid = (): never => {
   throw new Error('Invalid or unsupported protected TraceQL query.');
 };
 
-/** Only canonical stored-attribute envelopes may bypass browser-side encryption. */
-export function isEncryptedAttributeEnvelope(value: string): boolean {
-  const match = /^enc:v1:[0-9a-f]{32}:([A-Za-z0-9_-]{22,})$/.exec(value);
-  if (!match) {
-    return false;
-  }
-  const payload = match[1];
-  const remainder = payload.length % 4;
-  const last = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'.indexOf(payload[payload.length - 1]);
-  return (
-    remainder !== 1 && (remainder === 0 || (remainder === 2 && last % 16 === 0) || (remainder === 3 && last % 4 === 0))
-  );
+/** Explicit ciphertext query values bypass browser-side compilation. */
+export function isCiphertextQueryValue(value: string): boolean {
+  return value.startsWith('enc:');
+}
+
+function isDirectCiphertextPredicate(predicate: Predicate, query: string): boolean {
+  return isCiphertextQueryValue(literal(predicate.rhs, query));
 }
 
 type Edit = { from: number; to: number; text: string };
-type Predicate = { field: string; lhs: SyntaxNode; rhs: SyntaxNode; comparison: SyntaxNode; op: '=' | '!=' | '@>' | '!@>' };
+type Predicate = { field: string; lhs: SyntaxNode; rhs: SyntaxNode; comparison: SyntaxNode; op: '=' | '!=' | '@>' | '!@>' | '=~' | '!~' };
 type Attribute = { field: string; protected: boolean; dynamic: boolean };
 export interface ProtectedTraceQLPredicate {
   predicate: string;
@@ -55,13 +50,13 @@ export interface ProtectedTraceQLPredicate {
 }
 /** Positions plus field/operator prevent a moved predicate inheriting another predicate's choice. */
 export function protectedTraceQLPredicates(query: string, substringEnabled = false): ProtectedTraceQLPredicate[] {
-  return inspect(query, false, substringEnabled).predicates.map(({ field, op, rhs, comparison }) => ({
-    predicate: JSON.stringify([comparison.from, comparison.to, field, op]),
-    field,
-    operator: op,
-    keyRequired: op === '@>' || op === '!@>' || !isEncryptedAttributeEnvelope(literal(rhs, query)),
-    from: comparison.from,
-    to: comparison.to,
+  return inspect(query, false, substringEnabled).predicates.map((predicate) => ({
+    predicate: JSON.stringify([predicate.comparison.from, predicate.comparison.to, predicate.field, predicate.op]),
+    field: predicate.field,
+    operator: predicate.op,
+    keyRequired: !isDirectCiphertextPredicate(predicate, query),
+    from: predicate.comparison.from,
+    to: predicate.comparison.to,
   }));
 }
 /** Reject incomplete or forgotten choices before a plaintext draft can reach host onChange. */
@@ -74,9 +69,9 @@ export function assertProtectedTraceQLKeyChoices(
   const predicates = protectedTraceQLPredicates(query, substringEnabled);
   const chosen = new Map<string, string>();
   for (const choice of choices) {
+    const predicate = predicates.find((item) => item.predicate === choice.predicate);
     if (!/^[0-9a-f]{32}$/.test(choice.kid) || chosen.has(choice.predicate) ||
-      !predicates.some((item) => item.predicate === choice.predicate) ||
-      !keys.some((key) => key.kid === choice.kid)) {
+      !predicate || (predicate.keyRequired && !keys.some((key) => key.kid === choice.kid))) {
       invalid();
     }
     chosen.set(choice.predicate, choice.kid);
@@ -267,7 +262,7 @@ function predicateFor(attributeNode: SyntaxNode, query: string): Predicate {
     return invalid();
   }
   const op = query.slice(nodes[1].from, nodes[1].to);
-  if (op !== '=' && op !== '!=' && op !== '@>' && op !== '!@>') {
+  if (op !== '=' && op !== '!=' && op !== '@>' && op !== '!@>' && op !== '=~' && op !== '!~') {
     return invalid();
   }
   const right = children(nodes[2]);
@@ -384,7 +379,8 @@ function inspect(
         return;
       }
       const predicate = predicateFor(node.node, query);
-      if ((predicate.op === '@>' || predicate.op === '!@>') && !substringEnabled) {
+      if ((predicate.op === '@>' || predicate.op === '!@>') &&
+        !substringEnabled && !isDirectCiphertextPredicate(predicate, query)) {
         invalid();
       }
       predicate.field = parsed.field;
@@ -400,8 +396,7 @@ function inspect(
       dynamicReferences,
       requiresSealing:
         dynamicReferences ||
-        (protectedReferences &&
-          (!predicates.length || predicates.some(({ rhs, op }) => op === '@>' || op === '!@>' || !isEncryptedAttributeEnvelope(literal(rhs, query))))),
+        (protectedReferences && (!predicates.length || predicates.some((predicate) => !isDirectCiphertextPredicate(predicate, query)))),
       protectedRhsRanges: predicates.map(({ rhs }) => ({ from: rhs.from, to: rhs.to })),
     },
   };
@@ -537,6 +532,9 @@ export async function rewriteProtectedTraceQL(
   const edits: Edit[] = [];
   const fields = new Map<string, string>();
   for (const predicate of predicates) {
+    if (isDirectCiphertextPredicate(predicate, query)) {
+      continue; // Explicit ciphertext predicates stay byte-for-byte as written.
+    }
     const choice = selected.get(JSON.stringify([predicate.comparison.from, predicate.comparison.to, predicate.field, predicate.op]));
     const key = choice ? available.get(choice) : protectedKeys.length === 1 ? protectedKeys[0] : undefined;
     if (choice && !key) {
@@ -560,13 +558,11 @@ export async function rewriteProtectedTraceQL(
       continue;
     }
     const value = literal(predicate.rhs, query);
-    const encrypted = isEncryptedAttributeEnvelope(value)
-      ? JSON.stringify(value)
-      : key ? JSON.stringify(key.encrypt(predicate.field, value)) : invalid();
+    const encrypted = key ? JSON.stringify(key.encrypt(predicate.field, value)) : invalid();
     const lhs = query.slice(predicate.lhs.from, predicate.lhs.to);
     const between = query.slice(predicate.lhs.to, predicate.rhs.from);
     const comparison = `${lhs}${between}${encrypted}`;
-    if (predicate.op === '=') {
+    if (predicate.op !== '!=') {
       edits.push({
         from: predicate.comparison.from,
         to: predicate.comparison.to,
@@ -579,6 +575,9 @@ export async function rewriteProtectedTraceQL(
         text: `(${comparison} && ${lhs} != nil)`,
       });
     }
+  }
+  if (!fields.size) {
+    return query;
   }
   if (mode === 'search') {
     const select = pipelineSelect(root, selects);

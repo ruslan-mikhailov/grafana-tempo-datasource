@@ -154,6 +154,8 @@ export function TraceQLEditor(props: Props) {
       return;
     }
     setDraft(value);
+    // An earlier run/save error no longer describes the draft being typed.
+    setAlertText(undefined);
     setDirty(true);
     props.onPendingChange?.(true);
     committed.current = false;
@@ -217,12 +219,13 @@ export function TraceQLEditor(props: Props) {
         () => {
           if (generation.current === current) {
             setDraftPending(false);
-            setAlertText('Complete or correct the protected query before saving');
+            setAlertText('Unable to save the protected query');
           }
         }
       );
     } catch {
-      setAlertText('Complete or correct the protected query before saving');
+      // Strict parsing still keeps incomplete and unsafe drafts local. Typing is
+      // not a save request; report the failure only if the user explicitly runs.
     }
   };
   const onEditorChange = useCallback((value: string) => editorChangeRef.current(value), []);
@@ -234,7 +237,7 @@ export function TraceQLEditor(props: Props) {
     if (committed.current && !draftPending && !locked) {
       onRunQuery();
     } else {
-      setAlertText('Complete or unlock the query before running it');
+      setAlertText(locked ? 'Unlock the query before running it' : 'Complete or correct the query before running it');
     }
   };
 

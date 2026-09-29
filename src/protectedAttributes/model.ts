@@ -3,7 +3,7 @@ import { type TempoQuery } from '../types';
 import { intrinsics } from '../traceql/traceql';
 
 import { type ProtectedAttributeKey } from './crypto';
-import { classifyProtectedTraceQL, isEncryptedAttributeEnvelope, protectedTraceQLPredicates } from './traceql';
+import { classifyProtectedTraceQL, isCiphertextQueryValue, protectedTraceQLPredicates } from './traceql';
 
 // The shortest envelope seals an empty value: 12-byte nonce and 16-byte tag.
 // The canonical base64url spelling is checked here; opening authenticates it.
@@ -101,17 +101,20 @@ function assertFilterShape(filter: TraceqlFilter, substringEnabled = false): voi
   if (filter.protectedKeyId !== undefined &&
     (!/^[0-9a-f]{32}$/.test(filter.protectedKeyId) ||
       !classifyProtectedFilter(filter).protectedReference ||
-      !['=', '!=', '@>', '!@>'].includes(filter.operator ?? ''))) {
+      !['=', '!=', '=~', '!~', '@>', '!@>'].includes(filter.operator ?? ''))) {
     throw unsafe();
   }
   const { requiresSealing, dynamicReference, protectedReference } = classifyProtectedFilter(filter);
+  const directSubstring = typeof filter.value === 'string' && protectedReference && !dynamicReference &&
+    isCiphertextQueryValue(filter.value);
   if ((filter.operator === '@>' || filter.operator === '!@>') &&
     (Array.isArray(filter.value) || dynamicReference ||
       (filter.value !== undefined && !protectedReference && filter.valueType !== 'string') ||
-      (protectedReference && (!substringEnabled || filter.scope !== TraceqlSearchScope.Span)))) {
+      (protectedReference && ((!substringEnabled && !directSubstring) || filter.scope !== TraceqlSearchScope.Span)))) {
     throw unsafe();
   }
-  if (requiresSealing && filter.operator && !['=', '!=', ...(substringEnabled ? ['@>', '!@>'] : [])].includes(filter.operator)) {
+  if (requiresSealing && filter.operator && !['=', '!=', '=~', '!~',
+    ...(substringEnabled || directSubstring ? ['@>', '!@>'] : [])].includes(filter.operator)) {
     throw unsafe();
   }
   if (protectedReference && !dynamicReference && filter.scope !== TraceqlSearchScope.Span) {
@@ -200,7 +203,7 @@ export function assertProtectedQueryModelSafe(model: TempoQuery, kids?: string |
             !Number.isSafeInteger(identity[0]) || identity[0] < 0 ||
             !Number.isSafeInteger(identity[1]) || identity[1] <= identity[0] ||
             typeof identity[2] !== 'string' || !identity[2].startsWith('enc.') ||
-            !['=', '!=', '@>', '!@>'].includes(identity[3]) ||
+            !['=', '!=', '=~', '!~', '@>', '!@>'].includes(identity[3]) ||
             JSON.stringify(identity) !== item.predicate;
         } catch {
           return true;
@@ -229,21 +232,21 @@ export function assertProtectedQueryModelSafe(model: TempoQuery, kids?: string |
         if (!isProtectedModelEnvelope(value) || !requiresSealing) {
           throw unsafe();
         }
-      } else if (requiresSealing && !isDirectEncryptedFilter(filter, value)) {
+      } else if (requiresSealing && !isDirectCiphertextFilter(filter, value)) {
         throw unsafe();
       }
     }
   }
 }
 
-function isDirectEncryptedFilter(filter: TraceqlFilter, value: string): boolean {
+function isDirectCiphertextFilter(filter: TraceqlFilter, value: string): boolean {
   const { protectedReference, dynamicReference } = classifyProtectedFilter(filter);
   return (
     protectedReference &&
     !dynamicReference &&
     filter.scope === TraceqlSearchScope.Span &&
-    (filter.operator === '=' || filter.operator === '!=') &&
-    isEncryptedAttributeEnvelope(value)
+    ['=', '!=', '=~', '!~', '@>', '!@>'].includes(filter.operator ?? '') &&
+    isCiphertextQueryValue(value)
   );
 }
 
@@ -319,7 +322,7 @@ export async function prepareProtectedQueryModel(
           await keyForEnvelope(value, lookup ?? key).openQueryModel(value, context);
           return value;
         }
-        if (isDirectEncryptedFilter(filter, value)) {
+        if (isDirectCiphertextFilter(filter, value)) {
           return value;
         }
         return key.sealQueryModel(value, context);

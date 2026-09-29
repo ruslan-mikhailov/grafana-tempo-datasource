@@ -152,20 +152,82 @@ test('saved envelopes open with their own key ID while new values seal under the
   expect((await openProtectedQueryModel(updated, lookup, uid)).filters[0].value).toBe('new');
 });
 
-test('canonical ciphertext may be persisted and opened without keys, but lookalikes cannot', async () => {
-  const ciphertext = 'enc:v1:630dcd2966c4336691125448bbb25b4f:7aUwjY5fPtHvu_dUnzcxBJc6XQ';
-  const direct = query(`{span.enc.password="${ciphertext}"}`, [protectedFilter(ciphertext)]);
-  expect(() => assertProtectedQueryModelSafe(direct)).not.toThrow();
-  expect(await openProtectedQueryModel(direct, undefined, uid)).toEqual(direct);
-  const active = await importKey(master);
-  const prepared = await prepareProtectedQueryModel(direct, active, uid);
-  expect(prepared.query).toBe(direct.query);
-  expect(prepared.filters[0].value).toBe(ciphertext);
-  expect(() => assertProtectedQueryModelSafe(query('{span.enc.password="enc:v1:bad"}'))).toThrow();
-  expect(() => assertProtectedQueryModelSafe(query('', [protectedFilter('enc:v1:bad')]))).toThrow();
-  const dynamic = query('', [{ ...protectedFilter(ciphertext), tag: '${attribute}' }]);
+test('enc:-prefixed literals persist and open without keys while dynamic names still seal', async () => {
+  const key = await importKey(master);
+  for (const ciphertext of ['enc:custom', 'enc:v1|plain.*', `enc:v1:${kid}:bad`]) {
+    const direct = query(`{span.enc.password="${ciphertext}"}`, [protectedFilter(ciphertext)]);
+    expect(() => assertProtectedQueryModelSafe(direct)).not.toThrow();
+    expect(await openProtectedQueryModel(direct, undefined, uid)).toEqual(direct);
+    expect(await prepareProtectedQueryModel(direct, key, uid)).toMatchObject({
+      query: direct.query, filters: [{ value: ciphertext }],
+    });
+  }
+  const dynamic = query('', [{ ...protectedFilter('enc:custom'), tag: '${attribute}' }]);
   expect(() => assertProtectedQueryModelSafe(dynamic)).toThrow();
-  expect((await prepareProtectedQueryModel(dynamic, active, uid)).filters[0].value).toMatch(/^qenc:v1:/);
+  expect((await prepareProtectedQueryModel(dynamic, key, uid)).filters[0].value).toMatch(/^qenc:v1:/);
+});
+
+test('regex with enc: prefix bypasses sealing; non-prefixed regex requires a key and seals', async () => {
+  const key = await importKey(master);
+  for (const text of [
+    '{span.enc.api.token =~ "enc:custom"}',
+    '{span.enc.api.token !~ "enc:v1|secret"}',
+  ]) {
+    const direct = query(text);
+    expect(() => assertProtectedQueryModelSafe(direct)).not.toThrow();
+    expect(await openProtectedQueryModel(direct, undefined, uid)).toEqual(direct);
+    expect(await prepareProtectedQueryModel(direct, key, uid)).toEqual(direct);
+  }
+  for (const text of [
+    `{span.enc.api.token !~ "^enc:v1:${kid}:.*$"}`,
+    '{span.enc.api.token =~ "secret"}',
+    '{span.enc.api.token =~ ".*"}',
+  ]) {
+    const raw = query(text);
+    expect(() => assertProtectedQueryModelSafe(raw)).toThrow();
+    const sealed = await prepareProtectedQueryModel(raw, key, uid);
+    expect(sealed.query).toMatch(/^qenc:v1:/);
+    expect((await openProtectedQueryModel(sealed, key, uid)).query).toBe(text);
+  }
+  const mixed = query('{span.enc.api.token =~ "enc:v1" && span.enc.password="secret"}');
+  expect(() => assertProtectedQueryModelSafe(mixed)).toThrow();
+  const sealed = await prepareProtectedQueryModel(mixed, key, uid);
+  expect(sealed.query).toMatch(/^qenc:v1:/);
+  expect(JSON.stringify(sealed)).not.toContain('secret');
+});
+
+test('prefixed native ciphertext substring survives save/open keyless with index disabled', async () => {
+  const directQueries = [
+    '{span.enc.api.token =~ "enc:custom"}',
+    '{span.enc.api.token !~ "enc:v1|plain.*"}',
+    '{span.enc.api.token @> "enc:custom"}',
+    '{span.enc.api.token !@> "enc:v1|plain.*"}',
+  ];
+  for (const text of directQueries) {
+    const draft = query(text);
+    for (const enabled of [false, true]) {
+      expect(() => assertProtectedQueryModelSafe(draft, undefined, enabled)).not.toThrow();
+      expect(await openProtectedQueryModel(draft, undefined, uid, enabled)).toEqual(draft);
+    }
+  }
+  const key = await importKey(master);
+  for (const text of directQueries) {
+    expect(await prepareProtectedQueryModel(query(text), key, uid)).toEqual(query(text));
+  }
+  for (const text of [
+    '{span.enc.api.token @> "private"}',
+    '{span.enc.api.token @> "$term"}',
+    '{span.enc.api.token @> enc:v1}',
+    '{span.enc.api.token =~ ".*|private"}',
+    '{span.enc.api.token =~ $pattern}',
+  ]) {
+    expect(() => assertProtectedQueryModelSafe(query(text), undefined, true)).toThrow();
+  }
+  const mixed = query('{span.enc.api.token @> "enc:custom" && span.enc.password="secret"}');
+  expect(() => assertProtectedQueryModelSafe(mixed)).toThrow();
+  const sealed = await prepareProtectedQueryModel(mixed, key, uid);
+  expect(sealed.query).toMatch(/^qenc:v1:/);
+  expect(JSON.stringify(sealed)).not.toContain('"secret"');
 });
 
 test('dynamic tag or scope keeps adjacent builder value sealed even if it currently resolves ordinary', async () => {
@@ -206,9 +268,12 @@ test('dynamic tag or scope keeps adjacent builder value sealed even if it curren
 test('unsupported/ambiguous plaintext cannot cross model gate; static provisioned defaults fail closed', async () => {
   const key = await importKey(master);
   expect(() => assertProtectedQueryModelSafe(query('', [protectedFilter('secret')]), kid)).toThrow();
-  await expect(
-    prepareProtectedQueryModel(query('', [{ ...protectedFilter('secret'), operator: '=~' }]), key, uid)
-  ).rejects.toThrow();
+  const regex = query('', [{ ...protectedFilter('secret'), operator: '=~', protectedKeyId: kid }]);
+  expect(() => assertProtectedQueryModelSafe(regex)).toThrow();
+  const sealedRegex = await prepareProtectedQueryModel(regex, key, uid);
+  expect(sealedRegex.filters[0].value).toMatch(/^qenc:v1:/);
+  expect((await openProtectedQueryModel(sealedRegex, key, uid)).filters[0].value).toBe('secret');
+  expect(() => assertProtectedQueryModelSafe(sealedRegex)).not.toThrow();
   await expect(
     prepareProtectedQueryModel(
       query('', [{ ...protectedFilter('secret'), scope: TraceqlSearchScope.Resource }]),
@@ -257,6 +322,20 @@ test('unsupported/ambiguous plaintext cannot cross model gate; static provisione
       { id: 'ordinary', scope: TraceqlSearchScope.Resource, tag: 'service.name', value: 'frontend' },
     ])
   ).not.toThrow();
+});
+
+test('Builder direct enc: values support all operators without a key or substring index', async () => {
+  const key = await importKey(master);
+  for (const operator of ['=', '!=', '=~', '!~', '@>', '!@>']) {
+    const filter = { ...protectedFilter('enc:custom'), operator, protectedKeyId: kid };
+    const model = query('', [filter]);
+    expect(() => assertProtectedQueryModelSafe(model)).not.toThrow();
+    expect(await openProtectedQueryModel(model, undefined, uid)).toEqual(model);
+    expect(await prepareProtectedQueryModel(model, key, uid)).toMatchObject({
+      filters: [{ operator, value: 'enc:custom', protectedKeyId: kid }],
+    });
+  }
+  expect(() => assertStaticProtectedFilterDefaultsSafe([protectedFilter('enc:custom')])).toThrow();
 });
 
 test('known scoped intrinsics remain usable while malformed colon names and mismatched scopes fail closed', () => {

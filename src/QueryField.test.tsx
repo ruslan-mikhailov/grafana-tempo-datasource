@@ -340,6 +340,30 @@ describe('QueryField', () => {
     expect(screen.queryByTestId('query-with-assistant-button')).not.toBeInTheDocument();
   });
 
+  it('blocks the outer run while an ordinary partial draft remains browser-local', async () => {
+    const user = userEvent.setup();
+    const onChange = jest.fn();
+    const onRunQuery = jest.fn();
+    const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedAttributesEnabled: true } });
+    jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
+    renderQueryField({
+      datasource,
+      query: { refId: 'A', queryType: 'traceql', query: '{span.http.route="old"}', filters: [] },
+      onChange,
+      onRunQuery,
+    });
+    await waitFor(() => expect(onChange).toHaveBeenCalled());
+    onChange.mockClear();
+    act(() => {
+      mockEditorPendingCallbacks[mockEditorPendingCallbacks.length - 1](true);
+    });
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Run from editor' }));
+    expect(onRunQuery).not.toHaveBeenCalled();
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert')).toHaveTextContent('Complete or correct the query before running it');
+  });
+
   it('clears protected predicate key choices before changing query type without releasing a plaintext draft', async () => {
     const user = userEvent.setup();
     const onChange = jest.fn();

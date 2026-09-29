@@ -8,7 +8,7 @@ import { type TraceqlFilter, TraceqlSearchScope } from '../dataquery';
 import { getEscapedRegexValues, getEscapedValues } from '../datasource';
 import type TempoLanguageProvider from '../language_provider';
 import { classifyProtectedFilter, isVariableBearing } from '../protectedAttributes/model';
-import { intrinsics } from '../traceql/traceql';
+import { isCiphertextQueryValue } from '../protectedAttributes/traceql';
 import { type Scope } from '../types';
 
 export const interpolateFilters = (filters: TraceqlFilter[], scopedVars?: ScopedVars) => {
@@ -110,15 +110,20 @@ const tagHelper = (f: TraceqlFilter, filters: TraceqlFilter[]) => {
 };
 
 export const filterToQuerySection = (f: TraceqlFilter, filters: TraceqlFilter[], lp: TempoLanguageProvider) => {
-  if (isProtectedBuilderValue(f, lp) && !['=', '!=', ...(lp.datasource.instanceSettings?.jsonData?.protectedAttributesSubstringEnabled ? ['@>', '!@>'] : [])].includes(f.operator ?? '')) {
+  const directSubstring = typeof f.value === 'string' && isCiphertextQueryValue(f.value) &&
+    classifyProtectedFilter(f).protectedReference && !classifyProtectedFilter(f).dynamicReference;
+  if (isProtectedBuilderValue(f, lp) && !['=', '!=', '=~', '!~',
+    ...(lp.datasource.instanceSettings?.jsonData?.protectedAttributesSubstringEnabled || directSubstring ? ['@>', '!@>'] : [])].includes(f.operator ?? '')) {
     throw new Error('Protected filter operator is not enabled');
   }
   if ((f.operator === '@>' || f.operator === '!@>') && Array.isArray(f.value)) {
     throw new Error('Substring search requires a single string value');
   }
-  if (Array.isArray(f.value) && f.value.length > 1 && !isRegExpOperator(f.operator!)) {
-    // For negative operators (!=), use && instead of ||
-    const joinOperator = f.operator === '!=' ? ' && ' : ' || ';
+  const protectedRegex = isProtectedBuilderValue(f, lp) && isRegExpOperator(f.operator ?? '');
+  if (Array.isArray(f.value) && f.value.length > 1 && (!isRegExpOperator(f.operator!) || protectedRegex)) {
+    // Protected regex values are separate predicates: mixing enc: and plaintext in an alternation
+    // would encrypt the entire alternation, rather than only its plaintext arms.
+    const joinOperator = f.operator === '!=' || f.operator === '!~' ? ' && ' : ' || ';
     return `(${f.value.map((v) => `${scopeHelper(f, lp)}${tagHelper(f, filters)}${f.operator}${valueHelper({ ...f, value: v }, lp)}`).join(joinOperator)})`;
   }
 

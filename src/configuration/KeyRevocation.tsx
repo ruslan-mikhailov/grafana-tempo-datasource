@@ -220,18 +220,12 @@ export function KeyRevocation({ uid, name }: { uid?: string; name: string }) {
       {kid ? <div role="status">Key ID: <code>{kid}</code> <Button variant="secondary" disabled={submitting} onClick={removeKey}>Remove key</Button></div> : (
         <div style={{ display: 'grid', gap: 8, marginBottom: 8 }}>
           <Stack gap={1}>
-            <Button variant={method === 'file' ? 'primary' : 'secondary'} disabled={submitting} onClick={() => { removeKey(); setMethod('file'); }}>Load key file</Button>
+            <Button variant={method === 'file' ? 'primary' : 'secondary'} disabled={busy || submitting} onClick={() => { removeKey(); setMethod('file'); fileInput.current?.click(); }}>Choose local key file</Button>
             <Button variant={method === 'paste' ? 'primary' : 'secondary'} disabled={submitting} onClick={() => { removeKey(); setMethod('paste'); }}>Paste base64</Button>
           </Stack>
-          {method === 'file' ? (
-            <>
-              <Stack gap={1} alignItems="center">
-                <Button variant="secondary" disabled={busy || submitting} onClick={() => fileInput.current?.click()}>Choose local key file</Button>
-                <span role="status">{busy ? 'Reading key file…' : 'No key loaded'}</span>
-              </Stack>
-              <input id="redaction-key-file" aria-label="Key file" ref={fileInput} type="file" accept=".txt,.key,text/plain" style={{ display: 'none' }} disabled={busy || submitting} onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ''; void loadFile(file); }} />
-            </>
-          ) : (
+          {method === 'file' && <span role="status">{busy ? 'Reading key file…' : 'No key loaded'}</span>}
+          <input id="redaction-key-file" aria-label="Key file" ref={fileInput} type="file" accept=".txt,.key,text/plain" style={{ display: 'none' }} disabled={busy || submitting} onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ''; void loadFile(file); }} />
+          {method === 'paste' && (
             <Stack direction="column" gap={1} alignItems="flex-start">
               <label htmlFor="redaction-key-paste">Base64 key</label>
               <Input id="redaction-key-paste" ref={pasteInput} type="password" autoComplete="off" disabled={busy || submitting} onChange={() => { setKeyError(undefined); setConfirmation(undefined); }} />

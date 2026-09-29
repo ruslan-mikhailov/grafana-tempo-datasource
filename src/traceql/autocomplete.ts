@@ -1,9 +1,11 @@
+import { parser, TraceQL } from '@grafana/lezer-traceql';
 import { type IMarkdownString, languages } from 'monaco-editor';
 
 import { type SelectableValue, type TimeRange } from '@grafana/data';
 import { isFetchError } from '@grafana/runtime';
 import type { Monaco, monacoTypes } from '@grafana/ui';
 
+import { DEFAULT_TIME_RANGE_FOR_TAGS } from '../configuration/TagsTimeRangeSettings';
 import type TempoLanguageProvider from '../language_provider';
 
 import { getSituation, type Situation } from './situation';
@@ -442,12 +444,23 @@ export class CompletionProvider implements monacoTypes.languages.CompletionItemP
 
   private async getTagValues(
     tagName: string,
-    query: string,
+    query?: string,
     timeRangeForTags?: number,
     range?: TimeRange
   ): Promise<Array<SelectableValue<string>>> {
     let tagValues: Array<SelectableValue<string>>;
-    const cacheKey = `${tagName}:${query}`;
+    const timeBounds =
+      timeRangeForTags && range && timeRangeForTags !== DEFAULT_TIME_RANGE_FOR_TAGS
+        ? this.languageProvider.getTimeRangeForTags(timeRangeForTags, range)
+        : undefined;
+    const cacheKey = JSON.stringify([
+      tagName,
+      query ?? null,
+      this.languageProvider.getTagsLimit(),
+      timeBounds?.start ?? null,
+      timeBounds?.end ?? null,
+      !!this.languageProvider.datasource.instanceSettings.jsonData.protectedAttributesEnabled,
+    ]);
 
     if (this.cachedValues.hasOwnProperty(cacheKey)) {
       tagValues = this.cachedValues[cacheKey];
@@ -526,7 +539,10 @@ export class CompletionProvider implements monacoTypes.languages.CompletionItemP
       case 'SPANSET_IN_VALUE':
         let tagValues;
         try {
-          tagValues = await this.getTagValues(situation.tagName, situation.query, this.timeRangeForTags, this.range);
+          // An unfinished editor draft is not a usable contextual metadata filter.
+          // Do not send any of its text; complete queries still go through strict metadata validation.
+          const query = hasSyntaxRecovery(situation.query) ? undefined : situation.query;
+          tagValues = await this.getTagValues(situation.tagName, query, this.timeRangeForTags, this.range);
           setAlertText(undefined);
         } catch (error) {
           if (isFetchError(error)) {
@@ -623,6 +639,22 @@ export class CompletionProvider implements monacoTypes.languages.CompletionItemP
       type: 'OPERATOR',
     }));
   }
+}
+
+function hasSyntaxRecovery(query: string): boolean {
+  const tree = parser.parse(query);
+  if (tree.topNode.type.id !== TraceQL || tree.topNode.to !== query.length) {
+    return true;
+  }
+  let recovered = false;
+  tree.iterate({
+    enter(node) {
+      if (node.type.isError) {
+        recovered = true;
+      }
+    },
+  });
+  return recovered;
 }
 
 /**

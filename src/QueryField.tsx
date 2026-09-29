@@ -209,11 +209,12 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
   };
 
   private onSafeRunQuery = (target: TempoQuery = this.props.query) => {
-    if (
-      this.sealPending ||
-      (this.awaitingHostCommit && (target.queryType === 'traceql' || target.queryType === 'traceqlSearch'))
-    ) {
-      this.setState({ queryError: 'Complete or unlock the protected query before running it.' });
+    if (this.sealPending) {
+      this.setState({ queryError: 'Complete or correct the query before running it.' });
+      return;
+    }
+    if (this.awaitingHostCommit && (target.queryType === 'traceql' || target.queryType === 'traceqlSearch')) {
+      this.setState({ queryError: 'Wait for the protected query to be saved before running it.' });
       return;
     }
     const datasource = this.props.datasource;

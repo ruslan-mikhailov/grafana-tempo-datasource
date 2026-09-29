@@ -96,6 +96,21 @@ it('derives a key ID from pasted key without saving or transmitting key material
   expect(screen.getByRole('status', { name: 'Revocation submission results' })).toHaveTextContent('not completed');
 });
 
+it('opens the key picker directly, including after switching from paste mode', async () => {
+  const user = userEvent.setup();
+  render(<KeyRevocation uid="tempo-uid" name="Tempo" />);
+  await screen.findByText('span.enc.secret');
+  const fileInput = screen.getByLabelText('Key file') as HTMLInputElement;
+  const openPicker = jest.spyOn(fileInput, 'click').mockImplementation(() => {});
+  await user.click(screen.getByRole('button', { name: 'Choose local key file' }));
+  expect(openPicker).toHaveBeenCalledTimes(1);
+  await user.click(screen.getByRole('button', { name: 'Paste base64' }));
+  expect(screen.getByLabelText('Base64 key')).toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: 'Choose local key file' }));
+  expect(openPicker).toHaveBeenCalledTimes(2);
+  expect(screen.queryByLabelText('Base64 key')).not.toBeInTheDocument();
+});
+
 it('loads one valid local key file; rejects malformed and multi-key files and clears source input', async () => {
   const user = userEvent.setup();
   render(<KeyRevocation uid="tempo-uid" name="Tempo" />);

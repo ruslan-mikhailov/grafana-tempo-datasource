@@ -1857,6 +1857,114 @@ describe('protected datasource transport boundary', () => {
     expect(keyless.data.queries[0].query).toBe(`${direct.query} | select(span.enc.password)`);
   });
 
+  it('dispatches enc:-prefixed regex unchanged without a key but blocks non-prefixed regex', async () => {
+    const ds = new TempoDatasource(settings, identityTemplateSrv);
+    const queries = [
+      '{span.enc.api.token =~ "enc:custom"}',
+      '{span.enc.api.token !~ "enc:v1|plain.*"}',
+      `{span.enc.api.token =~ "${attributeEnvelope}"}`,
+    ];
+    for (const query of queries) {
+      const before = fetchMock.mock.calls.length;
+      await lastValueFrom(ds.query({ targets: [{ refId: 'A', queryType: 'traceql', query }], range } as DataQueryRequest<TempoQuery>));
+      expect(fetchMock).toHaveBeenCalledTimes(before + 1);
+      const sent = fetchMock.mock.calls.at(-1)![0] as { data: { queries: TempoQuery[] } };
+      expect(sent.data.queries[0].query).toBe(query);
+      expect(JSON.stringify(sent)).not.toContain('protectedQueryKeys');
+    }
+    const sentBefore = fetchMock.mock.calls.length;
+    for (const query of [
+      '{span.enc.api.token =~ "secret"}',
+      '{span.enc.api.token =~ ".*"}',
+      `{span.enc.api.token !~ "^enc:v1:${kid}:.*$"}`,
+      '{span.enc.api.token =~ "enc:v1" && span.enc.password="secret"}',
+      '{span.enc.api.token =~ "$pattern"}',
+    ]) {
+      await lastValueFrom(ds.query({ targets: [{ refId: 'A', queryType: 'traceql', query }], range } as DataQueryRequest<TempoQuery>));
+      expect(fetchMock).toHaveBeenCalledTimes(sentBefore);
+    }
+  });
+
+  it('dispatches prefixed ciphertext regex and contains unchanged across search, metrics, and metadata without keys', async () => {
+    const publicQueries = [
+      '{span.enc.api.token =~ "enc:custom"}',
+      '{span.enc.api.token !~ "enc:v1|plain.*"}',
+      '{span.enc.api.token @> "enc:custom"}',
+      '{span.enc.api.token !@> "enc:v1|plain.*"}',
+      `{span.enc.api.token @> "${attributeEnvelope}"}`,
+    ];
+    for (const enabled of [false, true]) {
+      const ds = new TempoDatasource({
+        ...settings,
+        jsonData: { ...settings.jsonData, protectedAttributesSubstringEnabled: enabled },
+      }, identityTemplateSrv);
+      const resource = jest.spyOn(ds, 'getResource').mockResolvedValue({ data: { tagValues: [] } });
+      for (const query of publicQueries) {
+        for (const text of [query, `${query} | count_over_time()`]) {
+          const before = fetchMock.mock.calls.length;
+          await lastValueFrom(ds.query({
+            targets: [{ refId: 'A', queryType: 'traceql', query: text }], range,
+          } as DataQueryRequest<TempoQuery>));
+          expect(fetchMock).toHaveBeenCalledTimes(before + 1);
+          const sent = fetchMock.mock.calls.at(-1)![0] as { data: { queries: TempoQuery[] } };
+          expect(sent.data.queries[0].query).toBe(text);
+        }
+        resource.mockClear();
+        await ds.metadataRequest('tag-values', { tag: 'span.http.route', q: query });
+        expect(resource).toHaveBeenCalledWith('tag-values', expect.objectContaining({ q: query }), expect.anything());
+      }
+    }
+  });
+
+  it('dispatches mixed ciphertext inspection only after sealing its protected plaintext comparison', async () => {
+    const ds = new TempoDatasource(settings, identityTemplateSrv);
+    await ds.importProtectedKey(master);
+    const raw = '{span.enc.api.token =~ "enc:v1" && span.enc.password="abc"}';
+    const saved = await prepareProtectedQueryModel({ refId: 'A', queryType: 'traceql', query: raw }, ds.protectedKey!, ds.uid);
+    expect(saved.query).toMatch(/^qenc:v1:/);
+    await lastValueFrom(ds.query({ targets: [saved], range } as DataQueryRequest<TempoQuery>));
+    const sent = fetchMock.mock.calls.at(-1)![0] as { data: { queries: TempoQuery[] } };
+    expect(sent.data.queries[0].query).toBe(
+      `{span.enc.api.token =~ "enc:v1" && span.enc.password="${attributeEnvelope}"} | select(span.enc.password)`
+    );
+    expect(JSON.stringify(sent)).not.toContain('"abc"');
+    expect(JSON.stringify(sent)).not.toContain('qenc:v1:');
+  });
+
+  it('dispatches prefixed Builder operators keylessly and keyed plaintext regex with its selected key', async () => {
+    const ds = new TempoDatasource(settings, identityTemplateSrv);
+    const prefixed: TempoQuery = {
+      refId: 'A', queryType: 'traceqlSearch', filters: [
+        { id: 'regex', scope: TraceqlSearchScope.Span, tag: 'enc.api.token',
+          operator: '=~', value: 'enc:custom', valueType: 'string' },
+        { id: 'contains', scope: TraceqlSearchScope.Span, tag: 'enc.api.token',
+          operator: '@>', value: 'enc:v1|plain.*', valueType: 'string' },
+      ],
+    };
+    await lastValueFrom(ds.query({ targets: [prefixed], range } as DataQueryRequest<TempoQuery>));
+    const direct = fetchMock.mock.calls.at(-1)![0] as { data: { queries: TempoQuery[] } };
+    expect(direct.data.queries[0].query).toContain('span.enc.api.token=~"enc:custom"');
+    expect(direct.data.queries[0].query).toContain('span.enc.api.token @> "enc:v1|plain.*"');
+    const oldKid = await ds.importProtectedKey(master);
+    const old = ds.getProtectedKey(oldKid)!;
+    const nextKid = await ds.importProtectedKey(Buffer.alloc(32, 7).toString('base64'));
+    const next = ds.getProtectedKey(nextKid)!;
+    const plaintext: TempoQuery = {
+      refId: 'A', queryType: 'traceqlSearch', filters: [
+        { id: 'regex', scope: TraceqlSearchScope.Span, tag: 'enc.api.token',
+          operator: '!~', value: ['enc:custom', 'a.*'], valueType: 'string', protectedKeyId: oldKid },
+      ],
+    };
+    const sealed = await prepareProtectedQueryModel(plaintext, next, ds.uid);
+    expect(sealed.filters[0].value).toEqual(['enc:custom', expect.stringMatching(/^qenc:v1:/)]);
+    await lastValueFrom(ds.query({ targets: [sealed], range } as DataQueryRequest<TempoQuery>));
+    const sent = fetchMock.mock.calls.at(-1)![0] as { data: { queries: TempoQuery[] } };
+    expect(sent.data.queries[0].query).toContain('span.enc.api.token!~"enc:custom" && span.enc.api.token!~');
+    expect(sent.data.queries[0].query).toContain(`span.enc.api.token!~"${old.encrypt('enc.api.token', 'a.*')}"`);
+    expect(sent.data.queries[0].query).not.toContain(next.encrypt('enc.api.token', 'a.*'));
+    expect(JSON.stringify(sent)).not.toContain('a.*');
+  });
+
   it('compiles raw and builder predicates with independent selected keys before dispatching any target', async () => {
     const ds = new TempoDatasource(settings);
     const oldKid = await ds.importProtectedKey(master);
@@ -2203,6 +2311,26 @@ describe('protected datasource transport boundary', () => {
       expect(payload).not.toHaveProperty('error');
       expect(payload).not.toHaveProperty('statusText');
     }
+  });
+
+  it('sends prefixed search and metrics through Live without keys or rewriting', async () => {
+    const stream = jest.fn((_request: unknown) => of({}));
+    jest.mocked(getGrafanaLiveSrv).mockReturnValue({ getStream: stream } as never);
+    config.liveEnabled = true;
+    const ds = new TempoDatasource(settings, identityTemplateSrv);
+    ds.streamingEnabled = { search: true, metrics: true };
+    const search = '{span.enc.api.token =~ "enc:custom"}';
+    const metrics = '{span.enc.api.token !~ "enc:v1|plain.*"} | count_over_time()';
+    await lastValueFrom(ds.query({
+      targets: [
+        { refId: 'A', queryType: 'traceql', query: search },
+        { refId: 'B', queryType: 'traceql', query: metrics },
+      ], range, app: CoreApp.Explore,
+    } as DataQueryRequest<TempoQuery>));
+    const calls = stream.mock.calls.map(([request]) => request as { path: string; data: TempoQuery });
+    expect(calls.find((call) => call.path.startsWith('search/'))?.data.query).toBe(search);
+    expect(calls.find((call) => call.path.startsWith('metrics/'))?.data.query).toBe(metrics);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('passes compiled per-target search and metrics only to Live data', async () => {

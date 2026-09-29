@@ -252,6 +252,24 @@ describe('filterToQuerySection returns the correct query section for a filter', 
     expect(() => filterToQuerySection({ ...filter, value: `a${String.fromCharCode(10)}b` }, [filter], provider)).toThrow();
     expect(() => filterToQuerySection({ ...filter, value: '${password}' }, [filter], provider)).toThrow();
   });
+  it('serializes protected regex arms separately so each value keeps its key and operator semantics', () => {
+    const protectedDatasource = {
+      instanceSettings: { jsonData: { protectedAttributesEnabled: true, protectedAttributesSubstringEnabled: false } },
+    } as TempoDatasource;
+    const provider = new TempoLanguageProvider(protectedDatasource);
+    const filter: TraceqlFilter = {
+      id: 'token', scope: TraceqlSearchScope.Span, tag: 'enc.api.token', operator: '=~',
+      value: ['enc:custom', 'a.*'], valueType: 'string',
+    };
+    const positive = filterToQuerySection(filter, [filter], provider);
+    expect(positive).toBe('(span.enc.api.token=~"enc:custom" || span.enc.api.token=~"a.*")');
+    expect(classifyProtectedTraceQL(`{${positive}}`).requiresSealing).toBe(true);
+    expect(filterToQuerySection({ ...filter, operator: '!~' }, [filter], provider))
+      .toBe('(span.enc.api.token!~"enc:custom" && span.enc.api.token!~"a.*")');
+    expect(filterToQuerySection({ ...filter, value: 'enc:custom', operator: '@>' }, [filter], provider))
+      .toBe('span.enc.api.token @> "enc:custom"');
+    expect(() => filterToQuerySection({ ...filter, value: 'plain', operator: '@>' }, [filter], provider)).toThrow();
+  });
   it('keeps every ordinary array element inside its own TraceQL string, including backslashes and comments', async () => {
     const metadataRequest = jest.fn().mockResolvedValue({ tagValues: [] });
     const protectedDatasource = {

@@ -167,9 +167,9 @@ test('rejects protected builder values before a key is imported', async () => {
   expect(screen.getByText(/Complete or correct protected filter/)).toBeInTheDocument();
 });
 
-test('opens a canonical encrypted Builder filter without importing a key', async () => {
+test('opens an enc:-prefixed Builder filter without importing a key', async () => {
   initTemplateSrv([], {});
-  const ciphertext = 'enc:v1:630dcd2966c4336691125448bbb25b4f:7aUwjY5fPtHvu_dUnzcxBJc6XQ';
+  const ciphertext = 'enc:custom';
   const filter: TraceqlFilter = {
     id: 'password',
     scope: TraceqlSearchScope.Span,

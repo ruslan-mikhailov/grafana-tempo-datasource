@@ -67,7 +67,7 @@ import {
 } from './protectedAttributes/model';
 import {
   classifyProtectedTraceQL,
-  isEncryptedAttributeEnvelope,
+  isCiphertextQueryValue,
   isMetricsTraceQL,
   rewriteProtectedTraceQL,
 } from './protectedAttributes/traceql';
@@ -762,7 +762,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
                   savedValues.some(
                     (value) =>
                       typeof value !== 'string' ||
-                      (!value.startsWith('qenc:v1:') && !isEncryptedAttributeEnvelope(value))
+                      (!value.startsWith('qenc:v1:') && !isCiphertextQueryValue(value))
                   ) ||
                   plainValues.some(
                     (value, item) =>

@@ -1,4 +1,4 @@
-import { type DataSourceInstanceSettings, type PluginMetaInfo, PluginType } from '@grafana/data';
+import { type DataSourceInstanceSettings, type PluginMetaInfo, PluginType, type TimeRange } from '@grafana/data';
 import { type monacoTypes } from '@grafana/ui';
 
 import { v2Tags, emptyTags, testIntrinsics } from '../SearchTraceQLEditor/mocks';
@@ -382,6 +382,143 @@ describe('CompletionProvider', () => {
     }
   );
 
+  describe('tag value request context', () => {
+    it.each([
+      ['{resource.service.name=}', '{resource.service.name=}'.indexOf('=') + 1],
+      ['{resource.service.name="}', '{resource.service.name="}'.indexOf('"') + 1],
+      ['{resource.service.name=', '{resource.service.name='.length],
+    ])('omits an incomplete draft from ordinary value metadata: %s', async (query, offset) => {
+      const { provider, model, datasource, setAlertText } = setup(query, offset);
+      datasource.instanceSettings.jsonData.protectedAttributesEnabled = true;
+      const metadataRequest = jest.spyOn(datasource, 'metadataRequest').mockResolvedValue({
+        tagValues: [{ type: 'string', value: 'api' }],
+      });
+
+      const result = await provider.provideCompletionItems(model, emptyPosition);
+
+      expect((result! as monacoTypes.languages.CompletionList).suggestions).toEqual(
+        expect.arrayContaining([expect.objectContaining({ label: 'api' })])
+      );
+      expect(metadataRequest).toHaveBeenCalledWith(
+        'tag-values',
+        expect.objectContaining({ tag: 'resource.service.name' })
+      );
+      expect(metadataRequest.mock.calls[0][1]).not.toHaveProperty('q');
+      expect(setAlertText).toHaveBeenCalledWith(undefined);
+    });
+
+    it('does not send any part of a malformed draft containing protected plaintext', async () => {
+      const query = '{span.enc.api.token="private" && resource.service.name=}';
+      const { provider, model, datasource } = setup(query, query.lastIndexOf('=') + 1);
+      datasource.instanceSettings.jsonData.protectedAttributesEnabled = true;
+      const metadataRequest = jest.spyOn(datasource, 'metadataRequest').mockResolvedValue({
+        tagValues: [{ type: 'string', value: 'api' }],
+      });
+
+      const result = await provider.provideCompletionItems(model, emptyPosition);
+
+      expect((result! as monacoTypes.languages.CompletionList).suggestions).toEqual(
+        expect.arrayContaining([expect.objectContaining({ label: 'api' })])
+      );
+      expect(metadataRequest).toHaveBeenCalledWith(
+        'tag-values',
+        expect.objectContaining({ tag: 'resource.service.name' })
+      );
+      expect(metadataRequest.mock.calls[0][1]).not.toHaveProperty('q');
+      expect(JSON.stringify(metadataRequest.mock.calls)).not.toContain('private');
+    });
+
+    it('does not request protected value dictionaries even for incomplete drafts', async () => {
+      const query = '{span.enc.api.token=}';
+      const { provider, model, datasource } = setup(query, query.indexOf('=') + 1);
+      datasource.instanceSettings.jsonData.protectedAttributesEnabled = true;
+      const metadataRequest = jest.spyOn(datasource, 'metadataRequest');
+
+      const result = await provider.provideCompletionItems(model, emptyPosition);
+
+      expect((result! as monacoTypes.languages.CompletionList).suggestions).toEqual([]);
+      expect(metadataRequest).not.toHaveBeenCalled();
+    });
+
+    it('does not reuse previously cached protected value suggestions after protection is enabled', async () => {
+      const query = '{span.enc.api.token=}';
+      const { provider, model, datasource } = setup(query, query.indexOf('=') + 1);
+      const metadataRequest = jest.spyOn(datasource, 'metadataRequest').mockResolvedValue({
+        tagValues: [{ type: 'string', value: 'ciphertext' }],
+      });
+
+      const unprotected = await provider.provideCompletionItems(model, emptyPosition);
+      expect((unprotected! as monacoTypes.languages.CompletionList).suggestions).toEqual([
+        expect.objectContaining({ label: 'ciphertext' }),
+      ]);
+
+      datasource.instanceSettings.jsonData.protectedAttributesEnabled = true;
+      const protectedResult = await provider.provideCompletionItems(model, emptyPosition);
+      expect((protectedResult! as monacoTypes.languages.CompletionList).suggestions).toEqual([]);
+      expect(metadataRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('passes a complete context through strict metadata validation rather than dropping unsafe filters', async () => {
+      const query = '{span.enc.api.token="private" && resource.service.name=""}';
+      const { provider, model, datasource, setAlertText } = setup(query, query.lastIndexOf('""') + 1);
+      datasource.instanceSettings.jsonData.protectedAttributesEnabled = true;
+      const metadataRequest = jest.spyOn(datasource, 'metadataRequest').mockRejectedValue(
+        new Error('Protected metadata request failed.')
+      );
+
+      await provider.provideCompletionItems(model, emptyPosition);
+
+      expect(metadataRequest).toHaveBeenCalledWith('tag-values', expect.objectContaining({ q: query }));
+      expect(setAlertText).toHaveBeenCalledWith('Error: Protected metadata request failed.');
+    });
+
+    it('preserves valid ordinary context and reports actual metadata request failures', async () => {
+      const query = '{span.http.route="/users" && resource.service.name=""}';
+      const { provider, model, datasource, setAlertText } = setup(query, query.lastIndexOf('""') + 1);
+      const metadataRequest = jest.spyOn(datasource, 'metadataRequest').mockRejectedValue(new Error('Network unavailable'));
+
+      await provider.provideCompletionItems(model, emptyPosition);
+
+      expect(metadataRequest).toHaveBeenCalledWith('tag-values', expect.objectContaining({ q: query }));
+      expect(setAlertText).toHaveBeenCalledWith('Error: Network unavailable');
+    });
+
+    it('separates unfiltered and contextual suggestions across effective time windows', async () => {
+      const incomplete = '{resource.service.name=}';
+      const complete = '{resource.service.name=""}';
+      const { provider, model, datasource } = setup(incomplete, incomplete.indexOf('=') + 1);
+      const metadataRequest = jest.spyOn(datasource, 'metadataRequest').mockImplementation(async (_url, params) => ({
+        tagValues: [{
+          type: 'string',
+          value: params.q ? 'contextual' : params.start ? 'recent' : 'unfiltered',
+        }],
+      }));
+      const initial = await provider.provideCompletionItems(model, emptyPosition);
+      expect((initial! as monacoTypes.languages.CompletionList).suggestions).toEqual([
+        expect.objectContaining({ label: 'unfiltered' }),
+      ]);
+
+      provider.timeRangeForTags = 1;
+      provider.range = {
+        from: { valueOf: () => 1000, unix: () => 1 },
+        to: { valueOf: () => 2000, unix: () => 2 },
+      } as TimeRange;
+      const recent = await provider.provideCompletionItems(model, emptyPosition);
+      expect((recent! as monacoTypes.languages.CompletionList).suggestions).toEqual([
+        expect.objectContaining({ label: 'recent' }),
+      ]);
+      expect(metadataRequest.mock.calls[1][1]).toEqual(expect.objectContaining({ start: 1, end: 2 }));
+
+      const validModel = makeModel(complete, complete.indexOf('""') + 1) as unknown as monacoTypes.editor.ITextModel;
+      provider.editor = { getModel: () => validModel } as monacoTypes.editor.IStandaloneCodeEditor;
+      const contextual = await provider.provideCompletionItems(validModel, emptyPosition);
+      expect((contextual! as monacoTypes.languages.CompletionList).suggestions).toEqual([
+        expect.objectContaining({ label: 'contextual' }),
+      ]);
+      expect(metadataRequest.mock.calls[2][1]).toHaveProperty('q', complete);
+    });
+  });
+
   describe('Query hint autocompletion', () => {
     it('suggests most_recent parameter inside with clause', async () => {
       const { provider, model } = setup('{.foo=300} with(', 17);
@@ -446,12 +583,13 @@ describe('CompletionProvider', () => {
 });
 
 function setup(value: string, offset: number, tagsV2?: Scope[]) {
-  const ds = new TempoDatasource(defaultSettings);
+  const ds = new TempoDatasource({ ...defaultSettings, jsonData: { ...defaultSettings.jsonData } });
   const lp = new TempoLanguageProvider(ds);
   if (tagsV2) {
     lp.setV2Tags(tagsV2);
   }
-  const provider = new CompletionProvider({ languageProvider: lp, setAlertText: () => {} });
+  const setAlertText = jest.fn();
+  const provider = new CompletionProvider({ languageProvider: lp, setAlertText });
   const model = makeModel(value, offset);
   provider.monaco = {
     Range: {
@@ -472,7 +610,7 @@ function setup(value: string, offset: number, tagsV2?: Scope[]) {
     },
   } as unknown as monacoTypes.editor.IStandaloneCodeEditor;
 
-  return { provider, model } as unknown as { provider: CompletionProvider; model: monacoTypes.editor.ITextModel };
+  return { provider, model: model as unknown as monacoTypes.editor.ITextModel, datasource: ds, setAlertText };
 }
 
 function makeModel(value: string, offset: number) {
