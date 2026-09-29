@@ -23,6 +23,7 @@ import { config } from '@grafana/runtime';
 import { SecureSocksProxySettings, useStyles2, Divider, Stack, InlineField, InlineSwitch } from '@grafana/ui';
 
 import { type TempoJsonData } from '../types';
+import { KeyRevocation } from './KeyRevocation';
 import { QuerySettings } from './QuerySettings';
 import { ServiceGraphSettings } from './ServiceGraphSettings';
 import { StreamingSection } from './StreamingSection';
@@ -123,21 +124,8 @@ const ConfigEditor = ({ options, onOptionsChange }: ConfigEditorProps) => {
                 }
               />
             </InlineField>
-            <InlineField label="Enable protected substring search" labelWidth={26}>
-              <InlineSwitch
-                id="protectedAttributesSubstringEnabled"
-                aria-label="Enable protected substring search"
-                value={options.jsonData.protectedAttributesSubstringEnabled ?? false}
-                disabled={!options.jsonData.protectedAttributesEnabled}
-                onChange={(event) =>
-                  guardedOptionsChange({
-                    ...options,
-                    jsonData: { ...options.jsonData, protectedAttributesSubstringEnabled: event.currentTarget.checked },
-                  })
-                }
-              />
-            </InlineField>
             {protectionError && <div role="alert">{protectionError}</div>}
+            <KeyRevocation key={options.uid ?? 'unsaved'} uid={options.uid} name={options.name ?? 'Tempo'} />
           </ConfigSubSection>
 
           <ConfigSubSection

@@ -37,6 +37,7 @@ type DataSource struct {
 	info            *DatasourceInfo
 	logger          log.Logger
 	tracer          trace.Tracer
+	redaction       *redactionBridge
 	resourceHandler backend.CallResourceHandler
 }
 
@@ -77,13 +78,16 @@ func NewDatasource(ctx context.Context, settings backend.DataSourceInstanceSetti
 			StreamingClient: streamingClient,
 			URL:             settings.URL,
 		},
-		logger: backend.NewLoggerWith("logger", "tsdb.tempo"),
-		tracer: tracing.DefaultTracer(),
+		logger:    backend.NewLoggerWith("logger", "tsdb.tempo"),
+		tracer:    tracing.DefaultTracer(),
+		redaction: newRedactionBridge(settings, opts),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tags", ds.handleTags)
 	mux.HandleFunc("/tag-values", ds.handleTagValues)
+	mux.HandleFunc("/redaction/capabilities", ds.handleRedactionCapabilities)
+	mux.HandleFunc("/redaction", ds.handleRedaction)
 	ds.resourceHandler = httpadapter.New(mux)
 
 	return ds, nil

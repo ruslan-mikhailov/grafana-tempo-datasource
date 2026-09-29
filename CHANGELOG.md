@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix the clipped key-revocation file picker by using a Grafana button to open the local file dialog; add spacing between key-loading controls.
+- Remove the protected substring-search settings switch while retaining provisioned query support. Make both demo Tempo datasources editable, and authorize key revocation by Grafana's trusted organization Admin role, including anonymous Admins.
+- Add administrator-only key revocation in Tempo datasource settings: load a base64 key locally, discover `enc` attributes, confirm irreversible replacement, and submit per-attribute scheduler jobs through an authorized backend bridge. Require a provisioned scheduler URL and tenant; show queued batches and partial failures without automatic retries. Protected substring search is not required.
 - Add opt-in protected span substring search (`@>` and `!@>`): browser-side NFC trigrams, pinned TraceQL parser, internal `subarray_seq` index queries, and guarded Builder/metadata/HTTP/Live paths. Handle non-index array attributes without a search-result panic; omit `bi.*` from Grafana search frames while retaining Tempo storage and direct API access. Requires matching Alloy and Tempo builds; protected terms shorter than three Unicode scalars are rejected.
 - Display protected Tempo span values in the stock Grafana Traces table and trace detail when the browser key is loaded; keep returned frames and host actions encrypted. Requires the accompanying `grafana-h` host build.
 - Open the protected key entry dialog after forgetting a key, with the old key and input cleared.

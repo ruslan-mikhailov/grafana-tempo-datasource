@@ -32,6 +32,7 @@ jest.mock('./StreamingSection', () => ({ StreamingSection: () => null }));
 jest.mock('./TagLimitSettings', () => ({ TagLimitSection: () => null }));
 jest.mock('./TagsTimeRangeSettings', () => ({ TagsTimeRangeSettings: () => null }));
 jest.mock('./TraceQLSearchSettings', () => ({ TraceQLSearchSettings: () => null }));
+jest.mock('./KeyRevocation', () => ({ KeyRevocation: () => null }));
 
 test('enables protected attributes without a configured key ID', async () => {
   const user = userEvent.setup();
@@ -86,22 +87,22 @@ test('refuses to enable protection while a valued protected static default remai
   expect(screen.getByRole('alert')).not.toHaveTextContent('sensitive');
 });
 
-test('substring opt-in requires protection and disabling protection clears the opt-in', async () => {
+test('disabling protected attributes clears provisioned substring opt-in before re-enabling', async () => {
   const user = userEvent.setup();
   const onOptionsChange = jest.fn();
   const options = {
-    jsonData: { protectedAttributesEnabled: true, protectedAttributesSubstringEnabled: false },
+    jsonData: { protectedAttributesEnabled: true, protectedAttributesSubstringEnabled: true },
   } as DataSourcePluginOptionsEditorProps<TempoJsonData>['options'];
   const { rerender } = render(<ConfigEditor options={options} onOptionsChange={onOptionsChange} />);
-  await user.click(screen.getByLabelText('Enable protected substring search'));
-  expect(onOptionsChange).toHaveBeenCalledWith(expect.objectContaining({
-    jsonData: { protectedAttributesEnabled: true, protectedAttributesSubstringEnabled: true },
-  }));
-  rerender(<ConfigEditor options={{
-    ...options, jsonData: { protectedAttributesEnabled: true, protectedAttributesSubstringEnabled: true },
-  }} onOptionsChange={onOptionsChange} />);
   await user.click(screen.getByLabelText('Enable protected attributes'));
   expect(onOptionsChange).toHaveBeenLastCalledWith(expect.objectContaining({
     jsonData: { protectedAttributesEnabled: false, protectedAttributesSubstringEnabled: false },
+  }));
+  rerender(<ConfigEditor options={{
+    ...options, jsonData: { protectedAttributesEnabled: false, protectedAttributesSubstringEnabled: false },
+  }} onOptionsChange={onOptionsChange} />);
+  await user.click(screen.getByLabelText('Enable protected attributes'));
+  expect(onOptionsChange).toHaveBeenLastCalledWith(expect.objectContaining({
+    jsonData: { protectedAttributesEnabled: true, protectedAttributesSubstringEnabled: false },
   }));
 });

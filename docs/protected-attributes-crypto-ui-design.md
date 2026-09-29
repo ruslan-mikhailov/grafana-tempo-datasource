@@ -46,7 +46,7 @@ Grafana [issue #117639](https://github.com/grafana/grafana/issues/117639) docume
 
 ## UI and response-path placement
 
-`src/configuration/ConfigEditor.tsx` exposes only an enable switch, persisting `jsonData.protectedAttributesEnabled`, never a key or required key ID. Enabling does not encrypt existing traces. `QueryField.tsx` shows **Protected data**, a key count, and **Load keys/Manage keys**. Import uses masked fields, multiline paste or local files; optional names stay local. Session keys provides fingerprints and individual/all-key removal. **Locked** values can request matching-key import. Decrypted values toggle inline between plaintext/unlocked and ciphertext/locked, without opening a dialog or forgetting the key. Import/forget resets reveal state. One query key is automatic; multiple keys expose per-predicate choices. No prototype/sample-key controls appear in the product. Keys disappear on reload and never enter logs, telemetry or host query models.
+`src/configuration/ConfigEditor.tsx` exposes **Enable protected attributes** and a separate key-revocation operation; it never saves a key or required key ID. The substring-search switch is not shown; `jsonData.protectedAttributesSubstringEnabled` remains a provisioning option for protected-query compatibility. Enabling protection does not encrypt existing traces. `QueryField.tsx` shows **Protected data**, a key count, and **Load keys/Manage keys**. Import uses masked fields, multiline paste or local files; optional names stay local. Session keys provides fingerprints and individual/all-key removal. **Locked** values can request matching-key import. Decrypted values toggle inline between plaintext/unlocked and ciphertext/locked, without opening a dialog or forgetting the key. Import/forget resets reveal state. One query key is automatic; multiple keys expose per-predicate choices. No prototype/sample-key controls appear in the product. Keys disappear on reload and never enter logs, telemetry or host query models.
 
 `QueryField.tsx` must hide `QueryWithAssistantButton` whenever `jsonData.protectedAttributesEnabled` is true, even before key import. Protected plaintext can exist in editor-local drafts but not newly saved query models; old unsafe models may still exist. Neither belongs in a remote assistant request. Unprotected datasources keep their existing assistant behavior.
 
@@ -63,6 +63,45 @@ Fail closed on **valued** static defaults whose `scope`, `tag`, or embedded quer
 HTTP trace-ID, HTTP search, and Live search responses keep encrypted `tags`, projected `enc.` fields, nested frames, and Raw JSON unchanged. `transformTrace` receives the original trace response; the stock span renderer resolves visible values at render time. Search formatting preserves its existing encrypted frames and metrics progress frame. Live `result: null` or an absent result is normalized to `[]` before formatting, so zero-result progress and Done events still emit. Metrics responses and uploaded traces do not invoke a response decryptor.
 
 Metadata tag-value endpoints are owned by the [query design](./protected-attributes-query-design.md). Keep protected tag names available but suppress `enc.*` ciphertext **value suggestions** instead of decrypting metadata suggestions or exposing ciphertext as selectable plaintext. Users enter their own protected values in the query editor; the outbound query owner encrypts only supported scoped span equality/inequality RHS literals after interpolation. Do not silently make the backend a plaintext metadata service.
+
+## Key revocation from datasource settings
+
+**Connections → Data sources → Tempo → Settings → Additional settings → Protected span attributes → Key revocation** is an immediate administrative operation, not a saved datasource setting. It works on provisioned datasources and does not depend on protected substring search. The provisioning option `protectedAttributesSubstringEnabled` controls protected TraceQL `@>` / `!@>` queries, not scheduler prefix matching.
+
+1. Use a Grafana organization Admin role. An anonymous user configured with that role can submit; Viewer, Editor, unknown roles and missing user context cannot.
+2. Select span or resource attributes from autocomplete. The existing `/resources/tags` handler queries Tempo's `/api/v2/search/tags`; only unscoped names beginning with `enc` are offered. Discovery is not a complete historical inventory.
+3. Select **Load key file → Choose local key file** to load one text file containing a base64-encoded 32-byte key, or select **Paste base64** and load the pasted key. The file picker uses a Grafana button rather than a visible native file input, matching the Explore key dialogs. The browser derives the key ID using the existing crypto importer, clears its cryptographic handle and input, and retains only the ID in the form. It does not add this key to Explore's keyring.
+4. Review the exact datasource, attributes and full key ID. Acknowledge the irreversible rewrite before confirming.
+5. Review each submission result. Accepted batch IDs and queued job counts do **not** report completion. Tempo permits only one active batch per tenant; a later attribute may receive a conflict. Wait for that batch to complete before explicitly resubmitting failed attributes. Accepted attributes are removed from the selection. A transport failure can leave the submission outcome unknown; inspect scheduler state before retrying.
+
+The bridge accepts one operation per request:
+
+```json
+{
+  "attributeRedaction": {
+    "key": "span.enc.secret",
+    "valuePrefix": "enc:v1:630dcd2966c4336691125448bbb25b4f"
+  }
+}
+```
+
+It calls `tempopb.BackendScheduler/SubmitRedaction` with no time bounds. Each matching string value in processed stored blocks becomes `[REDACTED]`; attribute names, traces and values under other keys remain. This does not revoke copied ciphertext, keys in other browsers, or future/in-flight ingestion. Rotate or disable the ingestion key separately. No automatic request retries are performed.
+
+Provision the backend scheduler's **gRPC** address and a trusted tenant:
+
+```yaml
+jsonData:
+  redactionSchedulerURL: https://scheduler.example.internal:9095
+  httpHeaderName1: X-Scope-OrgID
+secureJsonData:
+  httpHeaderValue1: my-tenant
+```
+
+Use an unused header index if the datasource already has configured headers. A scheduler URL must use `http` or `https` and an explicit port, without credentials, path, query or fragment. HTTPS reuses the datasource's configured TLS options; configured basic authentication is supported. The bridge takes the tenant only from the configured secure header, not from the browser request or its forwarded headers. Restrict access to the scheduler itself: it does not authorize a caller's choice of tenant.
+
+The demo provisions `http://backend-scheduler:9095` and tenant `single-tenant`. Both Tempo datasources use `editable: true`: change settings, use **Save & test**, and the saved values survive a page refresh. Provisioning still uses `version: 0`, so restarting Grafana reapplies the configured defaults. Grafana login is enabled and the existing anonymous Admin role can use Explore, edit datasource settings and submit revocations. Anonymous Admin access is not suitable for a public deployment. Rebuild and recreate the demo's `grafana` service to apply plugin changes and provisioning; no new host-code changes require rebuilding `grafana-base`.
+
+Backend resources are `GET /api/datasources/uid/<uid>/resources/redaction/capabilities` and `POST /api/datasources/uid/<uid>/resources/redaction`. Capability discovery is advisory; the POST handler independently checks the trusted Grafana organization Admin role, configured tenant/scheduler, operation shape, attribute scope/prefix, and the exact `enc:v1:<32-lowercase-hex-ID>` value prefix. Authorization does not depend on the user's login string. Browser input cannot select a role, tenant, scheduler, time window, trace query, dry-run mode, or secret key.
 
 ## Security and failure decisions
 
