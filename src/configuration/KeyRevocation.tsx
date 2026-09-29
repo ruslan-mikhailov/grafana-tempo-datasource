@@ -8,10 +8,11 @@ import { importKey, type ProtectedAttributeKey } from '../protectedAttributes/cr
 
 type Capability = { enabled: boolean; canSubmit: boolean };
 type TagResponse = { scopes?: Array<{ name: string; tags: string[] }> };
-type Submission = { attribute: string; batchId?: string; jobsCreated?: number; error?: string };
+type Submission = { batchId?: string; jobsCreated?: number; error?: string };
 type Confirmation = { uid: string; name: string; kid: string; attributes: string[] };
 
 const keyFileLimit = 64 * 1024;
+const maxAttributePairs = 32;
 
 export function KeyRevocation({ uid, name }: { uid?: string; name: string }) {
   const [capability, setCapability] = useState<Capability>();
@@ -26,7 +27,7 @@ export function KeyRevocation({ uid, name }: { uid?: string; name: string }) {
   const [submitting, setSubmitting] = useState(false);
   const [confirmation, setConfirmation] = useState<Confirmation>();
   const [acknowledged, setAcknowledged] = useState(false);
-  const [results, setResults] = useState<Submission[]>([]);
+  const [result, setResult] = useState<Submission>();
   const pasteInput = useRef<HTMLInputElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const generation = useRef(0);
@@ -50,7 +51,7 @@ export function KeyRevocation({ uid, name }: { uid?: string; name: string }) {
       setSubmitting(false);
       setConfirmation(undefined);
       setAcknowledged(false);
-      setResults([]);
+      setResult(undefined);
       importBusy.current = false;
       submitBusy.current = false;
     }
@@ -72,7 +73,7 @@ export function KeyRevocation({ uid, name }: { uid?: string; name: string }) {
           setAttributes(Array.from(new Set((response.scopes ?? [])
             .filter((scope) => scope.name === 'span' || scope.name === 'resource')
             .flatMap((scope) => (scope.tags ?? [])
-              .filter((tag) => typeof tag === 'string' && tag.startsWith('enc'))
+              .filter((tag) => typeof tag === 'string' && tag.startsWith('enc.') && tag.length > 4 && !/\p{Cc}/u.test(tag))
               .map((tag) => `${scope.name}.${tag}`)))).sort());
         } catch {
           if (active) { setDiscoveryError(true); }
@@ -95,7 +96,7 @@ export function KeyRevocation({ uid, name }: { uid?: string; name: string }) {
     setKeyError(undefined);
     setConfirmation(undefined);
     setAcknowledged(false);
-    setResults([]);
+    setResult(undefined);
     setBusy(false);
     importBusy.current = false;
   };
@@ -145,7 +146,6 @@ export function KeyRevocation({ uid, name }: { uid?: string; name: string }) {
   };
   const review = () => {
     if (!uid || !kid || !selected.length || !capability?.enabled || !capability.canSubmit || submitBusy.current) { return; }
-    // Keep accepted batch IDs visible while the operator reviews a failed attribute again.
     setAcknowledged(false);
     setConfirmation({ uid, name, kid, attributes: [...selected] });
   };
@@ -157,26 +157,22 @@ export function KeyRevocation({ uid, name }: { uid?: string; name: string }) {
     setConfirmation(undefined);
     const base = `/api/datasources/uid/${encodeURIComponent(snapshot.uid)}/resources/redaction`;
     const submittedGeneration = generation.current;
+    const attributeRedactions = snapshot.attributes.flatMap((attribute) => [
+      { key: attribute, valuePrefix: `enc:v1:${snapshot.kid}` },
+      { key: attribute.replace('.enc.', '.bi.'), valuePrefix: `bi:v1:${snapshot.kid}` },
+    ]);
     try {
-      const outcomes: Submission[] = [];
-      for (const attribute of snapshot.attributes) {
-        // A tenant can have only one active redaction batch. Do not race its scheduler with concurrent submissions.
-        if (generation.current !== submittedGeneration) { break; }
-        try {
-          const response = await getBackendSrv().post<{ batchId: string; jobsCreated: number }>(base, {
-            attributeRedaction: { key: attribute, valuePrefix: `enc:v1:${snapshot.kid}` },
-          });
-          outcomes.push({ attribute, batchId: response.batchId, jobsCreated: response.jobsCreated });
-        } catch (error) {
-          const conflict = typeof error === 'object' && error !== null && 'status' in error && error.status === 409;
-          outcomes.push({ attribute, error: conflict
-            ? 'Another redaction batch is active for this tenant. Retry this attribute after that batch completes.'
-            : 'Submission could not be confirmed. Check scheduler state before retry; no automatic retry was attempted.' });
-        }
-      }
+      const response = await getBackendSrv().post<{ batchId: string; jobsCreated: number }>(base, { attributeRedactions });
       if (generation.current === submittedGeneration) {
-        setResults((previous) => [...previous.filter((item) => !snapshot.attributes.includes(item.attribute)), ...outcomes]);
-        setSelected(outcomes.filter((outcome) => outcome.error).map((outcome) => outcome.attribute));
+        setResult({ batchId: response.batchId, jobsCreated: response.jobsCreated });
+        setSelected([]);
+      }
+    } catch (error) {
+      if (generation.current === submittedGeneration) {
+        const conflict = typeof error === 'object' && error !== null && 'status' in error && error.status === 409;
+        setResult({ error: conflict
+          ? 'Another redaction batch is active for this tenant. Retry after it completes.'
+          : 'Submission could not be confirmed. Check scheduler state before retry; no automatic retry was attempted.' });
       }
     } finally {
       if (generation.current === submittedGeneration) {
@@ -208,14 +204,14 @@ export function KeyRevocation({ uid, name }: { uid?: string; name: string }) {
         options={choices}
         value={selected}
         onChange={(values) => {
-          setSelected(Array.from(new Set(values.flatMap((item) => item.value && attributes.includes(item.value) ? [item.value] : []))));
-          setConfirmation(undefined);
+          const next = Array.from(new Set(values.flatMap((item) => item.value && attributes.includes(item.value) ? [item.value] : [])));
+          if (next.length <= maxAttributePairs) { setSelected(next); setConfirmation(undefined); }
         }}
         isSearchable
         disabled={submitting || busy || !!discoveryError}
         placeholder="Search enc attributes…"
       />
-      <p>One independent scheduler request per selected attribute.</p>
+      <p>Select up to {maxAttributePairs} encrypted attributes. Their matching blind-index attributes are removed in the same batch.</p>
       <p>Key to revoke — load one local 32-byte base64 key. Only its derived key ID is retained in this form.</p>
       {kid ? <div role="status">Key ID: <code>{kid}</code> <Button variant="secondary" disabled={submitting} onClick={removeKey}>Remove key</Button></div> : (
         <div style={{ display: 'grid', gap: 8, marginBottom: 8 }}>
@@ -238,19 +234,17 @@ export function KeyRevocation({ uid, name }: { uid?: string; name: string }) {
       <p>Data source: {name}. Scope: all stored blocks for this data source’s configured tenant, with no time bounds.</p>
       {kid && <p>Match: selected attributes with values starting <code>enc:v1:{kid}</code>.</p>}
       <Button variant="destructive" disabled={!kid || !selected.length || busy || submitting} onClick={review}>Revoke key…</Button>
-      {submitting && <p role="status">Submitting independent requests. Queued does not mean completed.</p>}
-      {results.length > 0 && <div role="status" aria-label="Revocation submission results">
-        <p>Submission results — queued jobs are not completed redactions. No automatic retries.</p>
-        <ul>{results.map((result) => <li key={result.attribute}>
-          <code>{result.attribute}</code>: {result.error ?? `Queued ${result.jobsCreated} job(s), batch ${result.batchId}.`}
-        </li>)}</ul>
+      {submitting && <p role="status">Submitting one batch. Queued does not mean completed.</p>}
+      {result && <div role="status" aria-label="Revocation submission results">
+        <p>Submission result — queued jobs are not completed redactions. No automatic retries.</p>
+        <p>{result.error ?? `Queued ${result.jobsCreated} job(s), batch ${result.batchId}.`}</p>
       </div>}
       <Modal title="Revoke key and delete matching data?" isOpen={!!confirmation} onDismiss={() => { if (!submitting) { setConfirmation(undefined); setAcknowledged(false); } }}>
         {confirmation && <div>
           <Alert title="Irreversible redaction" severity="error">Matching values in all stored blocks become [REDACTED]. This cannot be undone. Traces survive; future writes are not stopped.</Alert>
           <p>Data source: {confirmation.name}</p><p>Key ID: <code>{confirmation.kid}</code></p>
           <p>Attributes:</p><ul>{confirmation.attributes.map((attribute) => <li key={attribute}><code>{attribute}</code></li>)}</ul>
-          <p>One separate request per attribute. Accepted requests queue jobs; they do not indicate completion.</p>
+          <p>One request queues one batch for all selected attributes and their matching blind indexes; it does not indicate completion.</p>
           <label><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.currentTarget.checked)} /> I understand that this redaction is permanent and does not stop future writes.</label>
           <Stack gap={1} justifyContent="flex-end">
             <Button variant="secondary" onClick={() => { setConfirmation(undefined); setAcknowledged(false); }}>Cancel</Button>

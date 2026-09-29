@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -22,12 +24,13 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
-const validRedactionBody = `{"attributeRedaction":{"key":"span.enc.secret","valuePrefix":"enc:v1:630dcd2966c4336691125448bbb25b4f"}}`
+const validRedactionBody = `{"attributeRedactions":[{"key":"span.enc.secret","valuePrefix":"enc:v1:630dcd2966c4336691125448bbb25b4f"},{"key":"span.bi.secret","valuePrefix":"bi:v1:630dcd2966c4336691125448bbb25b4f"}]}`
 
 // Independent wire decoder: decoding via the bridge's own Go messages would
 // fail to catch a field-number or RPC-path mismatch with backendwork.proto.
+type schedulerWireAttribute struct{ Key, Prefix string }
 type schedulerWireRequest struct {
-	Key, Prefix string
+	Attributes  []schedulerWireAttribute
 	OtherFields bool
 }
 type schedulerWireReply struct {
@@ -51,35 +54,37 @@ func (schedulerWireCodec) Unmarshal(data []byte, v any) error {
 			return errors.New("invalid protobuf tag")
 		}
 		data = data[n:]
-		if field != 7 || typ != protowire.BytesType {
+		if field != 8 || typ != protowire.BytesType {
 			req.OtherFields = true
 		}
-		if field == 7 && typ == protowire.BytesType {
-			var attr []byte
-			attr, n = protowire.ConsumeBytes(data)
-			if n < 0 {
+		if field == 8 && typ == protowire.BytesType {
+			attr, size := protowire.ConsumeBytes(data)
+			if size < 0 {
 				return errors.New("invalid protobuf attribute")
 			}
+			var rule schedulerWireAttribute
 			for len(attr) != 0 {
 				id, kind, consumed := protowire.ConsumeTag(attr)
 				if consumed < 0 || kind != protowire.BytesType {
 					return errors.New("invalid protobuf attribute field")
 				}
 				attr = attr[consumed:]
-				value, size := protowire.ConsumeString(attr)
-				if size < 0 {
+				value, n := protowire.ConsumeString(attr)
+				if n < 0 {
 					return errors.New("invalid protobuf attribute value")
 				}
 				switch id {
 				case 1:
-					req.Key = value
+					rule.Key = value
 				case 2:
-					req.Prefix = value
+					rule.Prefix = value
 				default:
 					req.OtherFields = true
 				}
-				attr = attr[size:]
+				attr = attr[n:]
 			}
+			req.Attributes = append(req.Attributes, rule)
+			n = size
 		} else {
 			n = protowire.ConsumeFieldValue(field, typ, data)
 			if n < 0 {
@@ -119,7 +124,7 @@ func startRedactionScheduler(t *testing.T, handler func(context.Context, *schedu
 	server := grpc.NewServer(grpc.ForceServerCodec(schedulerWireCodec{}), grpc.StatsHandler(connStats))
 	server.RegisterService(&grpc.ServiceDesc{
 		ServiceName: "tempopb.BackendScheduler", HandlerType: (*schedulerWireService)(nil),
-		Methods: []grpc.MethodDesc{{MethodName: "SubmitRedaction", Handler: func(_ any, ctx context.Context, decode func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+		Methods: []grpc.MethodDesc{{MethodName: "SubmitAttributeRedaction", Handler: func(_ any, ctx context.Context, decode func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
 			invoke := func(ctx context.Context, req any) (any, error) { return handler(ctx, req.(*schedulerWireRequest)) }
 			req := new(schedulerWireRequest)
 			if err := decode(req); err != nil {
@@ -238,15 +243,30 @@ func TestRedactionRejectsInvalidBodiesWithoutSchedulerCall(t *testing.T) {
 	})
 	ds := newRedactionTestDatasource(t, "http://"+addr, "tenant")
 	admin := &backend.User{Login: "operator", Role: "Admin"}
+	pair := strings.TrimSuffix(strings.TrimPrefix(validRedactionBody, `{"attributeRedactions":[`), `]}`)
+	var distinctPairs []string
+	for i := 0; i <= redactionMaxPairs; i++ {
+		distinctPairs = append(distinctPairs, strings.ReplaceAll(pair, "secret", strconv.Itoa(i)))
+	}
 	for _, body := range []string{
-		`{}`, `null`, `{"attributeRedaction":null}`, `{"attributeRedaction":{}}`,
-		`{"attributeRedaction":{"key":"span.enc.x","valuePrefix":"enc:v1:630dcd2966c4336691125448bbb25b4f"},"traceIds":["raw"]}`,
-		`{"attributeRedaction":{"key":"span.enc.x","valuePrefix":"enc:v1:630dcd2966c4336691125448bbb25b4f","tenant":"other"}}`,
+		`{}`, `null`, `{"attributeRedactions":null}`, `{"attributeRedactions":[]}`,
+		`{"attributeRedaction":{"key":"span.enc.secret","valuePrefix":"enc:v1:630dcd2966c4336691125448bbb25b4f"}}`,
+		strings.Replace(validRedactionBody, `]}`, `],"traceIds":["raw"]}`, 1),
+		strings.Replace(validRedactionBody, `"key":"span.enc.secret"`, `"key":"span.enc.secret","tenant":"other"`, 1),
+		`{"attributeRedactions":[` + strings.Split(pair, `},{`)[0] + `}]}`,
 		strings.Replace(validRedactionBody, "span.enc.secret", "span.secret", 1),
 		strings.Replace(validRedactionBody, "span.enc.secret", "instrumentation.enc.secret", 1),
+		strings.Replace(validRedactionBody, "span.enc.secret", "span.enc.", 1),
 		strings.Replace(validRedactionBody, "span.enc.secret", `span.enc.\nsecret`, 1),
+		strings.Replace(validRedactionBody, "span.bi.secret", "resource.bi.secret", 1),
+		strings.Replace(validRedactionBody, "span.bi.secret", "span.bi.other", 1),
+		strings.Replace(validRedactionBody, "span.bi.secret", "span.enc.secret", 1),
 		strings.Replace(validRedactionBody, "630dcd2966c4336691125448bbb25b4f", "630DCD2966C4336691125448BBB25B4F", 1),
-		strings.Replace(validRedactionBody, "enc:v1:", "enc:v2:", 1),
+		strings.Replace(validRedactionBody, "bi:v1:", "enc:v1:", 1),
+		strings.Replace(validRedactionBody, "bi:v1:", "bi:v2:", 1),
+		strings.Replace(validRedactionBody, "bi:v1:630", "bi:v1:730", 1),
+		`{"attributeRedactions":[` + pair + `,` + pair + `]}`,
+		`{"attributeRedactions":[` + strings.Join(distinctPairs, ",") + `]}`,
 		validRedactionBody + validRedactionBody,
 		validRedactionBody + strings.Repeat(" ", redactionMaxBody),
 	} {
@@ -256,24 +276,36 @@ func TestRedactionRejectsInvalidBodiesWithoutSchedulerCall(t *testing.T) {
 	require.Zero(t, calls.Load())
 }
 
-func TestRedactionSubmitWireTenantResponseAndConnectionClose(t *testing.T) {
+func TestRedactionSubmitPairedWireTenantResponseAndConnectionClose(t *testing.T) {
 	observed := make(chan struct{}, 1)
+	var calls atomic.Int32
 	addr, ended := startRedactionScheduler(t, func(ctx context.Context, req *schedulerWireRequest) (*schedulerWireReply, error) {
+		calls.Add(1)
 		md, ok := metadata.FromIncomingContext(ctx)
 		if !ok || strings.Join(md.Get("x-scope-orgid"), ",") != "single-tenant" || len(md.Get("authorization")) != 0 ||
-			req.Key != "resource.enc:customer/key" || req.Prefix != "enc:v1:630dcd2966c4336691125448bbb25b4f" || req.OtherFields {
+			req.OtherFields || len(req.Attributes) != 4 {
 			return nil, status.Error(codes.InvalidArgument, "wire contract mismatch")
+		}
+		expected := []schedulerWireAttribute{
+			{"span.enc.secret", "enc:v1:630dcd2966c4336691125448bbb25b4f"},
+			{"span.bi.secret", "bi:v1:630dcd2966c4336691125448bbb25b4f"},
+			{"resource.enc.token", "enc:v1:630dcd2966c4336691125448bbb25b4f"},
+			{"resource.bi.token", "bi:v1:630dcd2966c4336691125448bbb25b4f"},
+		}
+		if !reflect.DeepEqual(req.Attributes, expected) {
+			return nil, status.Error(codes.InvalidArgument, "wire rules mismatch")
 		}
 		observed <- struct{}{}
 		return &schedulerWireReply{Batch: "batch-123", Jobs: 7}, nil
 	})
 	ds := newRedactionTestDatasource(t, "http://"+addr, "single-tenant")
 	admin := &backend.User{Login: "operator", Role: "Admin"}
-	body := strings.Replace(validRedactionBody, "span.enc.secret", "resource.enc:customer/key", 1)
+	body := strings.TrimSuffix(validRedactionBody, `]}`) + `,{"key":"resource.enc.token","valuePrefix":"enc:v1:630dcd2966c4336691125448bbb25b4f"},{"key":"resource.bi.token","valuePrefix":"bi:v1:630dcd2966c4336691125448bbb25b4f"}]}`
 	ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs("x-scope-orgid", "attacker", "authorization", "Bearer attacker"))
 	r := redactionCall(t, ds, "POST", "/redaction", body, admin, map[string][]string{"X-Scope-OrgID": {"attacker"}, "Authorization": {"Bearer attacker"}}, ctx)
 	require.Equal(t, http.StatusOK, r.Status, string(r.Body))
 	require.JSONEq(t, `{"batchId":"batch-123","jobsCreated":7}`, string(r.Body))
+	require.EqualValues(t, 1, calls.Load())
 	select {
 	case <-observed:
 	case <-time.After(time.Second):

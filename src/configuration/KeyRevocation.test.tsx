@@ -85,15 +85,55 @@ it('derives a key ID from pasted key without saving or transmitting key material
   await user.click(screen.getByRole('button', { name: 'Revoke key…' }));
   expect(screen.getByRole('dialog')).toHaveTextContent(kid);
   expect(screen.getByRole('dialog')).toHaveTextContent('span.enc.secret');
+  expect(screen.getByRole('dialog')).not.toHaveTextContent('span.bi.secret');
   await user.click(screen.getByRole('checkbox'));
   await user.click(screen.getByRole('button', { name: 'Confirm redaction' }));
   await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
   expect(post).toHaveBeenCalledWith('/api/datasources/uid/tempo-uid/resources/redaction', {
-    attributeRedaction: { key: 'span.enc.secret', valuePrefix: `enc:v1:${kid}` },
+    attributeRedactions: [
+      { key: 'span.enc.secret', valuePrefix: `enc:v1:${kid}` },
+      { key: 'span.bi.secret', valuePrefix: `bi:v1:${kid}` },
+    ],
   });
   expect(JSON.stringify([...get.mock.calls, ...post.mock.calls])).not.toContain(secret);
   expect(screen.getByRole('status', { name: 'Revocation submission results' })).toHaveTextContent('Queued 2 job(s), batch batch-123');
   expect(screen.getByRole('status', { name: 'Revocation submission results' })).toHaveTextContent('not completed');
+});
+
+it('retains the selected encrypted attribute when the batch is rejected', async () => {
+  const user = userEvent.setup();
+  post.mockRejectedValue({ status: 409 });
+  render(<KeyRevocation uid="tempo-uid" name="Tempo" />);
+  await screen.findByRole('button', { name: 'span.enc.secret' });
+  await loadPastedKey(user);
+  await user.click(screen.getByRole('button', { name: 'span.enc.secret' }));
+  await user.click(screen.getByRole('button', { name: 'Revoke key…' }));
+  expect(screen.getByRole('dialog')).not.toHaveTextContent('bi.secret');
+  await user.click(screen.getByRole('checkbox'));
+  await user.click(screen.getByRole('button', { name: 'Confirm redaction' }));
+  expect(await screen.findByRole('status', { name: 'Revocation submission results' }))
+    .toHaveTextContent('Another redaction batch is active');
+  expect(screen.getByRole('button', { name: 'span.enc.secret' })).toHaveAttribute('aria-pressed', 'true');
+  expect(screen.queryByRole('button', { name: 'span.bi.secret' })).not.toBeInTheDocument();
+  expect(post).toHaveBeenCalledTimes(1);
+});
+
+it('pairs resource-scoped fields without exposing the paired name in the picker', async () => {
+  const user = userEvent.setup();
+  render(<KeyRevocation uid="tempo-uid" name="Tempo" />);
+  await screen.findByRole('button', { name: 'resource.enc.secret' });
+  await loadPastedKey(user);
+  await user.click(screen.getByRole('button', { name: 'resource.enc.secret' }));
+  await user.click(screen.getByRole('button', { name: 'Revoke key…' }));
+  expect(screen.getByRole('dialog')).toHaveTextContent('resource.enc.secret');
+  expect(screen.getByRole('dialog')).not.toHaveTextContent('resource.bi.secret');
+  await user.click(screen.getByRole('checkbox'));
+  await user.click(screen.getByRole('button', { name: 'Confirm redaction' }));
+  await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+  expect(post.mock.calls[0][1].attributeRedactions).toEqual([
+    { key: 'resource.enc.secret', valuePrefix: `enc:v1:${kid}` },
+    { key: 'resource.bi.secret', valuePrefix: `bi:v1:${kid}` },
+  ]);
 });
 
 it('opens the key picker directly, including after switching from paste mode', async () => {
@@ -152,30 +192,33 @@ it('gates requests by backend capability and unsaved datasources', async () => {
   expect(post).not.toHaveBeenCalled();
 });
 
-it('reports per-attribute partial success and leaves only failed attributes selected for explicit retry', async () => {
+it('submits two encrypted selections and their paired blind indexes in one batch', async () => {
   const user = userEvent.setup();
-  post.mockImplementation((_url: string, body: { attributeRedaction: { key: string } }) =>
-    body.attributeRedaction.key === 'span.enc.secret'
-      ? Promise.resolve({ batchId: 'accepted-batch', jobsCreated: 3 })
-      : Promise.reject({ status: 409 }));
   render(<KeyRevocation uid="tempo-uid" name="Tempo" />);
   await screen.findByRole('button', { name: 'span.enc.token' });
   await loadPastedKey(user);
   await user.click(screen.getByRole('button', { name: 'span.enc.secret' }));
   await user.click(screen.getByRole('button', { name: 'span.enc.token' }));
+  expect(screen.queryByRole('button', { name: /span\.bi\./ })).not.toBeInTheDocument();
   await user.click(screen.getByRole('button', { name: 'Revoke key…' }));
+  expect(screen.getByRole('dialog')).toHaveTextContent('span.enc.secret');
+  expect(screen.getByRole('dialog')).toHaveTextContent('span.enc.token');
+  expect(screen.getByRole('dialog')).not.toHaveTextContent('span.bi.');
   await user.click(screen.getByRole('checkbox'));
   await user.click(screen.getByRole('button', { name: 'Confirm redaction' }));
   const results = await screen.findByRole('status', { name: 'Revocation submission results' });
-  expect(results).toHaveTextContent('accepted-batch');
-  expect(results).toHaveTextContent('Another redaction batch is active');
-  expect(post).toHaveBeenCalledTimes(2);
+  expect(results).toHaveTextContent('Queued 2 job(s), batch batch-123');
+  expect(post).toHaveBeenCalledTimes(1);
+  expect(post).toHaveBeenCalledWith('/api/datasources/uid/tempo-uid/resources/redaction', {
+    attributeRedactions: [
+      { key: 'span.enc.secret', valuePrefix: `enc:v1:${kid}` },
+      { key: 'span.bi.secret', valuePrefix: `bi:v1:${kid}` },
+      { key: 'span.enc.token', valuePrefix: `enc:v1:${kid}` },
+      { key: 'span.bi.token', valuePrefix: `bi:v1:${kid}` },
+    ],
+  });
   expect(screen.getByRole('button', { name: 'span.enc.secret' })).toHaveAttribute('aria-pressed', 'false');
-  expect(screen.getByRole('button', { name: 'span.enc.token' })).toHaveAttribute('aria-pressed', 'true');
-  await user.click(screen.getByRole('button', { name: 'Revoke key…' }));
-  expect(screen.getByRole('dialog')).toHaveTextContent('span.enc.token');
-  expect(screen.getByRole('dialog')).not.toHaveTextContent('span.enc.secret');
-  expect(post).toHaveBeenCalledTimes(2);
+  expect(screen.getByRole('button', { name: 'span.enc.token' })).toHaveAttribute('aria-pressed', 'false');
 });
 
 it('does not duplicate a pending submission on repeated confirmation clicks', async () => {
@@ -198,9 +241,8 @@ it('does not duplicate a pending submission on repeated confirmation clicks', as
   expect(post).toHaveBeenCalledTimes(1);
 });
 
-it('submits attributes in order, never starting the second while the first is pending', async () => {
-  const first = deferred<{ batchId: string; jobsCreated: number }>();
-  post.mockImplementationOnce(() => first.promise).mockResolvedValueOnce({ batchId: 'second-batch', jobsCreated: 0 });
+it('keeps both selections after an unconfirmed transport failure', async () => {
+  post.mockRejectedValue(new Error('connection lost'));
   const user = userEvent.setup();
   render(<KeyRevocation uid="tempo-uid" name="Tempo" />);
   await screen.findByRole('button', { name: 'span.enc.secret' });
@@ -210,14 +252,17 @@ it('submits attributes in order, never starting the second while the first is pe
   await user.click(screen.getByRole('button', { name: 'Revoke key…' }));
   await user.click(screen.getByRole('checkbox'));
   await user.click(screen.getByRole('button', { name: 'Confirm redaction' }));
+  expect(await screen.findByRole('status', { name: 'Revocation submission results' }))
+    .toHaveTextContent('Submission could not be confirmed');
   expect(post).toHaveBeenCalledTimes(1);
-  expect(post.mock.calls[0][1].attributeRedaction.key).toBe('span.enc.secret');
-  await act(async () => { first.resolve({ batchId: 'first-batch', jobsCreated: 2 }); await first.promise; });
-  await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
-  expect(post.mock.calls[1][1].attributeRedaction.key).toBe('span.enc.token');
+  expect(screen.getByRole('button', { name: 'span.enc.secret' })).toHaveAttribute('aria-pressed', 'true');
+  expect(screen.getByRole('button', { name: 'span.enc.token' })).toHaveAttribute('aria-pressed', 'true');
+  await user.click(screen.getByRole('button', { name: 'Revoke key…' }));
+  expect(screen.getByRole('dialog')).toHaveTextContent('span.enc.secret');
+  expect(screen.getByRole('dialog')).toHaveTextContent('span.enc.token');
 });
 
-it('does not start undispatched attributes after switching datasources during a submission', async () => {
+it('does not display a prior datasource batch after switching UIDs during submission', async () => {
   const first = deferred<{ batchId: string; jobsCreated: number }>();
   post.mockImplementationOnce(() => first.promise);
   const user = userEvent.setup();
@@ -235,6 +280,8 @@ it('does not start undispatched attributes after switching datasources during a 
   await screen.findByText(/Data source: New Tempo/);
   expect(post).toHaveBeenCalledTimes(1);
   expect(screen.queryByText(kid)).not.toBeInTheDocument();
+  expect(screen.queryByText(/old-batch/)).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'span.enc.secret' })).toHaveAttribute('aria-pressed', 'false');
 });
 
 it('does not attach a key from an old datasource after a UID switch during file import', async () => {

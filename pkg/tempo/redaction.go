@@ -27,13 +27,14 @@ import (
 )
 
 const (
-	redactionRPC     = "/tempopb.BackendScheduler/SubmitRedaction"
-	redactionTimeout = 15 * time.Second
-	redactionMaxBody = 512
+	redactionRPC      = "/tempopb.BackendScheduler/SubmitAttributeRedaction"
+	redactionTimeout  = 15 * time.Second
+	redactionMaxBody  = 32 * 1024
+	redactionMaxPairs = 32
 )
 
 var (
-	redactionPrefixPattern = regexp.MustCompile(`^enc:v1:[0-9a-f]{32}$`)
+	redactionPrefixPattern = regexp.MustCompile(`^(enc|bi):v1:([0-9a-f]{32})$`)
 	// A single tenant only: reject multi-tenant separators and metadata control characters.
 	redactionTenantPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 )
@@ -114,10 +115,7 @@ func (ds *DataSource) handleRedaction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		AttributeRedaction *struct {
-			Key         string `json:"key"`
-			ValuePrefix string `json:"valuePrefix"`
-		} `json:"attributeRedaction"`
+		AttributeRedactions []redactionAttribute `json:"attributeRedactions"`
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, redactionMaxBody+1))
 	if err != nil {
@@ -139,15 +137,14 @@ func (ds *DataSource) handleRedaction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid redaction request", http.StatusBadRequest)
 		return
 	}
-	if input.AttributeRedaction == nil || !validRedactionKey(input.AttributeRedaction.Key) ||
-		!redactionPrefixPattern.MatchString(input.AttributeRedaction.ValuePrefix) {
-		http.Error(w, "invalid attribute redaction", http.StatusBadRequest)
+	if !validRedactionPairs(input.AttributeRedactions) {
+		http.Error(w, "invalid attribute redactions", http.StatusBadRequest)
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), redactionTimeout)
 	defer cancel()
-	response, err := ds.redaction.submit(ctx, input.AttributeRedaction.Key, input.AttributeRedaction.ValuePrefix)
+	response, err := ds.redaction.submit(ctx, input.AttributeRedactions)
 	if err != nil {
 		switch {
 		case status.Code(err) == codes.AlreadyExists:
@@ -167,20 +164,32 @@ func (ds *DataSource) handleRedaction(w http.ResponseWriter, r *http.Request) {
 	}{BatchID: response.BatchID, JobsCreated: response.JobsCreated})
 }
 
-func validRedactionKey(key string) bool {
-	scope, raw, ok := strings.Cut(key, ".")
-	if !ok || (scope != "span" && scope != "resource") || !strings.HasPrefix(raw, "enc") {
+func validRedactionPairs(attributes []redactionAttribute) bool {
+	if len(attributes) == 0 || len(attributes) > 2*redactionMaxPairs || len(attributes)%2 != 0 {
 		return false
 	}
-	for _, r := range raw {
-		if unicode.IsControl(r) {
+	seen := make(map[string]struct{}, len(attributes)/2)
+	for i := 0; i < len(attributes); i += 2 {
+		enc, bi := attributes[i], attributes[i+1]
+		scope, name, ok := strings.Cut(enc.Key, ".enc.")
+		if !ok || (scope != "span" && scope != "resource") || name == "" || strings.ContainsFunc(name, unicode.IsControl) ||
+			bi.Key != scope+".bi."+name {
 			return false
 		}
+		encPrefix := redactionPrefixPattern.FindStringSubmatch(enc.ValuePrefix)
+		biPrefix := redactionPrefixPattern.FindStringSubmatch(bi.ValuePrefix)
+		if encPrefix == nil || biPrefix == nil || encPrefix[1] != "enc" || biPrefix[1] != "bi" || encPrefix[2] != biPrefix[2] {
+			return false
+		}
+		if _, duplicate := seen[enc.Key]; duplicate {
+			return false
+		}
+		seen[enc.Key] = struct{}{}
 	}
 	return true
 }
 
-func (bridge *redactionBridge) submit(ctx context.Context, key, prefix string) (*redactionResponse, error) {
+func (bridge *redactionBridge) submit(ctx context.Context, attributes []redactionAttribute) (*redactionResponse, error) {
 	var transport credentials.TransportCredentials = insecure.NewCredentials()
 	if bridge.tlsConfig != nil {
 		transport = credentials.NewTLS(bridge.tlsConfig)
@@ -199,7 +208,10 @@ func (bridge *redactionBridge) submit(ctx context.Context, key, prefix string) (
 		md.Set("authorization", bridge.basicAuth)
 	}
 	ctx = metadata.NewOutgoingContext(ctx, md)
-	request := &redactionRequest{AttributeRedaction: &redactionAttribute{Key: key, ValuePrefix: prefix}}
+	request := &redactionRequest{AttributeRedactions: make([]*redactionAttribute, len(attributes))}
+	for i := range attributes {
+		request.AttributeRedactions[i] = &attributes[i]
+	}
 	response := new(redactionResponse)
 	if err := conn.Invoke(ctx, redactionRPC, request, response); err != nil {
 		return nil, err
@@ -208,12 +220,12 @@ func (bridge *redactionBridge) submit(ctx context.Context, key, prefix string) (
 }
 
 // These minimal gogo wire messages match backendwork.proto in tempo-h. The
-// published Tempo dependency predates SubmitRedaction; keep the binding small
-// instead of importing a local Tempo tree or replacing its whole module.
-// Wire fields: request attribute_redaction=7; attribute key=1,prefix=2;
+// published Tempo dependency predates SubmitAttributeRedaction; keep the binding
+// small instead of replacing its whole module.
+// Wire fields: request attribute_redactions=8; attribute key=1,prefix=2;
 // response batch_id=1,jobs_created=2. All other request fields stay unset.
 type redactionRequest struct {
-	AttributeRedaction *redactionAttribute `protobuf:"bytes,7,opt,name=attribute_redaction,json=attributeRedaction,proto3"`
+	AttributeRedactions []*redactionAttribute `protobuf:"bytes,8,rep,name=attribute_redactions,json=attributeRedactions,proto3"`
 }
 
 type redactionAttribute struct {

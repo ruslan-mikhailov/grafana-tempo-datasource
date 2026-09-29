@@ -68,28 +68,28 @@ Metadata tag-value endpoints are owned by the [query design](./protected-attribu
 
 ## Key revocation from datasource settings
 
-**Connections → Data sources → Tempo → Settings → Additional settings → Protected span attributes → Key revocation** is an immediate administrative operation, not a saved datasource setting. It works on provisioned datasources and does not depend on protected substring search. The provisioning option `protectedAttributesSubstringEnabled` controls indexed protected plaintext TraceQL `@>` / `!@>` queries, not raw ciphertext inspection or scheduler prefix matching.
+**Connections → Data sources → Tempo → Settings → Additional settings → Protected span attributes → Key revocation** is an immediate administrative operation, not a saved datasource setting. It works on provisioned datasources and does not depend on protected substring search.
 
 1. Use a Grafana organization Admin role. An anonymous user configured with that role can submit; Viewer, Editor, unknown roles and missing user context cannot.
-2. Select span or resource attributes from autocomplete. The existing `/resources/tags` handler queries Tempo's `/api/v2/search/tags`; only unscoped names beginning with `enc` are offered. Discovery is not a complete historical inventory.
+2. Select span or resource attributes from autocomplete. The existing `/resources/tags` handler queries Tempo's `/api/v2/search/tags`; only unscoped names beginning with `enc.` are offered. Discovery is not a complete historical inventory. Select up to 32 fields.
 3. Select **Choose local key file** to open the picker directly and load one text file containing a base64-encoded 32-byte key, or select **Paste base64** and load the pasted key. The file input remains mounted when switching methods so the file action also opens the picker directly from paste mode. The browser derives the key ID using the existing crypto importer, clears its cryptographic handle and input, and retains only the ID in the form. It does not add this key to Explore's keyring.
 4. Review the exact datasource, attributes and full key ID. Acknowledge the irreversible rewrite before confirming.
-5. Review each submission result. Accepted batch IDs and queued job counts do **not** report completion. Tempo permits only one active batch per tenant; a later attribute may receive a conflict. Wait for that batch to complete before explicitly resubmitting failed attributes. Accepted attributes are removed from the selection. A transport failure can leave the submission outcome unknown; inspect scheduler state before retrying.
+5. Review the one submission result. The browser submits all selected `enc.*` fields and their same-scope `bi.*` partners in one request; the picker and confirmation show only selected `enc.*` names. An accepted batch ID and queued job count do **not** report completion. On rejection or transport failure, all selected fields remain available for explicit retry; inspect scheduler state first if the submission outcome is unknown. Tempo permits only one active batch per tenant.
 
 The Grafana form submits `REDACTION_MODE_APPLY` through the trusted datasource bridge and the configured `X-Scope-OrgID` tenant; it never sends the key itself. Backend jobs write replacement blocks and mark the old blocks compacted, but a completed batch is not immediate erasure: other queriers need a blocklist poll, live-store may still return recent original traces (local complete blocks are retained for 20 minutes after trace end by default), and the old backend objects are physically deleted only after compacted-block retention (one hour by default). A query-frontend trace-by-ID request mixes live-store and backend even if its URL contains `mode=blocks`; diagnose backend-only reads through a querier directly. Rotate the ingestion key separately.
 
-The bridge accepts one operation per request:
+The bridge accepts one operation containing adjacent `enc.*`/`bi.*` pairs:
 
 ```json
 {
-  "attributeRedaction": {
-    "key": "span.enc.secret",
-    "valuePrefix": "enc:v1:630dcd2966c4336691125448bbb25b4f"
-  }
+  "attributeRedactions": [
+    {"key": "span.enc.secret", "valuePrefix": "enc:v1:630dcd2966c4336691125448bbb25b4f"},
+    {"key": "span.bi.secret", "valuePrefix": "bi:v1:630dcd2966c4336691125448bbb25b4f"}
+  ]
 }
 ```
 
-It calls `tempopb.BackendScheduler/SubmitRedaction` with no time bounds. Each matching string value in processed stored blocks becomes `[REDACTED]`; attribute names, traces and values under other keys remain. This does not revoke copied ciphertext, keys in other browsers, or future/in-flight ingestion. Rotate or disable the ingestion key separately. No automatic request retries are performed.
+It calls `tempopb.BackendScheduler/SubmitAttributeRedaction` with no time bounds. In each matching span or resource of a processed backend block, the complete encrypted scalar value becomes `[REDACTED]` and the paired `bi.*` attribute is removed, including its array of substring tokens. Other fields and traces remain. The tenant-wide batch rewrites each affected block at most once. This does not revoke copied ciphertext, keys in other browsers, or future/in-flight ingestion. Rotate or disable the ingestion key separately. No automatic request retries are performed.
 
 Provision the backend scheduler's **gRPC** address and a trusted tenant:
 
@@ -105,7 +105,7 @@ Use an unused header index if the datasource already has configured headers. A s
 
 The demo provisions `http://backend-scheduler:9095` and tenant `single-tenant`. Both Tempo datasources use `editable: true`: change settings, use **Save & test**, and the saved values survive a page refresh. Provisioning still uses `version: 0`, so restarting Grafana reapplies the configured defaults. Grafana login is enabled and the existing anonymous Admin role can use Explore, edit datasource settings and submit revocations. Anonymous Admin access is not suitable for a public deployment. Rebuild and recreate the demo's `grafana` service to apply plugin changes and provisioning; no new host-code changes require rebuilding `grafana-base`.
 
-Backend resources are `GET /api/datasources/uid/<uid>/resources/redaction/capabilities` and `POST /api/datasources/uid/<uid>/resources/redaction`. Capability discovery is advisory; the POST handler independently checks the trusted Grafana organization Admin role, configured tenant/scheduler, operation shape, attribute scope/prefix, and the exact `enc:v1:<32-lowercase-hex-ID>` value prefix. Authorization does not depend on the user's login string. Browser input cannot select a role, tenant, scheduler, time window, trace query, dry-run mode, or secret key.
+Backend resources are `GET /api/datasources/uid/<uid>/resources/redaction/capabilities` and `POST /api/datasources/uid/<uid>/resources/redaction`. Capability discovery is advisory; the POST handler independently checks the trusted Grafana organization Admin role, configured tenant/scheduler, operation shape, pair count (1–32), matching span/resource field suffixes and key IDs, and exact `enc:v1:<32-lowercase-hex-ID>`/`bi:v1:<same-ID>` prefixes. Authorization does not depend on the user's login string. Browser input cannot select a role, tenant, scheduler, time window, trace query, dry-run mode, or secret key.
 
 ## Security and failure decisions
 
