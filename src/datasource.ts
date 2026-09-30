@@ -54,8 +54,18 @@ import {
   totalsMetric,
   nativeHistogramDurationMetric,
 } from './graphTransform';
-import { importKey, type ProtectedAttributeKey } from './protectedAttributes/crypto';
+import { importKey, persistentKeyFor, restoreKey, type ProtectedAttributeKey } from './protectedAttributes/crypto';
 import { registerProtectedDisplayMode, setProtectedDisplayKey } from './protectedAttributes/display';
+import {
+  announceStoredKeyDeletion,
+  deleteAllStoredKeys,
+  deleteStoredKey,
+  keyStorageAvailable,
+  loadStoredKeys,
+  protectedKeyScope,
+  saveStoredKeys,
+  subscribeStoredKeyChanges,
+} from './protectedAttributes/keyStore';
 import {
   assertProtectedQueryModelSafe,
   assertStaticProtectedFilterDefaultsSafe,
@@ -144,6 +154,9 @@ const preparedTargets = new WeakSet<TempoQuery>();
 // The browser parser accepts a plaintext string RHS, not the compiled backend
 // token-array RHS. Keep the parsed editor query's metrics route across compilation.
 const preparedMetricsTargets = new WeakSet<TempoQuery>();
+const keyStoreFinalizer = typeof FinalizationRegistry === 'undefined'
+  ? undefined
+  : new FinalizationRegistry<() => void>((unsubscribe) => unsubscribe());
 
 function assertHostAdHocFilterSourcesSafe(filters: DataQueryRequest<TempoQuery>['filters']): void {
   for (const filter of filters ?? []) {
@@ -292,17 +305,66 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
   private keyEpoch = 0;
   private importGeneration = 0;
   private readonly keyListeners = new Set<(epoch: number) => void>();
+  private keyStorageScope?: string;
+  private keyStorageReady: Promise<void> = Promise.resolve();
+  private keyStorageState: 'loading' | 'persistent' | 'memory-only' = 'memory-only';
+
+  get protectedKeyStorageState(): 'loading' | 'persistent' | 'memory-only' {
+    return this.keyStorageState;
+  }
+
+  isProtectedKeyScopeCurrent(): boolean {
+    return !this.keyStorageScope || protectedKeyScope(this.uid) === this.keyStorageScope;
+  }
+
+  whenProtectedKeysReady(): Promise<void> {
+    return this.keyStorageReady;
+  }
+
+  private async restoreStoredKeys(scope: string): Promise<void> {
+    const generation = this.importGeneration;
+    const staged: ProtectedAttributeKey[] = [];
+    try {
+      const records = await loadStoredKeys(scope);
+      for (const record of records) {
+        if (record.scope !== scope || record.id !== JSON.stringify([scope, record.kid])) {
+          throw new Error('Invalid protected key record.');
+        }
+        staged.push(await restoreKey(record.kid, record.key));
+      }
+      if (generation !== this.importGeneration || !this.isProtectedKeyScopeCurrent()) {
+        this.keyStorageState = this.isProtectedKeyScopeCurrent() ? 'persistent' : 'memory-only';
+        this.notifyProtectedKeyChange();
+        return;
+      }
+      for (const key of staged) {
+        this.importedProtectedKeys.set(key.kid, key);
+        setProtectedDisplayKey(this, key.kid, key);
+      }
+      this.importedProtectedKey = staged[staged.length - 1];
+      staged.length = 0;
+      this.keyStorageState = 'persistent';
+      this.notifyProtectedKeyChange();
+    } catch {
+      this.keyStorageState = 'memory-only';
+      this.notifyProtectedKeyChange();
+    } finally {
+      for (const key of staged) {
+        key.clear();
+      }
+    }
+  }
 
   get protectedKey(): ProtectedAttributeKey | undefined {
-    return this.importedProtectedKey;
+    return this.isProtectedKeyScopeCurrent() ? this.importedProtectedKey : undefined;
   }
 
   get protectedKeys(): readonly ProtectedAttributeKey[] {
-    return [...this.importedProtectedKeys.values()];
+    return this.isProtectedKeyScopeCurrent() ? [...this.importedProtectedKeys.values()] : [];
   }
 
   getProtectedKey(kid: string): ProtectedAttributeKey | undefined {
-    return this.importedProtectedKeys.get(kid);
+    return this.isProtectedKeyScopeCurrent() ? this.importedProtectedKeys.get(kid) : undefined;
   }
 
   get protectedKeyEpoch(): number {
@@ -326,10 +388,14 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     if (base64Keys.length === 0) {
       throw new Error('Protected key batch is empty.');
     }
+    if (!this.isProtectedKeyScopeCurrent()) {
+      throw new Error('Grafana identity changed. Reload the datasource before importing keys.');
+    }
     const generation = ++this.importGeneration;
     const staged = new Map<string, ProtectedAttributeKey>();
     const kids: string[] = [];
     try {
+      await this.keyStorageReady;
       for (const base64 of base64Keys) {
         const key = await importKey(base64);
         kids.push(key.kid);
@@ -340,10 +406,16 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
       if (
         signal?.aborted ||
         generation !== this.importGeneration ||
+        !this.isProtectedKeyScopeCurrent() ||
         !this.instanceSettings.jsonData.protectedAttributesEnabled
       ) {
         throw new Error('Protected key import was superseded.');
       }
+      const storageKeys = [...staged].map(([kid, handle]) => ({ kid, key: persistentKeyFor(handle)! }));
+      const storageScope = this.keyStorageScope;
+      const save = storageScope && keyStorageAvailable()
+        ? saveStoredKeys(storageScope, storageKeys)
+        : undefined;
       for (const [kid, key] of staged) {
         const previous = this.importedProtectedKeys.get(kid);
         this.importedProtectedKeys.delete(kid);
@@ -352,7 +424,32 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
         previous?.clear();
       }
       this.importedProtectedKey = staged.get(kids[kids.length - 1]);
+      staged.clear();
       this.notifyProtectedKeyChange();
+      if (save) {
+        const previousState = this.keyStorageState;
+        let superseded = false;
+        try {
+          await save;
+          if (this.importGeneration !== generation && storageScope) {
+            for (const { kid } of storageKeys) {
+              if (!this.importedProtectedKeys.has(kid)) {
+                superseded = true;
+                await deleteStoredKey(storageScope, kid);
+              }
+            }
+          }
+          this.keyStorageState = 'persistent';
+        } catch {
+          this.keyStorageState = 'memory-only';
+        }
+        if (this.keyStorageState !== previousState) {
+          this.notifyProtectedKeyChange();
+        }
+        if (superseded) {
+          throw new Error('Protected key import was superseded.');
+        }
+      }
       return kids;
     } catch (error) {
       for (const key of staged.values()) {
@@ -362,8 +459,7 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     }
   }
 
-  clearProtectedKey(kid = this.importedProtectedKey?.kid): void {
-    this.importGeneration++;
+  private clearProtectedKeyInMemory(kid: string | undefined): void {
     if (kid) {
       const current = this.importedProtectedKeys.get(kid);
       if (current) {
@@ -381,8 +477,24 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     this.notifyProtectedKeyChange();
   }
 
-  clearAllProtectedKeys(): void {
+  clearProtectedKey(kid = this.importedProtectedKey?.kid): Promise<boolean> {
     this.importGeneration++;
+    const scope = this.keyStorageScope;
+    if (scope && keyStorageAvailable() && kid) {
+      return deleteStoredKey(scope, kid).then(() => {
+        this.clearProtectedKeyInMemory(kid);
+        announceStoredKeyDeletion({ scope, kid });
+        return true;
+      }, () => {
+        this.clearProtectedKeyInMemory(kid);
+        return false;
+      });
+    }
+    this.clearProtectedKeyInMemory(kid);
+    return Promise.resolve(true);
+  }
+
+  private clearAllProtectedKeysInMemory(): void {
     for (const [kid, key] of this.importedProtectedKeys) {
       setProtectedDisplayKey(this, kid);
       key.clear();
@@ -390,6 +502,23 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     this.importedProtectedKeys.clear();
     this.importedProtectedKey = undefined;
     this.notifyProtectedKeyChange();
+  }
+
+  clearAllProtectedKeys(): Promise<boolean> {
+    this.importGeneration++;
+    const scope = this.keyStorageScope;
+    if (scope && keyStorageAvailable()) {
+      return deleteAllStoredKeys(scope).then(() => {
+        this.clearAllProtectedKeysInMemory();
+        announceStoredKeyDeletion({ scope });
+        return true;
+      }, () => {
+        this.clearAllProtectedKeysInMemory();
+        return false;
+      });
+    }
+    this.clearAllProtectedKeysInMemory();
+    return Promise.resolve(true);
   }
 
   private notifyProtectedKeyChange(): void {
@@ -412,6 +541,46 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
     }
     if (instanceSettings.jsonData.protectedAttributesEnabled) {
       registerProtectedDisplayMode();
+      this.keyStorageScope = protectedKeyScope(this.uid);
+      if (this.keyStorageScope && keyStorageAvailable()) {
+        this.keyStorageState = 'loading';
+        const scope = this.keyStorageScope;
+        if (typeof WeakRef !== 'undefined') {
+          const owner = new WeakRef(this);
+          let unsubscribe: (() => void) | undefined;
+          unsubscribe = subscribeStoredKeyChanges((change) => {
+            const datasource = owner.deref();
+            if (!datasource) {
+              unsubscribe?.();
+              return;
+            }
+            if (change.scope !== scope) {
+              return;
+            }
+            datasource.importGeneration++;
+            if (change.kid) {
+              const key = datasource.importedProtectedKeys.get(change.kid);
+              if (key) {
+                datasource.importedProtectedKeys.delete(change.kid);
+                setProtectedDisplayKey(datasource, change.kid);
+                key.clear();
+                datasource.importedProtectedKey = [...datasource.importedProtectedKeys.values()].at(-1);
+                datasource.notifyProtectedKeyChange();
+              }
+            } else if (datasource.importedProtectedKeys.size) {
+              for (const [kid, key] of datasource.importedProtectedKeys) {
+                setProtectedDisplayKey(datasource, kid);
+                key.clear();
+              }
+              datasource.importedProtectedKeys.clear();
+              datasource.importedProtectedKey = undefined;
+              datasource.notifyProtectedKeyChange();
+            }
+          });
+          keyStoreFinalizer?.register(this, unsubscribe);
+        }
+        this.keyStorageReady = this.restoreStoredKeys(scope);
+      }
     }
 
     this.tracesToLogs = instanceSettings.jsonData.tracesToLogs;
@@ -678,6 +847,9 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
 
   private async prepareTargets(options: DataQueryRequest<TempoQuery>): Promise<DataQueryRequest<TempoQuery>> {
     const protectedEnabled = !!this.instanceSettings.jsonData.protectedAttributesEnabled;
+    if (protectedEnabled) {
+      await this.keyStorageReady;
+    }
     const originalTargets = options.targets.filter((target) => !target.hide);
     const keys = this.protectedKeys;
     const keyEpoch = this.keyEpoch;
@@ -1343,6 +1515,9 @@ export class TempoDatasource extends DataSourceWithBackend<TempoQuery, TempoJson
 
   async metadataRequest(url: string, params: Record<string, unknown> = {}) {
     const protectedConfigured = !!this.instanceSettings.jsonData.protectedAttributesEnabled;
+    if (protectedConfigured) {
+      await this.keyStorageReady;
+    }
     const epoch = this.keyEpoch;
     try {
       if (url.startsWith('/') || (protectedConfigured && url.includes('?'))) {

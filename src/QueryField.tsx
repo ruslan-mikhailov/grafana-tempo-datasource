@@ -41,6 +41,7 @@ interface State {
   keyFiles?: File[];
   keyInputCount: number;
   keyBusy: boolean;
+  keyForgetBusy: boolean;
   keyError?: string;
   queryError?: string;
   keyEpoch: number;
@@ -78,6 +79,7 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
     this.state = {
       uploadModalOpen: false,
       keyBusy: false,
+      keyForgetBusy: false,
       importMethod: 'paste',
       keyInputCount: 1,
       keyEpoch: props.datasource.protectedKeyEpoch,
@@ -139,6 +141,7 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
       keyInputCount: 1,
       keyFiles: undefined,
       keyBusy: false,
+      keyForgetBusy: false,
       keyError: undefined,
       queryError: undefined,
     });
@@ -209,6 +212,15 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
   };
 
   private onSafeRunQuery = (target: TempoQuery = this.props.query) => {
+    if (this.props.datasource.protectedKeyStorageState === 'loading') {
+      const datasource = this.props.datasource;
+      void datasource.whenProtectedKeysReady().then(() => {
+        if (this._isMounted && this.props.datasource === datasource) {
+          this.onSafeRunQuery(target);
+        }
+      });
+      return;
+    }
     if (this.sealPending) {
       this.setState({ queryError: 'Complete or correct the query before running it.' });
       return;
@@ -299,6 +311,23 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
       keyBusy: false,
       keyError: undefined,
     });
+  };
+
+  private forgetKey = async (kid?: string) => {
+    if (this.state.keyForgetBusy) {
+      return;
+    }
+    const datasource = this.props.datasource;
+    this.setState({ keyForgetBusy: true, keyError: undefined });
+    const forgotten = kid
+      ? await datasource.clearProtectedKey(kid)
+      : await datasource.clearAllProtectedKeys();
+    if (this._isMounted && this.props.datasource === datasource) {
+      this.setState({
+        keyForgetBusy: false,
+        keyError: forgotten ? undefined : 'The key was cleared from this page, but its saved browser copy may return after refresh. Retry removal or clear this site’s browser data.',
+      });
+    }
   };
 
   private importKey = async () => {
@@ -526,6 +555,12 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
       !protectedMode &&
       config.featureToggles.queryWithAssistant &&
       (app === CoreApp.Explore || app === CoreApp.Dashboard || app === CoreApp.PanelEditor);
+    const storageState = datasource.protectedKeyStorageState;
+    const storageDescription = storageState === 'persistent'
+      ? 'Keys are saved in this browser profile and restored after navigation or refresh. Logging out does not erase them; someone with access to this browser profile can use them. Forget removes the saved copy.'
+      : storageState === 'loading'
+        ? 'Restoring keys saved in this browser profile.'
+        : 'Browser storage is unavailable. Keys remain in memory for this page and are cleared on refresh.';
     return (
       <>
         <Modal
@@ -612,7 +647,7 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
             <Modal title={this.state.requestedKid ? 'Load matching key' : 'Load keys'} isOpen={this.state.keyView === 'import'} onDismiss={this.closeKeyModal}>
               <div className={css({ display: 'grid', gap: this.props.theme.spacing(2), padding: this.props.theme.spacing(2) })}>
                 {this.state.requestedKid && <div>Required key ID: <code>{this.state.requestedKid}</code></div>}
-                <div><strong>Only in this browser session</strong><span> · Keys stay in browser memory and are not sent to Grafana, Tempo, or Loki. Reloading clears this session’s keys.</span></div>
+                <div><strong>Browser keys</strong><span> · {storageDescription} Keys are not sent to Grafana, Tempo, or Loki.</span></div>
                 <RadioButtonGroup<'paste' | 'file'>
                   options={[{ label: 'Paste keys', value: 'paste' }, { label: 'Import files', value: 'file' }]}
                   value={this.state.importMethod}
@@ -690,24 +725,29 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
                 </Stack>
               </div>
             </Modal>
-            <Modal title="Session keys" isOpen={this.state.keyView === 'manager'} onDismiss={this.closeKeyModal}>
+            <Modal title="Browser keys" isOpen={this.state.keyView === 'manager'} onDismiss={() => {
+              if (!this.state.keyForgetBusy) {
+                this.closeKeyModal();
+              }
+            }}>
               <div className={css({ display: 'grid', gap: this.props.theme.spacing(2), padding: this.props.theme.spacing(2) })}>
-                <div><strong>Only in this browser session</strong><span> · Keys stay in browser memory and are not sent to Grafana, Tempo, or Loki. Reloading clears this session’s keys.</span></div>
-                {keys.length === 0 && <span>No keys loaded. Public data is still available.</span>}
+                <div><strong>Browser keys</strong><span> · {storageDescription} Keys are not sent to Grafana, Tempo, or Loki.</span></div>
+                {keys.length === 0 && <span>{storageState === 'loading' ? 'Restoring saved keys…' : 'No keys loaded. Public data is still available.'}</span>}
                 {keys.map((key) => (
                   <div key={key.kid} className={css({ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: this.props.theme.spacing(1) })}>
                     <div>
                       {this.keyAliases.get(key.kid) && <strong>{this.keyAliases.get(key.kid)} · </strong>}
                       <code>{key.kid}</code>
                     </div>
-                    <Button variant="secondary" size="sm" aria-label={`Forget key ${key.kid}`} onClick={() => datasource.clearProtectedKey(key.kid)}>Forget</Button>
+                    <Button variant="secondary" size="sm" aria-label={`Forget key ${key.kid}`} disabled={this.state.keyForgetBusy} onClick={() => void this.forgetKey(key.kid)}>Forget</Button>
                   </div>
                 ))}
                 <Stack gap={1} justifyContent="flex-end">
-                  {keyLoaded && <Button variant="secondary" onClick={() => datasource.clearAllProtectedKeys()}>Forget all</Button>}
-                  <Button variant="secondary" onClick={this.closeKeyModal}>Close</Button>
-                  <Button onClick={() => this.setState({ keyView: 'import', requestedKid: undefined, keyError: undefined })}>Add keys</Button>
+                  {(keyLoaded || this.state.keyError) && <Button variant="secondary" disabled={this.state.keyForgetBusy} onClick={() => void this.forgetKey()}>Forget all</Button>}
+                  <Button variant="secondary" disabled={this.state.keyForgetBusy} onClick={this.closeKeyModal}>Close</Button>
+                  <Button disabled={this.state.keyForgetBusy} onClick={() => this.setState({ keyView: 'import', requestedKid: undefined, keyError: undefined })}>Add keys</Button>
                 </Stack>
+                {this.state.keyError && <div role="alert">{this.state.keyError}</div>}
               </div>
             </Modal>
           </>

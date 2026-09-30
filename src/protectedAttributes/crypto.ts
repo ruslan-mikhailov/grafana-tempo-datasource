@@ -307,27 +307,22 @@ class ImportedKey implements ProtectedAttributeKey {
     this.attributeKey.fill(0);
     this.modelKey = undefined;
     this.substringKey = undefined;
+    persistentKeys.delete(this);
   }
 }
 
-export async function importKey(base64: string): Promise<ProtectedAttributeKey> {
-  if (typeof base64 !== 'string') {
-    throw error('invalid-key');
-  }
-  const crypto = webCrypto();
-  const master = decodeBase64(base64.trim(), false, 'invalid-key');
-  if (master.length !== 32) {
-    master.fill(0);
-    throw error('invalid-key');
-  }
+const persistentKeys = new WeakMap<ProtectedAttributeKey, CryptoKey>();
+
+export function persistentKeyFor(key: ProtectedAttributeKey): CryptoKey | undefined {
+  return persistentKeys.get(key);
+}
+
+async function deriveImportedKey(kid: string, hkdfKey: CryptoKey): Promise<ProtectedAttributeKey> {
   let attributeKey: Uint8Array | undefined;
   let modelBytes: Uint8Array<ArrayBuffer> | undefined;
   let substringBytes: Uint8Array<ArrayBuffer> | undefined;
   try {
-    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', master));
-    const kid = Array.from(digest.subarray(0, 16), (byte) => byte.toString(16).padStart(2, '0')).join('');
-    digest.fill(0);
-    const hkdfKey = await crypto.subtle.importKey('raw', master, 'HKDF', false, ['deriveBits']);
+    const crypto = webCrypto();
     attributeKey = new Uint8Array(await crypto.subtle.deriveBits(
       { name: 'HKDF', hash: 'SHA-256', salt: attributeSalt, info: attributeInfo }, hkdfKey, 512
     ));
@@ -340,14 +335,45 @@ export async function importKey(base64: string): Promise<ProtectedAttributeKey> 
     const substringKey = await crypto.subtle.importKey('raw', substringBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
     const modelKey = await crypto.subtle.importKey('raw', modelBytes, 'AES-GCM', false, ['encrypt', 'decrypt']);
     const handle = new ImportedKey(kid, attributeKey, modelKey, substringKey);
+    persistentKeys.set(handle, hkdfKey);
     attributeKey = undefined;
     return handle;
   } catch {
     throw error('invalid-key');
   } finally {
-    master.fill(0);
     attributeKey?.fill(0);
     modelBytes?.fill(0);
     substringBytes?.fill(0);
+  }
+}
+
+export async function restoreKey(kid: string, hkdfKey: CryptoKey): Promise<ProtectedAttributeKey> {
+  if (!/^[0-9a-f]{32}$/.test(kid) || hkdfKey?.type !== 'secret' ||
+    hkdfKey.algorithm.name !== 'HKDF' || hkdfKey.extractable || !hkdfKey.usages.includes('deriveBits')) {
+    throw error('invalid-key');
+  }
+  return deriveImportedKey(kid, hkdfKey);
+}
+
+export async function importKey(base64: string): Promise<ProtectedAttributeKey> {
+  if (typeof base64 !== 'string') {
+    throw error('invalid-key');
+  }
+  const crypto = webCrypto();
+  const master = decodeBase64(base64.trim(), false, 'invalid-key');
+  if (master.length !== 32) {
+    master.fill(0);
+    throw error('invalid-key');
+  }
+  try {
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', master));
+    const kid = Array.from(digest.subarray(0, 16), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    digest.fill(0);
+    const hkdfKey = await crypto.subtle.importKey('raw', master, 'HKDF', false, ['deriveBits']);
+    return await deriveImportedKey(kid, hkdfKey);
+  } catch {
+    throw error('invalid-key');
+  } finally {
+    master.fill(0);
   }
 }

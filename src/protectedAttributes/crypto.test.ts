@@ -1,5 +1,5 @@
 import { webcrypto } from 'node:crypto';
-import { importKey, ProtectedAttributeCryptoError } from './crypto';
+import { importKey, persistentKeyFor, restoreKey, ProtectedAttributeCryptoError } from './crypto';
 
 const master = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
 const kid = '630dcd2966c4336691125448bbb25b4f';
@@ -35,6 +35,25 @@ test('AES-256-SIV matches the four independently frozen stored-field vectors', a
     expect(key.decrypt(field, envelope)).toBe(plaintext);
   }
   expect(key.encrypt('enc.password', 'abc')).toBe(vectors[0][2]);
+});
+
+test('a non-extractable saved derivation key restores all protected operations', async () => {
+  const imported = await importKey(master);
+  const saved = persistentKeyFor(imported)!;
+  expect(saved.extractable).toBe(false);
+  await expect(globalThis.crypto.subtle.exportKey('raw', saved)).rejects.toThrow();
+  const sealed = await imported.sealQueryModel('secret', queryContext);
+  imported.clear();
+  expect(persistentKeyFor(imported)).toBeUndefined();
+
+  const restored = await restoreKey(kid, saved);
+  expect(restored.decrypt('enc.password', vectors[0][2])).toBe('abc');
+  expect(await restored.openQueryModel(sealed, queryContext)).toBe('secret');
+  expect(await restored.substringTokens('enc.secret', 'cool')).toEqual([
+    `bi:v1:${kid}:E_S8rZC-kHLrifr_71XBBSP7w8jOWNCm2j6LHigypgM`,
+    `bi:v1:${kid}:zQb64aCXnVL2KksfrDxrQwVtdw6Ljmwxv37So9E7ghc`,
+  ]);
+  restored.clear();
 });
 
 test('authenticated UTF-8 preserves an initial byte-order mark in both domains', async () => {

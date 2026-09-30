@@ -12,8 +12,13 @@ interface DisplayRegistry {
 }
 
 let protectedModeRegistered = false;
-const importedKeys = new Map<string, { owner: object; key: ProtectedAttributeKey }>();
+type KeyReference<T extends object> = { deref(): T | undefined };
+const importedKeys = new Map<string, { owner: KeyReference<object>; key: KeyReference<ProtectedAttributeKey> }>();
 const keyRequestHandlers: Array<(kid: string) => boolean> = [];
+
+function weakReference<T extends object>(value: T): KeyReference<T> {
+  return typeof WeakRef === 'undefined' ? { deref: () => value } : new WeakRef(value);
+}
 
 function requestKey(kid: string): boolean {
   if (!/^[0-9a-f]{32}$/.test(kid)) {
@@ -55,8 +60,11 @@ function resolve(storedField: string, envelope: string): string | undefined {
   ) {
     return '[encrypted: invalid data]';
   }
-  const key = importedKeys.get(kid)?.key;
+  const entry = importedKeys.get(kid);
+  const owner = entry?.owner.deref() as { isProtectedKeyScopeCurrent?: () => boolean } | undefined;
+  const key = owner && owner.isProtectedKeyScopeCurrent?.() !== false ? entry?.key.deref() : undefined;
   if (!key) {
+    importedKeys.delete(kid);
     return '[encrypted: key unavailable]';
   }
   try {
@@ -111,9 +119,9 @@ export function setProtectedDisplayKey(owner: object, kid: string | undefined, k
   }
   registerProtectedDisplayMode();
   if (key) {
-    importedKeys.set(kid, { owner, key });
+    importedKeys.set(kid, { owner: weakReference(owner), key: weakReference(key) });
     changed();
-  } else if (importedKeys.get(kid)?.owner === owner) {
+  } else if (importedKeys.get(kid)?.owner.deref() === owner) {
     importedKeys.delete(kid);
     changed();
   }

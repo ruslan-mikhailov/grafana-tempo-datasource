@@ -402,8 +402,8 @@ describe('QueryField', () => {
     await user.click(screen.getByRole('button', { name: 'Load keys' }));
     const importDialog = screen.getByRole('dialog', { name: 'Load keys' });
     expect(importDialog).not.toHaveTextContent('Required key ID');
-    expect(importDialog).toHaveTextContent('Only in this browser session');
-    expect(importDialog).toHaveTextContent('Keys stay in browser memory and are not sent to Grafana, Tempo, or Loki. Reloading clears this session’s keys.');
+    expect(importDialog).toHaveTextContent('Browser keys');
+    expect(importDialog).toHaveTextContent('Browser storage is unavailable. Keys remain in memory for this page and are cleared on refresh.');
     await user.type(screen.getByLabelText('Paste base64 key'), master);
     await user.click(within(importDialog).getByRole('button', { name: 'Add keys' }));
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('1 key loaded'));
@@ -736,7 +736,7 @@ describe('QueryField', () => {
     expect(importSpy).not.toHaveBeenCalled();
     expect(datasource.protectedKey).toBeUndefined();
     expect(within(pendingEditor.container).queryByRole('dialog')).not.toBeInTheDocument();
-    expect(within(forgetter.container).getByRole('dialog', { name: 'Session keys' })).toBeInTheDocument();
+    expect(within(forgetter.container).getByRole('dialog', { name: 'Browser keys' })).toBeInTheDocument();
     expect(within(forgetter.container).queryByRole('dialog', { name: 'Load keys' })).not.toBeInTheDocument();
   });
   it('discards a pending file read when the mounted editor changes datasource', async () => {
