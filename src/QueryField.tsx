@@ -25,6 +25,7 @@ import { type TempoDatasource } from './datasource';
 import { importKey } from './protectedAttributes/crypto';
 import { registerProtectedKeyRequest } from './protectedAttributes/display';
 import { assertProtectedQueryModelSafe } from './protectedAttributes/model';
+import { loadPasskeyMaster } from './protectedAttributes/passkey';
 import { QueryEditor } from './traceql/QueryEditor';
 import { type TempoQuery } from './types';
 import { migrateFromSearchToTraceQLSearch } from './utils';
@@ -37,7 +38,7 @@ interface State {
   uploadModalOpen: boolean;
   keyView?: 'import' | 'manager';
   requestedKid?: string;
-  importMethod: 'paste' | 'file';
+  importMethod: 'paste' | 'file' | 'passkey';
   keyFiles?: File[];
   keyInputCount: number;
   keyBusy: boolean;
@@ -334,12 +335,13 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
     if (this.state.keyBusy) {
       return;
     }
+    const passkey = this.state.importMethod === 'passkey';
     const files = this.state.importMethod === 'file' ? this.state.keyFiles : undefined;
-    const entries = this.keyTextInputs.map((input, index) => ({
+    const entries = passkey ? [] : this.keyTextInputs.map((input, index) => ({
       value: input?.value.trim() ?? '',
       alias: this.keyAliasInputs[index]?.value.trim() ?? '',
     })).filter((entry) => entry.value);
-    if (!files?.length && entries.length === 0) {
+    if (!passkey && !files?.length && entries.length === 0) {
       this.setState({ keyError: 'Paste a base64 key or choose a local key file.' });
       return;
     }
@@ -353,15 +355,17 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
       if (files?.some((file) => file.size > 64 * 1024)) {
         throw new Error('Key file exceeds the maximum size.');
       }
-      const base64Keys = files?.length
-        ? (await Promise.all(files.map((file) => file.text()))).flatMap((content) => {
-            const lines = content
-              .split(/\r\n|\r|\n/)
-              .map((line) => line.trim())
-              .filter(Boolean);
-            return lines.length ? lines : [''];
-          })
-        : entries.map((entry) => entry.value);
+      const base64Keys = passkey
+        ? [await loadPasskeyMaster(controller.signal)]
+        : files?.length
+          ? (await Promise.all(files.map((file) => file.text()))).flatMap((content) => {
+              const lines = content
+                .split(/\r\n|\r|\n/)
+                .map((line) => line.trim())
+                .filter(Boolean);
+              return lines.length ? lines : [''];
+            })
+          : entries.map((entry) => entry.value);
       if (this.state.requestedKid) {
         const requestedKid = this.state.requestedKid;
         let foundMatch = false;
@@ -413,11 +417,21 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
         this.keyImportSequence === sequence
       ) {
         this.setState({
-          keyError: error instanceof Error && error.message === 'Key file exceeds the maximum size.'
-            ? 'A key file exceeds 64 KB'
-            : error instanceof Error && error.message === 'Key does not match the required ID.'
-              ? 'Key does not match the required ID. No keys were loaded.'
-              : 'Unable to import keys. Check that every key contains 32 valid base64-encoded bytes.',
+          keyError: passkey
+            ? error instanceof Error && error.message === 'Key does not match the required ID.'
+              ? 'Key does not match the required ID. No keys were loaded. A passkey cannot recover an unrelated random key.'
+              : error instanceof Error && (error.name === 'NotAllowedError' || error.name === 'AbortError')
+                ? 'Passkey prompt cancelled or unavailable. No key was loaded.'
+                : error instanceof Error && error.message.startsWith('This passkey returned no WebAuthn PRF output.')
+                  ? error.message
+                  : error instanceof Error && error.message.startsWith('WebAuthn and Web Crypto require')
+                    ? error.message
+                    : 'Unable to load the passkey-derived key.'
+            : error instanceof Error && error.message === 'Key file exceeds the maximum size.'
+              ? 'A key file exceeds 64 KB'
+              : error instanceof Error && error.message === 'Key does not match the required ID.'
+                ? 'Key does not match the required ID. No keys were loaded.'
+                : 'Unable to import keys. Check that every key contains 32 valid base64-encoded bytes.',
         });
       }
     } finally {
@@ -648,10 +662,13 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
               <div className={css({ display: 'grid', gap: this.props.theme.spacing(2), padding: this.props.theme.spacing(2) })}>
                 {this.state.requestedKid && <div>Required key ID: <code>{this.state.requestedKid}</code></div>}
                 <div><strong>Browser keys</strong><span> · {storageDescription} Keys are not sent to Grafana, Tempo, or Loki.</span></div>
-                <RadioButtonGroup<'paste' | 'file'>
-                  options={[{ label: 'Paste keys', value: 'paste' }, { label: 'Import files', value: 'file' }]}
+                <RadioButtonGroup<'paste' | 'file' | 'passkey'>
+                  options={[{ label: 'Paste keys', value: 'paste' }, { label: 'Import files', value: 'file' }, { label: 'Load from passkey', value: 'passkey' }]}
                   value={this.state.importMethod}
                   onChange={(importMethod) => {
+                    if (this.state.keyBusy) {
+                      return;
+                    }
                     this.clearKeyInputs();
                     if (this.keyFileInput.current) {
                       this.keyFileInput.current.value = '';
@@ -693,7 +710,7 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
                     ))}
                     <Button variant="secondary" size="sm" disabled={this.state.keyBusy} onClick={() => this.setState({ keyInputCount: this.state.keyInputCount + 1, keyError: undefined })}>Add another key</Button>
                   </>
-                ) : (
+                ) : this.state.importMethod === 'file' ? (
                   <>
                     <span>Each file may contain newline-separated keys.</span>
                     <div className={css({ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: this.props.theme.spacing(1) })}>
@@ -717,11 +734,13 @@ class TempoQueryFieldComponent extends PureComponent<Props, State> {
                       }}
                     />
                   </>
+                ) : (
+                  <span>Select a discoverable PRF-capable passkey created on this same RP hostname ({window.location.hostname}). Only keys originally derived from a passkey can be recovered this way; a random key cannot. The derived key stays in this browser.</span>
                 )}
                 {this.state.keyError && <div role="alert">{this.state.keyError}</div>}
                 <Stack gap={1} justifyContent="flex-end">
                   <Button variant="secondary" onClick={this.closeKeyModal}>Cancel</Button>
-                  <Button disabled={this.state.keyBusy} onClick={() => void this.importKey()}>Add keys</Button>
+                  <Button disabled={this.state.keyBusy} onClick={() => void this.importKey()}>{this.state.importMethod === 'passkey' ? 'Load key' : 'Add keys'}</Button>
                 </Stack>
               </div>
             </Modal>

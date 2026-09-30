@@ -42,6 +42,25 @@ function keyId(bytes: Uint8Array): string {
   return Array.from(bytes.subarray(0, 16), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
+const encoder = new TextEncoder();
+const prfInput = encoder.encode('tempo-protected-attributes:master:v1');
+const hkdfSalt = encoder.encode('tempo-passkey-master-v1');
+const hkdfInfo = encoder.encode('aes256siv-hkdf-v1');
+
+function requirePasskeyBrowser() {
+  if (!window.isSecureContext || !window.PublicKeyCredential || !navigator.credentials?.create ||
+      !navigator.credentials?.get || !globalThis.crypto?.subtle) {
+    throw new Error('Passkeys and Web Crypto require a supported browser on localhost or HTTPS.');
+  }
+}
+
+function passkeyError(error: unknown): string {
+  if (error instanceof DOMException && error.name === 'NotAllowedError') {
+    return 'Passkey prompt cancelled or unavailable. No key was derived.';
+  }
+  return error instanceof Error ? error.message : 'Passkey operation failed.';
+}
+
 export function OnboardingPage() {
   const styles = useStyles2(getStyles);
   const [destination, setDestination] = useState<Destination>('tempo');
@@ -53,6 +72,7 @@ export function OnboardingPage() {
   const [copyFeedback, setCopyFeedback] = useState<Feedback>();
   const master = useRef<Uint8Array<ArrayBuffer> | null>(null);
   const pending = useRef<Uint8Array<ArrayBuffer> | null>(null);
+  const pendingCredential = useRef<Uint8Array<ArrayBuffer> | null>(null);
   const generation = useRef(0);
   const busy = useRef(false);
   const downloadInitiated = useRef(false);
@@ -67,6 +87,8 @@ export function OnboardingPage() {
       generation.current++;
       pending.current?.fill(0);
       pending.current = null;
+      pendingCredential.current?.fill(0);
+      pendingCredential.current = null;
       master.current?.fill(0);
       master.current = null;
       for (const timer of timers.current) {
@@ -119,6 +141,8 @@ export function OnboardingPage() {
       master.current = bytes;
       bytes = null;
       pending.current = null;
+      pendingCredential.current?.fill(0);
+      pendingCredential.current = null;
       downloadInitiated.current = false;
       setDownloaded(false);
       setCurrentId(id);
@@ -128,6 +152,104 @@ export function OnboardingPage() {
         setKeyFeedback({ message: 'Could not generate a key. Use a secure browser context and try again.', error: true });
       }
     } finally {
+      digest?.fill(0);
+      bytes?.fill(0);
+      if (run === generation.current) {
+        pending.current = null;
+        busy.current = false;
+        setGenerating(false);
+      }
+    }
+  };
+
+  const createPasskeyKey = async () => {
+    if (busy.current || (master.current && !downloadInitiated.current)) {
+      return;
+    }
+    busy.current = true;
+    setGenerating(true);
+    const run = generation.current;
+    let bytes: Uint8Array<ArrayBuffer> | null = null;
+    let output: Uint8Array<ArrayBuffer> | null = null;
+    let digest: Uint8Array<ArrayBuffer> | null = null;
+    try {
+      requirePasskeyBrowser();
+      if (!pendingCredential.current) {
+        setKeyFeedback({ message: 'Create a discoverable passkey with PRF support. Choose your YubiKey if you need to use it on another computer.' });
+        const credential = await navigator.credentials.create({ publicKey: {
+          challenge: globalThis.crypto.getRandomValues(new Uint8Array(32)),
+          rp: { name: 'Protected data' },
+          user: {
+            id: globalThis.crypto.getRandomValues(new Uint8Array(32)),
+            name: `protected-${Array.from(globalThis.crypto.getRandomValues(new Uint8Array(8)), (byte) => byte.toString(16).padStart(2, '0')).join('')}`,
+            displayName: 'Protected data key',
+          },
+          pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+          authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
+          extensions: { prf: {} },
+          timeout: 120000,
+        } }) as PublicKeyCredential | null;
+        if (run !== generation.current) {
+          return;
+        }
+        if (!credential || credential.getClientExtensionResults().prf?.enabled !== true) {
+          throw new Error('The new passkey did not report PRF support. It cannot derive this key; a credential may remain in your provider.');
+        }
+        pendingCredential.current = new Uint8Array(credential.rawId);
+      }
+      setKeyFeedback({ message: 'Authenticate with the newly created passkey to derive its 32-byte key.' });
+      const selectedId = pendingCredential.current;
+      if (!selectedId) {
+        throw new Error('The newly created credential is unavailable.');
+      }
+      const assertion = await navigator.credentials.get({ publicKey: {
+        challenge: globalThis.crypto.getRandomValues(new Uint8Array(32)),
+        userVerification: 'required',
+        allowCredentials: [{ type: 'public-key', id: selectedId }],
+        extensions: { prf: { eval: { first: prfInput } } },
+        timeout: 120000,
+      } }) as PublicKeyCredential | null;
+      if (run !== generation.current) {
+        return;
+      }
+      if (!assertion ||
+          assertion.rawId.byteLength !== selectedId.byteLength ||
+          !new Uint8Array(assertion.rawId).every((byte, index) => byte === selectedId[index])) {
+        throw new Error('The selected passkey does not match the newly created credential.');
+      }
+      const result = assertion.getClientExtensionResults().prf?.results?.first;
+      if (!(result instanceof ArrayBuffer) || result.byteLength !== 32) {
+        throw new Error('This passkey returned no WebAuthn PRF output. Choose a PRF-capable passkey and browser; a signature cannot recover the key.');
+      }
+      output = new Uint8Array(result);
+      const source = await globalThis.crypto.subtle.importKey('raw', output, 'HKDF', false, ['deriveBits']);
+      bytes = new Uint8Array(await globalThis.crypto.subtle.deriveBits(
+        { name: 'HKDF', hash: 'SHA-256', salt: hkdfSalt, info: hkdfInfo }, source, 256));
+      if (run !== generation.current) {
+        return;
+      }
+      pending.current = bytes;
+      digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', bytes));
+      if (run !== generation.current) {
+        return;
+      }
+      const id = keyId(digest);
+      master.current?.fill(0);
+      master.current = bytes;
+      bytes = null;
+      pending.current = null;
+      pendingCredential.current?.fill(0);
+      pendingCredential.current = null;
+      downloadInitiated.current = false;
+      setDownloaded(false);
+      setCurrentId(id);
+      setKeyFeedback({ message: 'Passkey key ready. Download it for Alloy and back it up. Use the same passkey and site hostname to load it in Explore.' });
+    } catch (error) {
+      if (run === generation.current) {
+        setKeyFeedback({ message: passkeyError(error), error: true });
+      }
+    } finally {
+      output?.fill(0);
       digest?.fill(0);
       bytes?.fill(0);
       if (run === generation.current) {
@@ -229,13 +351,26 @@ export function OnboardingPage() {
             <div className={styles.keyLayout}>
               <div>
                 <h3 className={styles.subheading}>Browser-local master key</h3>
-                <p className={styles.help}>Generate a random 32-byte master for <code>aes256siv-hkdf-v1</code>. Only its key ID is displayed; this page sends no key to Grafana.</p>
+                <p className={styles.help}>Choose a random or passkey-derived 32-byte master for <code>aes256siv-hkdf-v1</code>. Only its key ID is displayed; this page sends no key to Grafana.</p>
               </div>
               <div className={styles.actions}>
+                <Button type="button" variant="secondary" disabled={!currentId || generating} onClick={downloadKey}>Download key file</Button>
+              </div>
+            </div>
+            <div className={styles.keyMethods} aria-label="Choose a key method">
+              <div className={styles.keyMethod}>
+                <h3 className={styles.subheading}>Random key</h3>
+                <p className={styles.help}>Generate a key in this browser. Keep the downloaded file: a random key cannot be recovered from a passkey later.</p>
                 <Button type="button" disabled={generating || (!!currentId && !downloaded)} onClick={() => void generateKey()}>
                   {currentId ? 'Generate another key' : 'Generate key'}
                 </Button>
-                <Button type="button" variant="secondary" disabled={!currentId} onClick={downloadKey}>Download key file</Button>
+              </div>
+              <div className={styles.keyMethod}>
+                <h3 className={styles.subheading}>Passkey-derived key</h3>
+                <p className={styles.help}>Create a discoverable, PRF-capable passkey on a YubiKey or backed-up passkey provider, then authenticate to derive its key. Requires localhost or HTTPS. To load it on another computer or browser, use the same passkey at the same site hostname (the WebAuthn RP ID); the port may differ. Back up the key file too. Existing random keys are not stored on your YubiKey.</p>
+                <Button type="button" disabled={generating || (!!currentId && !downloaded)} onClick={() => void createPasskeyKey()}>
+                  {pendingCredential.current ? 'Retry key derivation' : 'Create passkey and key'}
+                </Button>
               </div>
             </div>
             {currentId && (
@@ -248,7 +383,7 @@ export function OnboardingPage() {
               </div>
             )}
             <p className={keyFeedback?.error ? styles.errorFeedback : styles.feedback} role={keyFeedback?.error ? 'alert' : 'status'} aria-live="polite">{keyFeedback?.message}</p>
-            <p className={styles.keyGuidance}><strong>Keep a backup.</strong> Store the downloaded file in a secret manager. Mount it read-only in Alloy and share it only with authorized readers. Use separate keys for separate access groups. Losing a key permanently loses access to its old encrypted values.</p>
+            <p className={styles.keyGuidance}><strong>Keep a backup.</strong> Store the downloaded file in a secret manager. Mount it read-only in Alloy and share it only with authorized readers. Use separate keys for separate access groups. Losing a key permanently loses access to its old encrypted values. Download the current key before generating or deriving another.</p>
           </div>
         </div>
       </section>
@@ -319,6 +454,8 @@ const getStyles = (theme: GrafanaTheme2) => ({
   help: css({ margin: `${theme.spacing(0.5)} 0 0`, color: theme.colors.text.secondary, fontSize: 13, lineHeight: 1.5, '& code': { overflowWrap: 'anywhere' } }),
   keyLayout: css({ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: theme.spacing(2), '& > div:first-child': { maxWidth: 570 }, '@media (max-width: 970px)': { flexDirection: 'column', alignItems: 'stretch' } }),
   actions: css({ display: 'flex', flex: 'none', gap: theme.spacing(1), flexWrap: 'wrap', justifyContent: 'flex-end', '@media (max-width: 970px)': { justifyContent: 'flex-start' } }),
+  keyMethods: css({ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: theme.spacing(1.5), marginTop: theme.spacing(2), '@media (max-width: 650px)': { gridTemplateColumns: '1fr' } }),
+  keyMethod: css({ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: theme.spacing(1), padding: theme.spacing(1.5), border: `1px solid ${theme.colors.border.medium}`, borderRadius: theme.shape.radius.default, '& p': { flex: 1 } }),
   keySummary: css({ marginTop: theme.spacing(2), padding: theme.spacing(1.5), borderRadius: theme.shape.radius.default, border: `1px solid ${theme.colors.success.border}`, background: theme.colors.success.transparent, '& strong': { color: theme.colors.success.text } }),
   keyDetails: css({ display: 'flex', flexWrap: 'wrap', gap: theme.spacing(3), margin: `${theme.spacing(1)} 0 0`, '& div': { display: 'grid', gap: 2 }, '& dt': { color: theme.colors.text.secondary, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.04em' }, '& dd': { margin: 0, overflowWrap: 'anywhere' }, '@media (max-width: 650px)': { display: 'grid', gap: theme.spacing(1) } }),
   keyGuidance: css({ margin: `${theme.spacing(2)} 0 0`, paddingTop: theme.spacing(1.5), borderTop: `1px solid ${theme.colors.border.medium}`, color: theme.colors.text.secondary, fontSize: 13, lineHeight: 1.5, '& strong': { color: theme.colors.text.primary } }),

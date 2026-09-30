@@ -151,6 +151,37 @@ const mockedReportInteraction = jest.mocked(reportInteraction);
 
 const master = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
 const kid = '630dcd2966c4336691125448bbb25b4f';
+
+function mockPasskey(get: (options: CredentialRequestOptions) => Promise<Credential | null>) {
+  const secureContext = Object.getOwnPropertyDescriptor(window, 'isSecureContext');
+  const credentialType = Object.getOwnPropertyDescriptor(window, 'PublicKeyCredential');
+  const credentials = Object.getOwnPropertyDescriptor(navigator, 'credentials');
+  const getMock = jest.fn(get);
+  Object.defineProperty(window, 'isSecureContext', { configurable: true, value: true });
+  Object.defineProperty(window, 'PublicKeyCredential', { configurable: true, value: class {} });
+  Object.defineProperty(navigator, 'credentials', { configurable: true, value: { get: getMock } });
+  return {
+    getMock,
+    restore: () => {
+      if (secureContext) {
+        Object.defineProperty(window, 'isSecureContext', secureContext);
+      } else {
+        Reflect.deleteProperty(window, 'isSecureContext');
+      }
+      if (credentialType) {
+        Object.defineProperty(window, 'PublicKeyCredential', credentialType);
+      } else {
+        Reflect.deleteProperty(window, 'PublicKeyCredential');
+      }
+      if (credentials) {
+        Object.defineProperty(navigator, 'credentials', credentials);
+      } else {
+        Reflect.deleteProperty(navigator, 'credentials');
+      }
+    },
+  };
+}
+
 const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
 
 beforeAll(() => {
@@ -389,6 +420,113 @@ describe('QueryField', () => {
     expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ queryType: 'clear', query: sealed }));
     expect(onChange.mock.calls[0][0]).not.toHaveProperty('protectedQueryKeys');
     expect(JSON.stringify(onChange.mock.calls)).not.toContain('secret');
+  });
+
+  it('loads the portable passkey master with a discoverable PRF assertion and keeps it out of query models', async () => {
+    const user = userEvent.setup();
+    const output = Uint8Array.from({ length: 32 }, (_, index) => index).buffer;
+    const passkey = mockPasskey(async () => ({
+      getClientExtensionResults: () => ({ prf: { results: { first: output } } }),
+    } as unknown as Credential));
+    try {
+      const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedAttributesEnabled: true } });
+      jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
+      const onChange = jest.fn();
+      renderQueryField({ datasource, onChange });
+
+      await user.click(screen.getByRole('button', { name: 'Load keys' }));
+      await user.click(screen.getByRole('button', { name: 'Load from passkey' }));
+      expect(screen.getByRole('dialog')).toHaveTextContent('Only keys originally derived from a passkey can be recovered');
+      await user.click(screen.getByRole('button', { name: 'Load key' }));
+      await waitFor(() => expect(datasource.protectedKeys.map((key) => key.kid)).toEqual(['b88cf51b7d355e0041c3b5ed431b97a9']));
+      expect(passkey.getMock).toHaveBeenCalledTimes(1);
+      const options = passkey.getMock.mock.calls[0][0];
+      expect(options.publicKey?.allowCredentials).toBeUndefined();
+      expect(options.publicKey?.userVerification).toBe('required');
+      expect(options.publicKey?.extensions).toEqual({
+        prf: { eval: { first: new TextEncoder().encode('tempo-protected-attributes:master:v1') } },
+      });
+      expect(JSON.stringify(onChange.mock.calls)).not.toContain('1d7Qh21vn6Ks2Dfj5b21QMZ8NSc/GBya87M0Kst/fhw=');
+    } finally {
+      passkey.restore();
+    }
+  });
+
+  it('rejects assertions without PRF output instead of importing a signature or an unrelated key', async () => {
+    const user = userEvent.setup();
+    const passkey = mockPasskey(async () => ({ getClientExtensionResults: () => ({}) } as unknown as Credential));
+    try {
+      const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedAttributesEnabled: true } });
+      jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
+      const importSpy = jest.spyOn(datasource, 'importProtectedKeys');
+      renderQueryField({ datasource });
+      await user.click(screen.getByRole('button', { name: 'Load keys' }));
+      await user.click(screen.getByRole('button', { name: 'Load from passkey' }));
+      await user.click(screen.getByRole('button', { name: 'Load key' }));
+      await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('no WebAuthn PRF output'));
+      expect(importSpy).not.toHaveBeenCalled();
+      expect(datasource.protectedKeys).toEqual([]);
+    } finally {
+      passkey.restore();
+    }
+  });
+
+  it('discards a passkey assertion that finishes after the import modal is cancelled', async () => {
+    const user = userEvent.setup();
+    let finishAssertion!: (value: Credential) => void;
+    const promise = new Promise<Credential>((resolve) => { finishAssertion = resolve; });
+    const passkey = mockPasskey(() => promise);
+    try {
+      const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedAttributesEnabled: true } });
+      jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
+      const importSpy = jest.spyOn(datasource, 'importProtectedKeys');
+      renderQueryField({ datasource });
+      await user.click(screen.getByRole('button', { name: 'Load keys' }));
+      await user.click(screen.getByRole('button', { name: 'Load from passkey' }));
+      await user.click(screen.getByRole('button', { name: 'Load key' }));
+      expect(passkey.getMock).toHaveBeenCalledTimes(1);
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+      await act(async () => {
+        finishAssertion({ getClientExtensionResults: () => ({
+          prf: { results: { first: Uint8Array.from({ length: 32 }, (_, index) => index).buffer } },
+        }) } as unknown as Credential);
+      });
+      expect(importSpy).not.toHaveBeenCalled();
+      expect(datasource.protectedKeys).toEqual([]);
+    } finally {
+      passkey.restore();
+    }
+  });
+
+  it('imports a passkey only when its derived key matches the requested ID', async () => {
+    const user = userEvent.setup();
+    const passkeyKid = 'b88cf51b7d355e0041c3b5ed431b97a9';
+    const passkey = mockPasskey(async () => ({
+      getClientExtensionResults: () => ({
+        prf: { results: { first: Uint8Array.from({ length: 32 }, (_, index) => index).buffer } },
+      }),
+    } as unknown as Credential));
+    try {
+      const datasource = createTempoDatasource({}, { uid: 'tempo-uid', jsonData: { protectedAttributesEnabled: true } });
+      jest.spyOn(datasource, 'getNativeHistograms').mockResolvedValue(false);
+      const importSpy = jest.spyOn(datasource, 'importProtectedKeys');
+      renderQueryField({ datasource });
+      const scope = globalThis as unknown as Record<symbol, { requestKey(kid: string): boolean }>;
+      const bridge = scope[Symbol.for('grafana.tempo.protected-attribute-display.v1')];
+      act(() => expect(bridge.requestKey(kid)).toBe(true));
+      await user.click(screen.getByRole('button', { name: 'Load from passkey' }));
+      await user.click(screen.getByRole('button', { name: 'Load key' }));
+      await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('does not match the required ID'));
+      expect(importSpy).not.toHaveBeenCalled();
+
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+      act(() => expect(bridge.requestKey(passkeyKid)).toBe(true));
+      await user.click(screen.getByRole('button', { name: 'Load from passkey' }));
+      await user.click(screen.getByRole('button', { name: 'Load key' }));
+      await waitFor(() => expect(datasource.protectedKeys.map((key) => key.kid)).toEqual([passkeyKid]));
+    } finally {
+      passkey.restore();
+    }
   });
 
   it('loads a browser key without configured fingerprint, rejects invalid bytes without replacing it, and never writes key material to host models', async () => {

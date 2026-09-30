@@ -17,6 +17,9 @@ const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
 const originalCreateObjectURL = Object.getOwnPropertyDescriptor(URL, 'createObjectURL');
 const originalRevokeObjectURL = Object.getOwnPropertyDescriptor(URL, 'revokeObjectURL');
 const originalClipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+const originalCredentials = Object.getOwnPropertyDescriptor(navigator, 'credentials');
+const originalPublicKeyCredential = Object.getOwnPropertyDescriptor(window, 'PublicKeyCredential');
+const originalSecureContext = Object.getOwnPropertyDescriptor(window, 'isSecureContext');
 
 beforeEach(() => {
   Object.defineProperty(globalThis, 'crypto', {
@@ -24,7 +27,7 @@ beforeEach(() => {
     value: {
       subtle: webcrypto.subtle,
       getRandomValues: (array: Uint8Array) => {
-        array.set(Uint8Array.from({ length: 32 }, (_, index) => index));
+        array.set(Uint8Array.from({ length: array.length }, (_, index) => index));
         return array;
       },
     },
@@ -40,6 +43,12 @@ afterEach(() => {
   else { Reflect.deleteProperty(URL, 'revokeObjectURL'); }
   if (originalClipboard) { Object.defineProperty(navigator, 'clipboard', originalClipboard); }
   else { Reflect.deleteProperty(navigator, 'clipboard'); }
+  if (originalCredentials) { Object.defineProperty(navigator, 'credentials', originalCredentials); }
+  else { Reflect.deleteProperty(navigator, 'credentials'); }
+  if (originalPublicKeyCredential) { Object.defineProperty(window, 'PublicKeyCredential', originalPublicKeyCredential); }
+  else { Reflect.deleteProperty(window, 'PublicKeyCredential'); }
+  if (originalSecureContext) { Object.defineProperty(window, 'isSecureContext', originalSecureContext); }
+  else { Reflect.deleteProperty(window, 'isSecureContext'); }
   jest.restoreAllMocks();
 });
 
@@ -55,7 +64,7 @@ test('downloads a compatible master key before allowing replacement and clears i
     value: {
       subtle: webcrypto.subtle,
       getRandomValues: (array: Uint8Array) => {
-        array.set(Uint8Array.from({ length: 32 }, (_, index) => index));
+        array.set(Uint8Array.from({ length: array.length }, (_, index) => index));
         generated = array;
         return array;
       },
@@ -79,6 +88,64 @@ test('downloads a compatible master key before allowing replacement and clears i
   expect(content).toBe(`${expectedMaster}\n`);
   unmount();
   expect(Array.from(generated!)).toEqual(Array(32).fill(0));
+});
+
+test('enrolls a discoverable PRF passkey and downloads the deterministic Alloy master without replacing an unsaved key', async () => {
+  const user = userEvent.setup();
+  Object.defineProperty(window, 'isSecureContext', { configurable: true, value: true });
+  Object.defineProperty(window, 'PublicKeyCredential', { configurable: true, value: class {} });
+  const rawId = Uint8Array.from([1, 2, 3, 4]).buffer;
+  const prfBytes = Uint8Array.from({ length: 32 }, (_, index) => index);
+  const create = jest.fn().mockResolvedValue({ rawId, getClientExtensionResults: () => ({ prf: { enabled: true } }) });
+  const get = jest.fn().mockResolvedValue({ rawId, getClientExtensionResults: () => ({ prf: { results: { first: prfBytes.buffer } } }) });
+  Object.defineProperty(navigator, 'credentials', { configurable: true, value: { create, get } });
+  let created: Blob | undefined;
+  Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: jest.fn((blob: Blob) => { created = blob; return 'blob:passkey'; }) });
+  Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: jest.fn() });
+  jest.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+  render(<OnboardingPage />);
+
+  await user.click(screen.getByRole('button', { name: 'Create passkey and key' }));
+  expect(await screen.findByText('b88cf51b7d355e0041c3b5ed431b97a9')).toBeInTheDocument();
+  expect(create).toHaveBeenCalledWith({ publicKey: expect.objectContaining({
+    authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
+    extensions: { prf: {} },
+  }) });
+  expect(get).toHaveBeenCalledWith({ publicKey: expect.objectContaining({
+    allowCredentials: [{ type: 'public-key', id: new Uint8Array(rawId) }],
+    extensions: { prf: { eval: { first: new TextEncoder().encode('tempo-protected-attributes:master:v1') } } },
+    userVerification: 'required',
+  }) });
+  expect(screen.getByRole('button', { name: 'Generate another key' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Create passkey and key' })).toBeDisabled();
+  await user.click(screen.getByRole('button', { name: 'Download key file' }));
+  const file = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(created!);
+  });
+  expect(file).toBe('1d7Qh21vn6Ks2Dfj5b21QMZ8NSc/GBya87M0Kst/fhw=\n');
+  expect(screen.getByRole('button', { name: 'Create passkey and key' })).toBeEnabled();
+});
+
+test('rejects passkeys without PRF output instead of exporting an unrelated key', async () => {
+  const user = userEvent.setup();
+  Object.defineProperty(window, 'isSecureContext', { configurable: true, value: true });
+  Object.defineProperty(window, 'PublicKeyCredential', { configurable: true, value: class {} });
+  const rawId = Uint8Array.from([1, 2, 3, 4]).buffer;
+  const create = jest.fn().mockResolvedValue({ rawId, getClientExtensionResults: () => ({ prf: { enabled: true } }) });
+  const get = jest.fn().mockResolvedValue({ rawId, getClientExtensionResults: () => ({ prf: {} }) });
+  Object.defineProperty(navigator, 'credentials', { configurable: true, value: { create, get } });
+  render(<OnboardingPage />);
+
+  await user.click(screen.getByRole('button', { name: 'Create passkey and key' }));
+  expect(await screen.findByRole('alert')).toHaveTextContent('no WebAuthn PRF output');
+  expect(screen.getByRole('button', { name: 'Download key file' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Retry key derivation' })).toBeEnabled();
+  await user.click(screen.getByRole('button', { name: 'Retry key derivation' }));
+  await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
+  expect(create).toHaveBeenCalledTimes(1);
 });
 
 test('switches between real Alloy pipelines and copies config without key material', async () => {
