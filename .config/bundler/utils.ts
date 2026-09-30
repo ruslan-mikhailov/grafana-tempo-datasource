@@ -43,10 +43,10 @@ export function hasReadme() {
   return fs.existsSync(path.resolve(process.cwd(), SOURCE_DIR, 'README.md'));
 }
 
-// Support bundling nested plugins by finding all plugin.json files in src directory
-// then checking for a sibling module.[jt]sx? file.
+// Discover entries only below the Tempo datasource's src directory. App plugins
+// alongside src are built separately and must not enter the datasource dist.
 export async function getEntries() {
-  const pluginsJson = await glob('**/src/**/plugin.json', { absolute: true });
+  const pluginsJson = await glob('src/**/plugin.json', { absolute: true });
 
   const plugins = await Promise.all(
     pluginsJson.map((pluginJson) => {

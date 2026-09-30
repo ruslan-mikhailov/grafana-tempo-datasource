@@ -1,0 +1,33 @@
+{
+  "type": "app",
+  "name": "Protected data",
+  "id": "protected-data-app",
+  "backend": false,
+  "info": {
+    "description": "Set up client-side keys and Alloy encryption for protected telemetry.",
+    "author": {
+      "name": "Protected Data Demo"
+    },
+    "keywords": ["protected data", "encryption", "onboarding"],
+    "logos": {
+      "small": "img/logo.svg",
+      "large": "img/logo.svg"
+    },
+    "version": "0.1.0",
+    "updated": "2026-09-30"
+  },
+  "includes": [
+    {
+      "type": "page",
+      "name": "Protected data",
+      "path": "/a/protected-data-app",
+      "role": "Viewer",
+      "addToNav": true,
+      "defaultNav": true
+    }
+  ],
+  "dependencies": {
+    "grafanaDependency": ">=13.0.0",
+    "plugins": []
+  }
+}

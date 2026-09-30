@@ -4,7 +4,7 @@ RUN npm install --global npm@11.12.1
 COPY package.json package-lock.json .npmrc ./
 RUN npm ci
 COPY . .
-RUN npm run build
+RUN npm run build && npm run build:protected-data-app
 
 FROM golang:1.26.7-bookworm AS backend
 WORKDIR /app
@@ -34,6 +34,7 @@ RUN mkdir -p /out && arch=${TARGETARCH:-$(go env GOARCH)} && CGO_ENABLED=0 GOOS=
 FROM grafana-base
 COPY --from=frontend --chown=472:0 /app/dist/ /var/lib/grafana/plugins/grafana-tempo-datasource/
 COPY --from=backend --chown=472:0 /out/ /var/lib/grafana/plugins/grafana-tempo-datasource/
+COPY --from=frontend --chown=472:0 /app/protected-data-app/dist/ /var/lib/grafana/plugins/protected-data-app/
 COPY --from=loki-frontend --chown=472:0 /app/dist/ /var/lib/grafana/plugins/grafana-loki-datasource/
 COPY --from=loki-backend --chown=472:0 /out/ /var/lib/grafana/plugins/grafana-loki-datasource/
 COPY --chown=472:0 custom.ini /etc/grafana/grafana.ini

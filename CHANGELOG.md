@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add the frontend-only Protected data onboarding app under Connections. Generate and download 32-byte keys locally, copy Tempo/Loki Alloy configuration, and review Explore query examples. The app builds beside the Tempo datasource plugin and is included and enabled in the demo Grafana image without modifying `grafana-base`.
+
 - Submit up to 32 selected protected attributes with their hidden same-scope `bi.*` partners through one administrator-authorized Grafana bridge request and one Tempo `SubmitAttributeRedaction` batch. Tempo removes matching sidecars in the same backend-block rewrite as `enc.*` replacement; submissions report queued jobs, not completion. Requires rebuilt Grafana plugin and Tempo scheduler/worker.
 
 - Open the local file picker directly from the key-revocation form's **Choose local key file** action, including after switching from paste mode; remove the redundant file-mode button.
