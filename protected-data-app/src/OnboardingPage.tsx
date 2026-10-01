@@ -260,42 +260,84 @@ export function OnboardingPage() {
     }
   };
 
-  const downloadKey = () => {
+  const downloadKey = async () => {
     const bytes = master.current;
-    if (!bytes || !currentId) {
+    if (!bytes || !currentId || busy.current) {
       return;
     }
+    busy.current = true;
+    setGenerating(true);
+    const run = generation.current;
     let url: string | undefined;
     try {
-      const base64 = btoa(String.fromCharCode(...bytes));
-      url = URL.createObjectURL(new Blob([`${base64}\n`], { type: 'text/plain' }));
-      urls.current.add(url);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = `protected-${currentId}.key`;
-      anchor.hidden = true;
-      document.body.appendChild(anchor);
-      try {
-        anchor.click();
-      } finally {
-        anchor.remove();
+      const content = `${btoa(String.fromCharCode(...bytes))}\n`;
+      const filename = `protected-${currentId}.key`;
+      const showSaveFilePicker = (window as Window & {
+        showSaveFilePicker?: (options: {
+          suggestedName: string;
+          types: Array<{ description: string; accept: Record<string, string[]> }>;
+        }) => Promise<FileSystemFileHandle>;
+      }).showSaveFilePicker;
+      if (showSaveFilePicker) {
+        const handle = await showSaveFilePicker.call(window, {
+          suggestedName: filename,
+          types: [{ description: 'Base64 key file', accept: { 'text/plain': ['.key'] } }],
+        });
+        const writable = await handle.createWritable();
+        try {
+          await writable.write(content);
+          await writable.close();
+        } catch (error) {
+          try {
+            await writable.abort();
+          } finally {
+            throw error;
+          }
+        }
+      } else {
+        url = URL.createObjectURL(new Blob([content], { type: 'application/octet-stream' }));
+        urls.current.add(url);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = filename;
+        anchor.hidden = true;
+        document.body.appendChild(anchor);
+        try {
+          anchor.click();
+        } finally {
+          anchor.remove();
+        }
+        const objectUrl = url;
+        const timer = window.setTimeout(() => {
+          URL.revokeObjectURL(objectUrl);
+          urls.current.delete(objectUrl);
+          timers.current.delete(timer);
+        }, 30_000);
+        timers.current.add(timer);
+      }
+      if (run !== generation.current) {
+        return;
       }
       downloadInitiated.current = true;
       setDownloaded(true);
-      setKeyFeedback({ message: 'Download requested. Confirm the file is saved before generating another key.' });
-      const objectUrl = url;
-      const timer = window.setTimeout(() => {
-        URL.revokeObjectURL(objectUrl);
-        urls.current.delete(objectUrl);
-        timers.current.delete(timer);
-      }, 30_000);
-      timers.current.add(timer);
-    } catch {
+      setKeyFeedback({ message: showSaveFilePicker
+        ? 'Key file saved. Keep a backup before generating another key.'
+        : 'Download requested. Confirm the file is saved before generating another key.' });
+    } catch (error) {
       if (url) {
         URL.revokeObjectURL(url);
         urls.current.delete(url);
       }
-      setKeyFeedback({ message: 'Download could not start. Try again before generating another key.', error: true });
+      if (run === generation.current) {
+        setKeyFeedback({ message: error instanceof DOMException && error.name === 'AbortError'
+          ? 'Save canceled. The key is still in this tab; save it before generating another.'
+          : 'Key file could not be saved. Try again before generating another key.', error: true });
+      }
+    } finally {
+      if (run === generation.current) {
+        busy.current = false;
+        setGenerating(false);
+      }
     }
   };
 
@@ -383,7 +425,7 @@ export function OnboardingPage() {
               </div>
             )}
             <p className={keyFeedback?.error ? styles.errorFeedback : styles.feedback} role={keyFeedback?.error ? 'alert' : 'status'} aria-live="polite">{keyFeedback?.message}</p>
-            <p className={styles.keyGuidance}><strong>Keep a backup.</strong> Store the downloaded file in a secret manager. Mount it read-only in Alloy and share it only with authorized readers. Use separate keys for separate access groups. Losing a key permanently loses access to its old encrypted values. Download the current key before generating or deriving another.</p>
+            <p className={styles.keyGuidance}><strong>Keep a backup.</strong> Choose a destination when your browser offers a save dialog; otherwise check that the download completed (use Save As if the browser opens the key instead). Store the file in a secret manager. Mount it read-only in Alloy and share it only with authorized readers. Use separate keys for separate access groups. Losing a key permanently loses access to its old encrypted values. Save the current key before generating or deriving another.</p>
           </div>
         </div>
       </section>

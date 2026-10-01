@@ -20,6 +20,7 @@ const originalClipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard'
 const originalCredentials = Object.getOwnPropertyDescriptor(navigator, 'credentials');
 const originalPublicKeyCredential = Object.getOwnPropertyDescriptor(window, 'PublicKeyCredential');
 const originalSecureContext = Object.getOwnPropertyDescriptor(window, 'isSecureContext');
+const originalSaveFilePicker = Object.getOwnPropertyDescriptor(window, 'showSaveFilePicker');
 
 beforeEach(() => {
   Object.defineProperty(globalThis, 'crypto', {
@@ -49,6 +50,8 @@ afterEach(() => {
   else { Reflect.deleteProperty(window, 'PublicKeyCredential'); }
   if (originalSecureContext) { Object.defineProperty(window, 'isSecureContext', originalSecureContext); }
   else { Reflect.deleteProperty(window, 'isSecureContext'); }
+  if (originalSaveFilePicker) { Object.defineProperty(window, 'showSaveFilePicker', originalSaveFilePicker); }
+  else { Reflect.deleteProperty(window, 'showSaveFilePicker'); }
   jest.restoreAllMocks();
 });
 
@@ -88,6 +91,50 @@ test('downloads a compatible master key before allowing replacement and clears i
   expect(content).toBe(`${expectedMaster}\n`);
   unmount();
   expect(Array.from(generated!)).toEqual(Array(32).fill(0));
+});
+
+test('saves the key as a named file instead of navigating to a blob URL when native save is available', async () => {
+  const user = userEvent.setup();
+  const write = jest.fn().mockResolvedValue(undefined);
+  const close = jest.fn().mockResolvedValue(undefined);
+  const picker = jest.fn().mockResolvedValue({ createWritable: async () => ({ write, close }) });
+  Object.defineProperty(window, 'showSaveFilePicker', { configurable: true, value: picker });
+  const createObjectURL = jest.fn();
+  Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL });
+  Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: jest.fn() });
+  const navigate = jest.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+  render(<OnboardingPage />);
+
+  await user.click(screen.getByRole('button', { name: 'Generate key' }));
+  expect(await screen.findByText(expectedKid)).toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: 'Download key file' }));
+  await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+  expect(picker).toHaveBeenCalledWith(expect.objectContaining({ suggestedName: `protected-${expectedKid}.key` }));
+  expect(write).toHaveBeenCalledWith(`${expectedMaster}\n`);
+  expect(createObjectURL).not.toHaveBeenCalled();
+  expect(navigate).not.toHaveBeenCalled();
+  expect(screen.getByRole('button', { name: 'Generate another key' })).toBeEnabled();
+});
+
+test('cancelled save keeps the current master available and blocks replacing it', async () => {
+  const user = userEvent.setup();
+  const picker = jest.fn().mockRejectedValue(new DOMException('Canceled', 'AbortError'));
+  Object.defineProperty(window, 'showSaveFilePicker', { configurable: true, value: picker });
+  const createObjectURL = jest.fn(() => 'blob:test-key');
+  Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL });
+  Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: jest.fn() });
+  const navigate = jest.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+  render(<OnboardingPage />);
+
+  await user.click(screen.getByRole('button', { name: 'Generate key' }));
+  expect(await screen.findByText(expectedKid)).toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: 'Download key file' }));
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Generate another key' })).toBeDisabled());
+  expect(screen.getByRole('button', { name: 'Download key file' })).toBeEnabled();
+  expect(screen.getByRole('alert')).toHaveTextContent(/cancel/i);
+  expect(picker).toHaveBeenCalledTimes(1);
+  expect(createObjectURL).not.toHaveBeenCalled();
+  expect(navigate).not.toHaveBeenCalled();
 });
 
 test('enrolls a discoverable PRF passkey and downloads the deterministic Alloy master without replacing an unsaved key', async () => {
